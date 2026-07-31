@@ -1,0 +1,96 @@
+import { z } from "zod";
+import { config } from "../config.js";
+import { store } from "./store.js";
+import { httpJson } from "./http.js";
+import { registerModule, ok, fail, type AssistantModule } from "./registry.js";
+
+export interface Location {
+  city: string;
+  lat: number;
+  lon: number;
+  source: "manual" | "ip" | "env";
+  confirmedAt: string;
+}
+
+const KEY = "location:current";
+
+/** 获取已确认位置；未确认返回 null */
+export function currentLocation(): Location | null {
+  const saved = store.get<Location>(KEY);
+  if (saved) return saved;
+  if (config.location.city && config.location.lat !== undefined && config.location.lon !== undefined) {
+    return {
+      city: config.location.city,
+      lat: config.location.lat,
+      lon: config.location.lon,
+      source: "env",
+      confirmedAt: new Date().toISOString(),
+    };
+  }
+  return null;
+}
+
+/** IP 自动探测（ip-api.com，免费、无 Key、45 次/分钟，仅供建议值） */
+async function detectByIp(): Promise<{ city: string; lat: number; lon: number } | null> {
+  try {
+    const r = await httpJson<{ status: string; city: string; lat: number; lon: number }>(
+      "http://ip-api.com/json/?lang=zh-CN&fields=status,city,lat,lon",
+    );
+    return r.status === "success" ? { city: r.city, lat: r.lat, lon: r.lon } : null;
+  } catch {
+    return null;
+  }
+}
+
+const locationModule: AssistantModule = {
+  name: "location",
+  tools: [
+    {
+      name: "get",
+      description:
+        "获取用户当前位置。首次使用天气/油价/快递功能前必须调用。若返回 need_confirm，请把 suggestion 用自然语言复述给用户并请其确认，确认后调用 location.set 保存。",
+      schema: {},
+      handler: async () => {
+        const loc = currentLocation();
+        if (loc) return ok({ status: "confirmed", location: loc });
+        const suggestion = await detectByIp();
+        return ok({
+          status: "need_confirm",
+          suggestion,
+          hint: "请向用户确认所在地。用户确认后调用 location.set(city, lat, lon) 保存；若 IP 建议不准确，请让用户告知城市名后再次调用 location.detect(city) 获取坐标。",
+        });
+      },
+    },
+    {
+      name: "detect",
+      description: "按城市名解析经纬度（Open-Meteo Geocoding，免费无 Key），用于用户口述城市后补全坐标。",
+      schema: { city: z.string().describe("城市名，如 北京 / 上海 / 深圳") },
+      handler: async (args) => {
+        const { city } = z.object({ city: z.string() }).parse(args);
+        const r = await httpJson<{ results?: Array<{ name: string; latitude: number; longitude: number }> }>(
+          `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(city)}&count=1&language=zh`,
+        );
+        const hit = r.results?.[0];
+        if (!hit) return fail(`未找到城市：${city}`);
+        return ok({ city: hit.name, lat: hit.latitude, lon: hit.longitude });
+      },
+    },
+    {
+      name: "set",
+      description: "保存用户确认后的位置（城市 + 经纬度）。",
+      schema: {
+        city: z.string(),
+        lat: z.number(),
+        lon: z.number(),
+      },
+      handler: async (args) => {
+        const p = z.object({ city: z.string(), lat: z.number(), lon: z.number() }).parse(args);
+        const loc: Location = { ...p, source: "manual", confirmedAt: new Date().toISOString() };
+        store.set(KEY, loc);
+        return ok({ status: "saved", location: loc });
+      },
+    },
+  ],
+};
+
+registerModule(locationModule);
