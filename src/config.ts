@@ -30,6 +30,6 @@ export const config = {
   cron: {
     weatherAlerts: "*/15 * * * *",
     oilWatch: "0 9 * * *",
-    expressPoll: "*/30 * * * *",
+    expressPoll: "0 * * * *",
   },
 };
