@@ -64,7 +64,8 @@ function cachedGeo(city: string): { id: string; lat: number; lon: number } | nul
   return null;
 }
 
-async function qweatherGeo(city: string): Promise<{ id: string; lat: number; lon: number }> {
+/** 和风 GeoAPI 城市查询（中文区县支持好），带缓存 */
+export async function qweatherGeo(city: string): Promise<{ id: string; lat: number; lon: number }> {
   const cached = cachedGeo(city);
   if (cached) return cached;
   const geo = await httpJson<{ location?: Array<{ id: string; lat: string; lon: string }> }>(

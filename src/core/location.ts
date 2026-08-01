@@ -63,10 +63,20 @@ const locationModule: AssistantModule = {
     },
     {
       name: "detect",
-      description: "按城市名解析经纬度（Open-Meteo Geocoding，免费无 Key），用于用户口述城市后补全坐标。",
-      schema: { city: z.string().describe("城市名，如 北京 / 上海 / 深圳") },
+      description: "按城市名解析经纬度（先和风 GeoAPI，再 Open-Meteo Geocoding 兜底，均免费无 Key），用于用户口述城市后补全坐标。",
+      schema: { city: z.string().describe("城市名，如 北京 / 上海 / 朔城区") },
       handler: async (args) => {
         const { city } = z.object({ city: z.string() }).parse(args);
+        // 优先和风 GeoAPI：对中文区县（如"朔城区"）支持好
+        if (config.qweatherKey) {
+          try {
+            const geo = await httpJson<{ location?: Array<{ name: string; lat: string; lon: string; adm1: string }> }>(
+              `https://${config.qweatherApiHost}/geo/v2/city/lookup?location=${encodeURIComponent(city)}&key=${config.qweatherKey}`,
+            );
+            const hit = geo.location?.[0];
+            if (hit) return ok({ city: hit.name, lat: Number(hit.lat), lon: Number(hit.lon), adm1: hit.adm1 });
+          } catch { /* 和风失败则走 Open-Meteo */ }
+        }
         const r = await httpJson<{ results?: Array<{ name: string; latitude: number; longitude: number }> }>(
           `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(city)}&count=1&language=zh`,
         );

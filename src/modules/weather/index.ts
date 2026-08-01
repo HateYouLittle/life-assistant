@@ -1,8 +1,9 @@
 import { z } from "zod";
 import { config } from "../../config.js";
 import { currentLocation } from "../../core/location.js";
+import { httpJson } from "../../core/http.js";
 import { registerModule, ok, fail, type AssistantModule } from "../../core/registry.js";
-import { fetchCurrent, fetchForecast, fetchAlerts } from "./provider.js";
+import { fetchCurrent, fetchForecast, fetchAlerts, qweatherGeo } from "./provider.js";
 
 function requireLocation() {
   const loc = currentLocation();
@@ -10,16 +11,44 @@ function requireLocation() {
   return loc;
 }
 
+/**
+ * 解析查询位置：
+ * - 无 city → 全局已确认位置（不改变）
+ * - 有 city → 走和风 GeoAPI（对中文区县支持好，如"朔城区"），失败则回退 Open-Meteo；
+ *   只做临时查询，绝不写入 location:current（多 profile 共享 store 时避免互相污染）
+ */
+async function resolveLocation(city?: string): Promise<{ city: string; lat: number; lon: number }> {
+  if (!city) {
+    const loc = requireLocation();
+    return { city: loc.city, lat: loc.lat, lon: loc.lon };
+  }
+  if (config.qweatherKey) {
+    try {
+      const geo = await qweatherGeo(city);
+      return { city, lat: geo.lat, lon: geo.lon };
+    } catch (e) {
+      console.error(`[weather] qweather geo failed for "${city}": ${(e as Error).message}`);
+    }
+  }
+  const r = await httpJson<{ results?: Array<{ name: string; latitude: number; longitude: number }> }>(
+    `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(city)}&count=1&language=zh`,
+  );
+  const hit = r.results?.[0];
+  if (!hit) throw new Error(`未找到城市：${city}`);
+  return { city: hit.name, lat: hit.latitude, lon: hit.longitude };
+}
+
 const weatherModule: AssistantModule = {
   name: "weather",
   tools: [
     {
       name: "current",
-      description: "查询用户所在地实时天气（温度、体感、湿度、风力、天气现象）。",
-      schema: {},
-      handler: async () => {
+      description: "查询实时天气。默认查询已保存位置；也可传 city 查询任意城市（如 朔城区/北京），临时查询不改变已保存位置。",
+      schema: { city: z.string().optional().describe("城市名（可选），如 朔城区/北京；不传则查已保存位置") },
+      handler: async (args) => {
         try {
-          const loc = requireLocation();
+          const { city } = z.object({ city: z.string().optional() }).parse(args ?? {});
+          const loc = await resolveLocation(city);
           const w = await fetchCurrent(loc.lat, loc.lon, loc.city);
           return ok({ city: loc.city, ...w, unit: { temperature: "℃", windSpeed: w.windSpeedUnit } });
         } catch (e) {
@@ -29,12 +58,12 @@ const weatherModule: AssistantModule = {
     },
     {
       name: "forecast",
-      description: "查询用户所在地未来 N 天天气预报。",
-      schema: { days: z.number().min(1).max(7).default(3).describe("预报天数 1-7") },
+      description: "查询未来 N 天天气预报。默认查询已保存位置；也可传 city 查询任意城市（如 朔城区/北京），临时查询不改变已保存位置。",
+      schema: { days: z.number().min(1).max(7).default(3).describe("预报天数 1-7"), city: z.string().optional().describe("城市名（可选），如 朔城区/北京；不传则查已保存位置") },
       handler: async (args) => {
         try {
-          const loc = requireLocation();
-          const { days } = z.object({ days: z.number().min(1).max(7).default(3) }).parse(args);
+          const { days, city } = z.object({ days: z.number().min(1).max(7).default(3), city: z.string().optional() }).parse(args ?? {});
+          const loc = await resolveLocation(city);
           return ok({ city: loc.city, forecast: await fetchForecast(loc.lat, loc.lon, days, loc.city) });
         } catch (e) {
           return fail((e as Error).message);
@@ -43,11 +72,12 @@ const weatherModule: AssistantModule = {
     },
     {
       name: "alerts",
-      description: "查询用户所在地当前生效的气象预警（暴雨/台风/高温/大风等）。",
-      schema: {},
-      handler: async () => {
+      description: "查询当前生效的气象预警（暴雨/台风/高温/大风等）。默认查询已保存位置；也可传 city 查询任意城市，临时查询不改变已保存位置。",
+      schema: { city: z.string().optional().describe("城市名（可选），如 朔城区/北京；不传则查已保存位置") },
+      handler: async (args) => {
         try {
-          const loc = requireLocation();
+          const { city } = z.object({ city: z.string().optional() }).parse(args ?? {});
+          const loc = await resolveLocation(city);
           const alerts = await fetchAlerts(loc.city, loc.lat, loc.lon);
           return ok({ city: loc.city, count: alerts.length, alerts });
         } catch (e) {
