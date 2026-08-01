@@ -3,6 +3,7 @@ import { store } from "./store.js";
 import { httpJson } from "./http.js";
 
 export interface Notice {
+  id: number; // 自增 ID，用于多消费者已读追踪
   title: string;
   body: string;
   time: string;
@@ -58,6 +59,14 @@ const channels: Channel[] = [
 ];
 
 const DEDUPE_KEY = "notify:sent_keys";
+const SEQ_KEY = "notify:seq";
+
+/** 生成自增通知 ID（跨进程共享 store.json，多消费者靠它去重） */
+function nextId(): number {
+  const seq = store.get<number>(SEQ_KEY, 0)!;
+  store.set(SEQ_KEY, seq + 1);
+  return seq + 1;
+}
 
 /** 扇出通知：推送全部通道 + 写入待读队列（供 notify.pull 兜底），带去重 */
 export async function notify(title: string, body: string, dedupeKey?: string): Promise<void> {
@@ -67,7 +76,7 @@ export async function notify(title: string, body: string, dedupeKey?: string): P
     store.set(DEDUPE_KEY, [...sent.slice(-500), dedupeKey]);
   }
 
-  const notice: Notice = { title, body, time: new Date().toISOString(), dedupeKey };
+  const notice: Notice = { id: nextId(), title, body, time: new Date().toISOString(), dedupeKey };
 
   // 入待读队列（上限 100 条）
   const queue = store.get<Notice[]>("pending_notifications", [])!;
@@ -77,9 +86,20 @@ export async function notify(title: string, body: string, dedupeKey?: string): P
   await Promise.allSettled(channels.map((c) => c.send(notice)));
 }
 
-/** 取走全部未读通知（notify.pull 工具使用） */
-export function pullPending(): Notice[] {
+/**
+ * 取走未读通知（notify.pull 工具使用）。
+ * - 传入 consumer（如 profile 名）：只返回该消费者未读的通知，并记录已读 id（队列不清空，多消费者共享）
+ * - 不传 consumer：保持旧行为，清空整个队列（向后兼容）
+ */
+export function pullPending(consumer?: string): Notice[] {
   const queue = store.get<Notice[]>("pending_notifications", [])!;
-  store.set("pending_notifications", []);
-  return queue;
+  if (!consumer) {
+    store.set("pending_notifications", []);
+    return queue;
+  }
+  const readKey = `notify:read:${consumer}`;
+  const readIds = store.get<number[]>(readKey, [])!;
+  const unseen = queue.filter((n) => !readIds.includes(n.id));
+  store.set(readKey, [...readIds.slice(-500), ...unseen.map((n) => n.id)]);
+  return unseen;
 }

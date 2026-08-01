@@ -17,7 +17,9 @@ export const notifyModule: AssistantModule = {
         "拉取所有未读的主动通知（天气预警、油价预通知、快递动态）。建议每次会话开始时调用一次，确保用户不错过预警。",
       schema: {},
       handler: async () => {
-        const items = pullPending();
+        // 多消费者支持：MCP 进程由哪个 Hermes profile 拉起，就用哪个 profile 名做已读标记
+        const consumer = process.env.HERMES_PROFILE || "default";
+        const items = pullPending(consumer);
         return ok({ count: items.length, notifications: items });
       },
     },
