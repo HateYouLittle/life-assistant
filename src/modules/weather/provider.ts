@@ -1,11 +1,13 @@
 import { config } from "../../config.js";
 import { httpJson } from "../../core/http.js";
+import { store } from "../../core/store.js";
 
 export interface CurrentWeather {
   temperature: number;
   apparent: number;
   humidity: number;
   windSpeed: number;
+  windSpeedUnit: "km/h" | "m/s";
   weatherText: string;
 }
 
@@ -30,8 +32,73 @@ const WMO: Record<number, string> = {
   95: "雷阵雨", 96: "雷阵雨伴冰雹", 99: "强雷阵雨伴冰雹",
 };
 
-/** 实时天气：Open-Meteo，免费、无 Key、非商用 1 万次/天 */
-export async function fetchCurrent(lat: number, lon: number): Promise<CurrentWeather> {
+/** 和风天气现象 code → 中文（v7 接口 text 字段直接给中文，这里做兜底映射） */
+const QW_TEXT: Record<string, string> = {
+  "100": "晴", "101": "多云", "102": "少云", "103": "晴间多云", "104": "阴",
+  "300": "阵雨", "301": "强阵雨", "302": "雷阵雨", "303": "强雷阵雨",
+  "304": "雷阵雨伴有冰雹", "305": "小雨", "306": "中雨", "307": "大雨",
+  "308": "极端降雨", "309": "毛毛雨", "310": "暴雨", "311": "大暴雨",
+  "312": "特大暴雨", "313": "冻雨", "314": "小到中雨", "315": "中到大雨",
+  "316": "大到暴雨", "317": "暴雨到大暴雨", "318": "大暴雨到特大暴雨",
+  "399": "雨", "400": "小雪", "401": "中雪", "402": "大雪", "403": "暴雪",
+  "404": "雨夹雪", "405": "雨雪天气", "406": "阵雨夹雪", "407": "阵雪",
+  "408": "小到中雪", "409": "中到大雪", "410": "大到暴雪", "499": "雪",
+  "500": "薄雾", "501": "雾", "502": "霾", "503": "扬沙", "504": "浮尘",
+  "507": "沙尘暴", "508": "强沙尘暴", "509": "浓雾", "510": "强浓雾",
+  "511": "中度霾", "512": "重度霾", "513": "严重霾", "514": "大雾",
+  "515": "特强浓雾", "900": "热", "901": "冷", "999": "未知",
+};
+
+/**
+ * 和风城市 ID 缓存：GeoAPI 查询结果落 store，避免每次重复消耗额度。
+ * key: qweather:geo:{city}，缓存 7 天（城市 ID 极少变动）。
+ */
+const GEO_CACHE_PREFIX = "qweather:geo:";
+const GEO_CACHE_TTL_MS = 7 * 24 * 3600 * 1000;
+
+function cachedGeo(city: string): { id: string; lat: number; lon: number } | null {
+  try {
+    const raw = store.get<{ id: string; lat: number; lon: number; ts: number }>(GEO_CACHE_PREFIX + city);
+    if (raw && Date.now() - raw.ts < GEO_CACHE_TTL_MS) return raw;
+  } catch { /* 忽略缓存读取错误 */ }
+  return null;
+}
+
+async function qweatherGeo(city: string): Promise<{ id: string; lat: number; lon: number }> {
+  const cached = cachedGeo(city);
+  if (cached) return cached;
+  const geo = await httpJson<{ location?: Array<{ id: string; lat: string; lon: string }> }>(
+    `https://${config.qweatherApiHost}/geo/v2/city/lookup?location=${encodeURIComponent(city)}&key=${config.qweatherKey}`,
+  );
+  const hit = geo.location?.[0];
+  if (!hit) throw new Error(`和风天气未找到城市：${city}`);
+  const result = { id: hit.id, lat: Number(hit.lat), lon: Number(hit.lon) };
+  store.set(GEO_CACHE_PREFIX + city, { ...result, ts: Date.now() });
+  return result;
+}
+
+/** 实时天气：优先和风（QWEATHER_KEY），降级 Open-Meteo */
+export async function fetchCurrent(lat: number, lon: number, city?: string): Promise<CurrentWeather> {
+  if (config.qweatherKey) {
+    try {
+      const loc = city ? await qweatherGeo(city) : null;
+      const r = await httpJson<{ now?: { temp: string; feelsLike: string; humidity: string; windSpeed: string; text: string; icon: string } }>(
+        `https://${config.qweatherApiHost}/v7/weather/now?location=${loc?.id ?? `${lat.toFixed(2)},${lon.toFixed(2)}`}&key=${config.qweatherKey}`,
+      );
+      if (r.now) {
+        return {
+          temperature: Number(r.now.temp),
+          apparent: Number(r.now.feelsLike),
+          humidity: Number(r.now.humidity),
+          windSpeed: Number(r.now.windSpeed),
+          windSpeedUnit: "km/h",
+          weatherText: r.now.text || (QW_TEXT[r.now.icon] ?? `code ${r.now.icon}`),
+        };
+      }
+    } catch (e) {
+      console.error(`[weather] QWeather current failed, fallback to Open-Meteo: ${(e as Error).message}`);
+    }
+  }
   const r = await httpJson<{ current: Record<string, number> }>(
     `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}` +
       `&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m&timezone=auto`,
@@ -41,11 +108,32 @@ export async function fetchCurrent(lat: number, lon: number): Promise<CurrentWea
     apparent: r.current.apparent_temperature,
     humidity: r.current.relative_humidity_2m,
     windSpeed: r.current.wind_speed_10m,
+    windSpeedUnit: "m/s",
     weatherText: WMO[r.current.weather_code] ?? `code ${r.current.weather_code}`,
   };
 }
 
-export async function fetchForecast(lat: number, lon: number, days = 3): Promise<ForecastDay[]> {
+export async function fetchForecast(lat: number, lon: number, days = 3, city?: string): Promise<ForecastDay[]> {
+  if (config.qweatherKey && days <= 7) {
+    try {
+      const loc = city ? await qweatherGeo(city) : null;
+      const daysKey = days <= 3 ? "3d" : "7d";
+      const r = await httpJson<{ daily?: Array<{ fxDate: string; tempMax: string; tempMin: string; textDay: string; iconDay: string; precip: string }> }>(
+        `https://${config.qweatherApiHost}/v7/weather/${daysKey}?location=${loc?.id ?? `${lat.toFixed(2)},${lon.toFixed(2)}`}&key=${config.qweatherKey}`,
+      );
+      if (r.daily) {
+        return r.daily.slice(0, days).map((d) => ({
+          date: d.fxDate,
+          tMax: Number(d.tempMax),
+          tMin: Number(d.tempMin),
+          weatherText: d.textDay || (QW_TEXT[d.iconDay] ?? `code ${d.iconDay}`),
+          precipProb: Math.round(Number(d.precip)),
+        }));
+      }
+    } catch (e) {
+      console.error(`[weather] QWeather forecast failed, fallback to Open-Meteo: ${(e as Error).message}`);
+    }
+  }
   const r = await httpJson<{ daily: Record<string, Array<number | string>> }>(
     `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}` +
       `&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max&forecast_days=${days}&timezone=auto`,
@@ -67,15 +155,26 @@ export async function fetchForecast(lat: number, lon: number, days = 3): Promise
  */
 export async function fetchAlerts(city: string, lat: number, lon: number): Promise<WeatherAlert[]> {
   if (config.qweatherKey) {
-    const geo = await httpJson<{ location?: Array<{ id: string }> }>(
-      `https://geoapi.qweather.com/v2/city/lookup?location=${encodeURIComponent(city)}&key=${config.qweatherKey}`,
-    );
-    const id = geo.location?.[0]?.id;
-    if (id) {
-      const r = await httpJson<{ warning?: Array<{ title: string; level: string; text: string }> }>(
-        `https://devapi.qweather.com/v7/warning/now?location=${id}&key=${config.qweatherKey}`,
+    try {
+      // 新版和风实时天气预警 API：直接按经纬度查询，无需先查城市 ID
+      const r = await httpJson<{
+        alerts?: Array<{
+          headline?: string;
+          description?: string;
+          eventType?: { name?: string };
+          severity?: string | null;
+        }>;
+      }>(
+        `https://${config.qweatherApiHost}/weatheralert/v1/current/${lat.toFixed(2)}/${lon.toFixed(2)}?key=${config.qweatherKey}`,
       );
-      return (r.warning ?? []).map((w) => ({ title: w.title, level: w.level, description: w.text }));
+      return (r.alerts ?? []).map((w) => ({
+        title: w.headline ?? w.eventType?.name ?? "天气预警",
+        level: w.severity ?? "unknown",
+        description: w.description ?? w.headline ?? "",
+      }));
+    } catch (e) {
+      // 预警接口失败（403 无权限 / 网络异常）→ 降级为阈值推断，不阻断整体功能
+      console.error(`[weather] QWeather alerts failed, fallback to inference: ${(e as Error).message}`);
     }
   }
   // 降级：阈值推断

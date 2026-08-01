@@ -11,7 +11,9 @@ export const config = {
   },
 
   qweatherKey: process.env.QWEATHER_KEY ?? "",
+  qweatherApiHost: process.env.QWEATHER_API_HOST ?? "devapi.qweather.com",
   juheKey: process.env.JUHE_KEY ?? "",
+  tianapiKey: process.env.TIANAPI_KEY ?? "",
 
   kuaidi100: {
     customer: process.env.KUAIDI100_CUSTOMER ?? "",
@@ -26,7 +28,7 @@ export const config = {
 
   /** 调度周期（cron 表达式），可在模块注册时覆盖 */
   cron: {
-    weatherAlerts: "*/30 * * * *",
+    weatherAlerts: "*/15 * * * *",
     oilWatch: "0 9 * * *",
     expressPoll: "*/30 * * * *",
   },

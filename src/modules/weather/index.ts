@@ -20,8 +20,8 @@ const weatherModule: AssistantModule = {
       handler: async () => {
         try {
           const loc = requireLocation();
-          const w = await fetchCurrent(loc.lat, loc.lon);
-          return ok({ city: loc.city, ...w, unit: { temperature: "℃", windSpeed: "m/s" } });
+          const w = await fetchCurrent(loc.lat, loc.lon, loc.city);
+          return ok({ city: loc.city, ...w, unit: { temperature: "℃", windSpeed: w.windSpeedUnit } });
         } catch (e) {
           return fail((e as Error).message);
         }
@@ -35,7 +35,7 @@ const weatherModule: AssistantModule = {
         try {
           const loc = requireLocation();
           const { days } = z.object({ days: z.number().min(1).max(7).default(3) }).parse(args);
-          return ok({ city: loc.city, forecast: await fetchForecast(loc.lat, loc.lon, days) });
+          return ok({ city: loc.city, forecast: await fetchForecast(loc.lat, loc.lon, days, loc.city) });
         } catch (e) {
           return fail((e as Error).message);
         }

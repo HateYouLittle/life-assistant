@@ -7,6 +7,7 @@ import { queryExpress, detectCompany, type ExpressResult } from "./provider.js";
 interface Tracked {
   company: string;
   number: string;
+  phoneSuffix?: string;   // 手机号后四位（中通/顺丰/京东等必需）
   label?: string;         // 用户备注，如 "给妈妈的包裹"
   lastStatus?: string;    // 最近一次最新轨迹文本（用于 diff）
   createdAt: string;
@@ -21,6 +22,7 @@ function getTracked(): Tracked[] {
 const trackSchema = {
   number: z.string().describe("快递单号"),
   company: z.string().optional().describe("快递公司代码（如 shunfeng/yuantong），不填则自动识别"),
+  phoneSuffix: z.string().optional().describe("寄件人或收件人手机号后四位（顺丰/中通/京东等必需，否则可能查不到轨迹）"),
   label: z.string().optional().describe("包裹备注名"),
 };
 
@@ -34,13 +36,13 @@ const expressModule: AssistantModule = {
       handler: async (args) => {
         try {
           const p = z.object(trackSchema).parse(args);
-          const company = p.company ?? (await detectCompany(p.number));
           const list = getTracked();
           if (list.some((t) => t.number === p.number)) return ok({ status: "already_tracked", number: p.number });
-          // 立即查一次作为基线
-          const first = await queryExpress(company, p.number);
+          // 立即查一次作为基线（TianAPI 自动识别公司；手机后四位用于中通/顺丰等）
+          const first = await queryExpress(p.company ?? "", p.number, p.phoneSuffix);
+          const company = p.company ?? first.company;
           list.push({
-            company, number: p.number, label: p.label,
+            company, number: p.number, phoneSuffix: p.phoneSuffix, label: p.label,
             lastStatus: first.traces[0]?.status, createdAt: new Date().toISOString(),
           });
           store.set(KEY, list);
@@ -69,12 +71,11 @@ const expressModule: AssistantModule = {
     {
       name: "query",
       description: "立即查询某快递单号的最新完整物流轨迹（不订阅）。",
-      schema: { number: z.string(), company: z.string().optional() },
+      schema: { number: z.string(), company: z.string().optional(), phoneSuffix: z.string().optional().describe("手机号后四位（中通/顺丰/京东等必需）") },
       handler: async (args) => {
         try {
-          const p = z.object({ number: z.string(), company: z.string().optional() }).parse(args);
-          const company = p.company ?? (await detectCompany(p.number));
-          return ok(await queryExpress(company, p.number));
+          const p = z.object({ number: z.string(), company: z.string().optional(), phoneSuffix: z.string().optional() }).parse(args);
+          return ok(await queryExpress(p.company ?? "", p.number, p.phoneSuffix));
         } catch (e) {
           return fail((e as Error).message);
         }
@@ -90,7 +91,7 @@ const expressModule: AssistantModule = {
         for (const t of list) {
           let r: ExpressResult;
           try {
-            r = await queryExpress(t.company, t.number);
+            r = await queryExpress(t.company, t.number, t.phoneSuffix);
           } catch {
             continue; // 单次失败下轮再试
           }
