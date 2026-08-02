@@ -188,7 +188,13 @@ export function startScheduler(): SchedulerHandle {
 }
 
 async function main(): Promise<void> {
-  startScheduler();
+  const handle = startScheduler();
+  const shutdown = (): void => {
+    handle.stop();
+    process.exitCode = 0;
+  };
+  process.once("SIGTERM", shutdown);
+  process.once("SIGINT", shutdown);
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))) {
