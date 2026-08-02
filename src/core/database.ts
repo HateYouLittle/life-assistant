@@ -18,7 +18,9 @@ function ensureColumn(db: DatabaseSync, table: string, name: string, definition:
 
 function migrate(db: DatabaseSync): void {
   db.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;");
-  db.exec(`
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    db.exec(`
     CREATE TABLE IF NOT EXISTS schema_meta (
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL
@@ -102,15 +104,20 @@ function migrate(db: DatabaseSync): void {
     );
     CREATE INDEX IF NOT EXISTS idx_schedules_due ON schedules(enabled, next_run_at);
     CREATE INDEX IF NOT EXISTS idx_profile_notifications_owner ON profile_notifications(profile_id, id);
-  `);
+    `);
 
-  // Additive migration for databases created by early development builds.
-  ensureColumn(db, "schedules", "type", "TEXT NOT NULL DEFAULT 'todo'");
-  ensureColumn(db, "schedules", "priority", "TEXT NOT NULL DEFAULT 'normal'");
-  ensureColumn(db, "schedules", "status", "TEXT NOT NULL DEFAULT 'active'");
-  ensureColumn(db, "schedules", "all_day", "INTEGER NOT NULL DEFAULT 1");
+    // Additive migration for databases created by early development builds.
+    ensureColumn(db, "schedules", "type", "TEXT NOT NULL DEFAULT 'todo'");
+    ensureColumn(db, "schedules", "priority", "TEXT NOT NULL DEFAULT 'normal'");
+    ensureColumn(db, "schedules", "status", "TEXT NOT NULL DEFAULT 'active'");
+    ensureColumn(db, "schedules", "all_day", "INTEGER NOT NULL DEFAULT 1");
 
-  db.prepare("INSERT OR REPLACE INTO schema_meta(key, value) VALUES('version', '2')").run();
+    db.prepare("INSERT OR REPLACE INTO schema_meta(key, value) VALUES('version', '2')").run();
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
 }
 
 function legacySource(notice: Record<string, unknown>): "weather" | "oilprice" | null {
@@ -196,10 +203,16 @@ function migrateLegacyJson(db: DatabaseSync): void {
 export function getDatabase(): DatabaseSync {
   if (database) return database;
   fs.mkdirSync(config.dataDir, { recursive: true });
-  database = new DatabaseSync(path.join(config.dataDir, "life-assistant.sqlite"));
-  migrate(database);
-  migrateLegacyJson(database);
-  return database;
+  const candidate = new DatabaseSync(path.join(config.dataDir, "life-assistant.sqlite"));
+  try {
+    migrate(candidate);
+    migrateLegacyJson(candidate);
+    database = candidate;
+    return candidate;
+  } catch (error) {
+    candidate.close();
+    throw error;
+  }
 }
 
 export function resetDatabaseForTests(): void {

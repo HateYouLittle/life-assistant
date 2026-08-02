@@ -15,7 +15,7 @@ const { createSchedule, listSchedules, getSchedule, updateSchedule, deleteSchedu
 );
 const { publishGlobal, publishProfile, pullPending } = await import("../src/core/notifier.js");
 const { getDatabase } = await import("../src/core/database.js");
-const { runDueSchedules, acquireSchedulerLease, releaseSchedulerLease } = await import(
+const { runDueSchedules, acquireSchedulerLease, refreshSchedulerLease, releaseSchedulerLease } = await import(
   "../src/scheduler.js",
 );
 
@@ -91,6 +91,15 @@ test("scheduler claims a singleton lease and emits only the target Profile notic
   const bNotices = pullPending(requireProfileContext("profile-b"));
   assert.equal(aNotices.some((n) => n.body.includes(schedule.title)), true);
   assert.equal(bNotices.some((n) => n.body.includes(schedule.title)), false);
+});
+
+test("a displaced scheduler owner cannot refresh or reacquire through the heartbeat path", () => {
+  assert.equal(acquireSchedulerLease("stale-owner"), true);
+  assert.equal(refreshSchedulerLease("stale-owner"), true);
+  db.prepare("UPDATE scheduler_lease SET owner = ? WHERE name = ?").run("replacement-owner", "scheduler");
+  assert.equal(refreshSchedulerLease("stale-owner"), false);
+  db.prepare("DELETE FROM scheduler_lease WHERE name = ?").run("scheduler");
+  assert.equal(refreshSchedulerLease("stale-owner"), false);
 });
 
 test("migration namespaces legacy shared schedule data instead of copying it", () => {

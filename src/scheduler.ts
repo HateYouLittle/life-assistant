@@ -28,8 +28,8 @@ export function acquireSchedulerLease(owner: string, at = new Date()): boolean {
   const row = db.prepare("SELECT owner, acquired_at FROM scheduler_lease WHERE name = ?").get(LEASE_NAME) as { owner: string; acquired_at: string } | undefined;
   if (!row) return false;
   if (row.owner === owner) {
-    db.prepare("UPDATE scheduler_lease SET acquired_at = ? WHERE name = ? AND owner = ?").run(timestamp, LEASE_NAME, owner);
-    return true;
+    const result = db.prepare("UPDATE scheduler_lease SET acquired_at = ? WHERE name = ? AND owner = ?").run(timestamp, LEASE_NAME, owner) as { changes: number };
+    return result.changes === 1;
   }
   const age = at.getTime() - Date.parse(row.acquired_at);
   if (age > LEASE_TTL_MS) {
@@ -37,6 +37,13 @@ export function acquireSchedulerLease(owner: string, at = new Date()): boolean {
     return result.changes === 1;
   }
   return false;
+}
+
+export function refreshSchedulerLease(owner: string, at = new Date()): boolean {
+  const result = getDatabase().prepare(
+    "UPDATE scheduler_lease SET acquired_at = ? WHERE name = ? AND owner = ?",
+  ).run(at.toISOString(), LEASE_NAME, owner) as { changes: number };
+  return result.changes === 1;
 }
 
 export function releaseSchedulerLease(owner: string): void {
@@ -111,39 +118,72 @@ export function startScheduler(): SchedulerHandle {
   const owner = `${process.pid}-${crypto.randomUUID()}`;
   if (!acquireSchedulerLease(owner)) return { owner, started: false, stop: () => undefined };
   const tasks: ScheduledTask[] = [];
-  const heartbeat = setInterval(() => {
-    if (!acquireSchedulerLease(owner)) console.error("[scheduler] lease heartbeat lost");
+  let stopped = false;
+  let activeRuns = 0;
+  let leaseReleased = false;
+  let heartbeat: NodeJS.Timeout;
+  const releaseIfIdle = (): void => {
+    if (!stopped || activeRuns !== 0 || leaseReleased) return;
+    releaseSchedulerLease(owner);
+    leaseReleased = true;
+  };
+  const stop = (): void => {
+    if (stopped) return;
+    stopped = true;
+    clearInterval(heartbeat);
+    for (const task of tasks) task.stop();
+    releaseIfIdle();
+  };
+  const fence = (): boolean => {
+    if (stopped) return false;
+    if (refreshSchedulerLease(owner)) return true;
+    console.error("[scheduler] lease lost; stopping all scheduled work");
+    stop();
+    return false;
+  };
+  const runFenced = async (handler: () => Promise<void>): Promise<void> => {
+    if (!fence()) return;
+    activeRuns += 1;
+    try {
+      await handler();
+    } finally {
+      activeRuns -= 1;
+      releaseIfIdle();
+    }
+  };
+  heartbeat = setInterval(() => {
+    fence();
   }, 60_000);
   heartbeat.unref();
   for (const module of getModules()) {
     for (const job of module.jobs ?? []) {
       const task = cron.schedule(job.cron, async () => {
-        try {
-          await job.handler({ notify });
-        } catch (error) {
-          console.error(`[job ${module.name}.${job.name}] failed:`, error);
-        }
+        await runFenced(async () => {
+          try {
+            await job.handler({ notify });
+          } catch (error) {
+            console.error(`[job ${module.name}.${job.name}] failed:`, error);
+          }
+        });
       });
       tasks.push(task);
       console.log(`[scheduler] registered ${module.name}.${job.name} cron="${job.cron}"`);
     }
   }
   tasks.push(cron.schedule("* * * * *", async () => {
-    try {
-      await runDueSchedules();
-    } catch (error) {
-      console.error("[job schedule.tick] failed:", error);
-    }
+    await runFenced(async () => {
+      try {
+        await runDueSchedules();
+      } catch (error) {
+        console.error("[job schedule.tick] failed:", error);
+      }
+    });
   }));
   console.log(`[scheduler] started, ${tasks.length} jobs from ${getModules().length} modules.`);
   return {
     owner,
     started: true,
-    stop: () => {
-      clearInterval(heartbeat);
-      for (const task of tasks) task.stop();
-      releaseSchedulerLease(owner);
-    },
+    stop,
   };
 }
 
