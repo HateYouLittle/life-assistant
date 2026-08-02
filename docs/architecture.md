@@ -181,7 +181,9 @@ scheduler (cron)
 
 MCP 进程必须由 Hermes 显式注入 `HERMES_PROFILE`。日程工具不接受 `profileId` 参数，所有查询都使用不可变的 ProfileContext；Profile 缺失或非法时 fail closed。`notify.pull` 在事务中合并当前 Profile 未读公共通知和当前 Profile 私有通知。
 
-日程通知先写入 Profile 私有通知和同事务 outbox。配置 `PROFILE_PUSH_ROUTES_JSON` 后，scheduler 使用 HMAC V2 调用对应 Hermes `deliver-only` Webhook，由该 Profile 的 QQ Home 主动发送；成功后避免 `notify.pull` 重复播报，失败按退避计划重试并保留私有队列兜底。公共 webhook/Bark/Server酱仍不接收私密正文。
+日程通知先写入 Profile 私有通知和同事务 outbox。配置 `PROFILE_PUSH_ROUTES_JSON` 后，scheduler 使用 HMAC V2 调用对应 Hermes `deliver-only` Webhook，由该 Profile 的当前目标平台（默认 QQ Home）主动发送；成功后避免 `notify.pull` 重复播报，失败按退避计划重试并保留私有队列兜底。公共 webhook/Bark/Server酱仍不接收私密正文。
+
+主动推送的目标平台属于 Hermes 动态订阅层，不属于 Life Assistant 业务代码。单一目标切换只需在对应 Profile 用 `hermes webhook remove` 和 `hermes webhook subscribe --deliver <platform> --deliver-only` 重建同名订阅；保持 route 名、URL、HMAC secret 时不需要改 `.env`、迁移 SQLite 或重启 scheduler，动态订阅会热加载。若修改 Hermes 平台凭据/配置，重启对应 gateway；若修改 `PROFILE_PUSH_ROUTES_JSON`，重启 scheduler。当前每个 Profile 只有一个主动目标；多平台同时发送需要扩展多 route/outbox 配置。切换后必须用 `webhook list` 和临时日程验证，并保留 `notify.pull` 作为兜底。
 
 日程存储使用 Node >=22.5 内置 `node:sqlite`，启用 WAL、事务和 scheduler 租约。JSON `store.json` 只作为旧数据迁移源和备份，不再承担多进程业务并发写入。
 

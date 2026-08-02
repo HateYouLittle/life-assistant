@@ -125,6 +125,49 @@ hermes skills list | grep life     # 技能应已加载
 | `NOTIFY_WEBHOOK_URL` / `BARK_URL` / `SERVERCHAN_SENDKEY` | 否 | 主动推送通道，可配多个 |
 | `PROFILE_PUSH_ROUTES_JSON` | 否 | Profile 私有 `deliver-only` Webhook 路由；HMAC secret 为 64 位随机十六进制值，`.env` 必须为 `600` |
 
+## 切换 Profile 主动推送平台
+
+Life Assistant 不直接绑定 QQ SDK；它把私有提醒投递到 Hermes 的 `deliver-only` Webhook，再由 Hermes 选择目标平台。因此，**单个平台切换通常不需要改代码、不需要迁移 SQLite**。
+
+当前部署的动态订阅是：
+
+```text
+default → life-assistant-reminder-default → qqbot
+bestie  → life-assistant-reminder-bestie  → qqbot
+```
+
+### 只切换一个 Profile 的目标平台
+
+先确保目标平台已经在对应 Hermes Profile 中配置好账号、Home 会话或目标 chat ID。然后删除旧订阅，用相同的 route 名、URL 和 HMAC secret 重建；只把 `--deliver qqbot` 换成目标平台，例如 `weixin` 或 `feishu`：
+
+```bash
+# default：QQ → 微信（示例）
+hermes webhook remove life-assistant-reminder-default
+hermes webhook subscribe life-assistant-reminder-default \
+  --prompt $'🎂 {notification.title}\n\n{notification.body}' \
+  --deliver weixin \
+  --deliver-only \
+  --secret "$DEFAULT_ROUTE_SECRET"
+
+# bestie：QQ → 微信（示例）
+hermes -p bestie webhook remove life-assistant-reminder-bestie
+hermes -p bestie webhook subscribe life-assistant-reminder-bestie \
+  --prompt $'🎂 {notification.title}\n\n{notification.body}' \
+  --deliver weixin \
+  --deliver-only \
+  --secret "$BESTIE_ROUTE_SECRET"
+```
+
+- 不要把真实 secret 粘贴到聊天、脚本或 Git；从权限为 `600` 的 secret 文件安全加载到环境变量。
+- 仅更换 `--deliver` 时，`PROFILE_PUSH_ROUTES_JSON`、scheduler 和 SQLite 不需要修改。
+- 动态订阅会热加载，通常不需要重启 gateway；如果同时修改了 Hermes 平台凭据或平台配置，才重启对应 Profile 的 gateway。
+- 如果修改了 route 名、URL 或 HMAC secret，必须同步更新项目 `.env` 的 `PROFILE_PUSH_ROUTES_JSON`，然后重启 scheduler。
+- 切换后用 `hermes webhook list`（bestie 使用 `hermes -p bestie webhook list`）确认目标，再创建一条临时日程做端到端测试。
+
+### 回滚与多平台限制
+
+回滚就是把 `--deliver weixin/feishu` 改回 `--deliver qqbot`，其它参数保持不变。当前配置模型是**每个 Profile 一个主动推送目标**；如果要同一提醒同时发 QQ、微信、飞书，需要把 Profile route 配置扩展为多个 route，并为每条 route 建立独立 outbox。`notify.pull` 始终是私有兜底，不随平台切换消失。
+
 ## 工具一览
 
 `location.get/set/detect` · `weather.current/forecast/alerts` · `oilprice.current/next_adjustment` · `schedule.create/list/get/update/complete/delete` · `notify.pull`

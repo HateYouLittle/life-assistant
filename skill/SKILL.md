@@ -1,5 +1,6 @@
 ---
 name: life-assistant
+description: "Use when users ask about weather, schedules, reminders, or notification platform switching."
 summary: "个人生活助理：共享天气/油价与 Profile 私有日程，支持公历和中国农历生日提醒。适配 Hermes Agent。"
 read_when:
   - 用户询问天气、气温、穿什么、要不要带伞
@@ -51,8 +52,19 @@ read_when:
 - 待办默认使用公历；生日和纪念日可以使用中国农历：传 `calendar: "lunar"`、`lunarMonth`、`lunarDay`。
 - 农历生日按当年转换为公历日期再提醒；普通月每年触发，`leapMonthPolicy: "leap"` 的闰月生日在非对应闰月年份跳过。
 - 创建前确认用户说的是公历还是农历；返回结果时同时说明农历字段和实际触发的公历日期，避免日期错位。
-- 日程提醒优先通过当前 Profile 的 Hermes `deliver-only` Webhook 主动发送到 QQ；成功后 `notify.pull` 不重复播报，失败或未配置时保留在私有队列兜底。
+- 日程提醒优先通过当前 Profile 的 Hermes `deliver-only` Webhook 主动发送到当前配置目标平台（默认 QQ）；成功后 `notify.pull` 不重复播报，失败或未配置时保留在私有队列兜底。
 - 私有日程不会发送到没有 Profile 路由的公共 webhook/Bark/Server酱。
+
+## 主动推送平台切换
+
+当用户要求“换 QQ/微信/飞书/其他消息平台”时，先区分是**切换单一目标**还是**同时增加多个目标**：
+
+- 单一目标切换：不改 Life Assistant 代码、不迁移 SQLite；在对应 Hermes Profile 删除并重建同名动态 Webhook 订阅，把 `--deliver qqbot` 替换为目标平台（如 `weixin`、`feishu`）。default 使用 `hermes webhook ...`，bestie 使用 `hermes -p bestie webhook ...`。
+- 订阅模板保持 `{notification.title}` 和 `{notification.body}`；HMAC secret 必须保持原值或用新的 64 位随机十六进制值，不能写进聊天、Git 或普通日志。
+- 仅修改动态订阅目标时通常不重启 gateway；修改 Hermes 平台凭据或配置时重启对应 Profile 的 gateway。
+- 修改 route 名、URL 或 secret 时同步更新 `PROFILE_PUSH_ROUTES_JSON`，并重启 scheduler；只修改 `--deliver` 不需要改该变量。
+- 切换后用 `webhook list` 和一条临时日程做端到端验证；验证完成删除临时日程。失败时保留 `notify.pull` 作为兜底。
+- 当前每个 Profile 只有一个主动推送目标；用户要求 QQ+微信同时发送时，不要假装配置已支持，应说明需要扩展多 route/outbox 配置。
 
 ## 快递（已封存，暂不可用）
 
