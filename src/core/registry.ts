@@ -1,4 +1,5 @@
 import type { ZodRawShape } from "zod";
+import type { ProfileContext } from "./profile.js";
 
 export interface ToolResult {
   [x: string]: unknown; // 兼容 MCP SDK CallToolResult
@@ -12,11 +13,12 @@ export interface ToolDef {
   /** 给 LLM 的工具说明，直接影响调用准确率，务必写清适用场景与参数含义 */
   description: string;
   schema: ZodRawShape;
-  handler: (args: Record<string, unknown>) => Promise<ToolResult>;
+  handler: (args: Record<string, unknown>, context?: ProfileContext) => Promise<ToolResult>;
 }
 
 export interface JobContext {
   notify: (title: string, body: string, dedupeKey?: string) => Promise<void>;
+  notifyGlobal?: (source: string, title: string, body: string, dedupeKey?: string) => Promise<void>;
 }
 
 export interface JobDef {

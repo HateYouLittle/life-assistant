@@ -1,7 +1,7 @@
 # Life Assistant — 架构设计文档
 
 > 个人生活助理：Skill + MCP 服务，适配 Hermes Agent
-> 初版能力：天气查询与主动预警、油价查询与调价预通知、快递动态追踪与通知
+> 当前能力：共享天气/油价信息与公共通知、Profile 私有日程和中国农历提醒
 
 ---
 
@@ -94,7 +94,7 @@ MCP 无法由服务端主动反向调用客户端，因此采用"双通道"策�
 
 ### 3.3 存储（Store）
 
-默认 JSON 文件（`DATA_DIR/store.json`），`Store` 类只依赖 `get/set/del` 三个原子操作，后续可平替 SQLite / Redis 而不动业务代码。存储内容：位置信息、快递订阅列表与最近状态、通知去重 key、待读通知队列。
+默认业务存储使用 `DATA_DIR/life-assistant.sqlite`（Node >=22.5 内置 `node:sqlite`），启用 WAL、事务和 Profile 作用域约束；`Store` 仍提供 `get/set/del` 兼容接口，供公共位置和 Provider 缓存使用。旧 `store.json` 只作为一次性迁移源，并保留 `.pre-sqlite.bak` 备份。
 
 ### 3.4 位置服务（Location）
 
@@ -127,9 +127,7 @@ MCP 无法由服务端主动反向调用客户端，因此采用"双通道"策�
 | `weather.alerts` | 当前生效的气象预警 |
 | `oilprice.current` | 当地 92#/95#/0# 油价 |
 | `oilprice.next_adjustment` | 下次调价窗口、预计方向与倒计时 |
-| `express.track` | 订阅一个单号的动态追踪 |
-| `express.list` / `express.untrack` | 查看/取消追踪列表 |
-| `express.query` | 立即查询某单号最新轨迹 |
+| `schedule.create/list/get/update/complete/delete` | 管理当前 Profile 的待办、生日、纪念日和农历提醒 |
 | `notify.pull` | 拉取未读主动通知 |
 
 ## 6. 目录结构
@@ -172,8 +170,27 @@ scheduler (cron)
   └──► 所有通知同时入 notify.pull 队列（Agent 会话开始时拉取兜底）
 ```
 
-## 8. Roadmap（预留扩展方向）
+## 8. Profile 作用域与日程隔离
+
+公共生活信息和 Profile 私有生活记录使用不同的作用域：
+
+| 作用域 | 内容 | 规则 |
+|---|---|---|
+| global | 位置、天气/油价缓存、天气/油价去重键、公共通知 | 所有 Profile 共享；公共通知每个 Profile 各自读取一次 |
+| profile | 日程、重复规则、提醒、occurrence、日程通知 | 只允许所属 `HERMES_PROFILE` 访问 |
+
+MCP 进程必须由 Hermes 显式注入 `HERMES_PROFILE`。日程工具不接受 `profileId` 参数，所有查询都使用不可变的 ProfileContext；Profile 缺失或非法时 fail closed。`notify.pull` 在事务中合并当前 Profile 未读公共通知和当前 Profile 私有通知。
+
+日程通知当前只进入 Profile 私有队列。项目只有一套公共 webhook/Bark/Server酱配置时，不能把私密日程正文发送到公共通道；未来增加 Profile 专属通道路由后再开放直推。
+
+日程存储使用 Node >=22.5 内置 `node:sqlite`，启用 WAL、事务和 scheduler 租约。JSON `store.json` 只作为旧数据迁移源和备份，不再承担多进程业务并发写入。
+
+### 中国农历
+
+日程日期明确区分 `calendar: "solar" | "lunar"`。农历日程保存 `lunarMonth`、`lunarDay` 和 `leapMonthPolicy`，不能把农历日期伪装成公历日期。普通农历月日每年转换为当年公历 occurrence；闰月策略为 `leap` 时，只在对应闰月年份触发，没有对应闰月的年份默认跳过。农历转换使用经过测试的 `lunar-javascript`，提醒和存储仍按日程自己的 IANA 时区计算。
+
+## 9. Roadmap（预留扩展方向）
 
 - v0.2：SQLite 存储、通知通道插件化市场（钉钉/飞书/邮件）
 - v0.3：新模块示例 —— 空气质量、车辆限行、纪念日提醒
-- v0.4：多用户/多位置支持、Web 配置面板
+- v0.4：Profile 专属通知通道、静默时段、Web 配置面板

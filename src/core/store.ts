@@ -1,49 +1,23 @@
-import fs from "node:fs";
-import path from "node:path";
-import { config } from "../config.js";
+import { getDatabase } from "./database.js";
 
-/**
- * JSON 文件存储。接口刻意保持 get/set/del 三个原子操作，
- * 后续可平替 SQLite / Redis 而不动业务代码。
- */
+/** Compatibility key/value facade backed by the shared SQLite transaction store. */
 class Store {
-  private file: string;
-  private cache: Record<string, unknown> | null = null;
-
-  constructor() {
-    this.file = path.join(config.dataDir, "store.json");
-  }
-
-  private load(): Record<string, unknown> {
-    if (this.cache) return this.cache;
-    try {
-      this.cache = JSON.parse(fs.readFileSync(this.file, "utf8"));
-    } catch {
-      this.cache = {};
-    }
-    return this.cache!;
-  }
-
-  private persist(): void {
-    fs.mkdirSync(path.dirname(this.file), { recursive: true });
-    const tmp = this.file + ".tmp";
-    fs.writeFileSync(tmp, JSON.stringify(this.cache, null, 2));
-    fs.renameSync(tmp, this.file); // 原子替换，避免写一半损坏
-  }
-
   get<T>(key: string, fallback?: T): T | undefined {
-    const v = this.load()[key];
-    return (v === undefined ? fallback : (v as T)) as T | undefined;
+    const row = getDatabase().prepare("SELECT value FROM kv WHERE key = ?").get(key) as { value?: string } | undefined;
+    if (!row?.value) return fallback;
+    try {
+      return JSON.parse(row.value) as T;
+    } catch {
+      return fallback;
+    }
   }
 
   set(key: string, value: unknown): void {
-    this.load()[key] = value;
-    this.persist();
+    getDatabase().prepare("INSERT INTO kv(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(key, JSON.stringify(value));
   }
 
   del(key: string): void {
-    delete this.load()[key];
-    this.persist();
+    getDatabase().prepare("DELETE FROM kv WHERE key = ?").run(key);
   }
 }
 
