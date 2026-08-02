@@ -13,7 +13,7 @@
 ## 特性
 
 - **Skill + MCP 双形态**：`skill/SKILL.md` 教 Agent 何时用、怎么用；MCP Server 提供工具
-- **主动推送**：内置调度器 + 通知通道（stdout / webhook / Bark / Server酱），并有 `notify.pull` 拉取兜底
+- **主动推送**：公共通知支持原有通道；Profile 私有日程通过 Hermes `deliver-only` Webhook 主动投递，并有 `notify.pull` 拉取兜底
 - **插件化模块**：新功能实现 `AssistantModule` 接口、注册一行即可，核心零改动
 - **低成本数据源**：Open-Meteo（免费无 Key）、和风天气免费版、聚合数据油价（低成本）、本地调价窗口推算（免费）
 - **Profile 隔离**：天气/油价数据和公共通知共享；日程、提醒和日程通知严格绑定 `HERMES_PROFILE`
@@ -54,7 +54,7 @@ npm run build
 npm run start:scheduler     # 或 pm2 start dist/scheduler.js --name life-assistant
 ```
 
-不启动调度进程也能用全部查询工具，只是没有主动提醒。日程通知会写入目标 Profile 的 `notify.pull` 队列；同一个 `DATA_DIR` 只应运行一个 scheduler。
+不启动调度进程也能用全部查询工具，只是没有主动提醒。配置 `PROFILE_PUSH_ROUTES_JSON` 后，日程通知会进入可靠 outbox 并主动投递到目标 Profile；发送失败时仍保留在 `notify.pull`。同一个 `DATA_DIR` 只应运行一个 scheduler。
 
 ## 接入 Hermes Agent（详细步骤）
 
@@ -123,6 +123,7 @@ hermes skills list | grep life     # 技能应已加载
 | `JUHE_KEY` | 否 | 聚合数据油价 Key |
 | `KUAIDI100_CUSTOMER/KEY` | 否* | 快递100 授权（*快递功能必填） |
 | `NOTIFY_WEBHOOK_URL` / `BARK_URL` / `SERVERCHAN_SENDKEY` | 否 | 主动推送通道，可配多个 |
+| `PROFILE_PUSH_ROUTES_JSON` | 否 | Profile 私有 `deliver-only` Webhook 路由；HMAC secret 为 64 位随机十六进制值，`.env` 必须为 `600` |
 
 ## 工具一览
 
@@ -136,7 +137,8 @@ hermes skills list | grep life     # 技能应已加载
 - `calendar: "lunar"`：使用 `lunarMonth`、`lunarDay`，不能把农历日期当作公历 `date`。
 - 农历生日/纪念日按每年转换为当年的公历日期；普通月每年触发。
 - `leapMonthPolicy: "leap"` 表示只在对应闰月年份触发；没有对应闰月的年份默认跳过。
-- 当前公共 webhook/Bark/Server酱配置没有 Profile 路由，因此日程通知只进入当前 Profile 的 `notify.pull`，不会把私密正文发到公共通道。
+- 配置 Profile 私有 Webhook 后，日程提醒会由 scheduler 通过 HMAC V2 主动投递；明确失败按 1m/5m/15m/1h 退避重试，网络结果不确定时复用请求 ID 防重复。
+- QQ/其他主动投递成功后，`notify.pull` 不会重复播报；主动投递失败或未配置时仍通过当前 Profile 的 `notify.pull` 兜底。
 
 ## 新增一个功能模块（5 分钟）
 
@@ -157,7 +159,7 @@ registerModule(mod);
 ## Roadmap
 
 - v0.2 SQLite 存储、更多通知通道（钉钉/飞书/邮件）
-- v0.3 Profile 专属 webhook/Bark 通道、静默时段、snooze
+- v0.3 已完成 Profile 专属 Hermes Webhook outbox；后续增加静默时段、snooze
 - v0.4 多位置/多用户、Web 配置面板
 
 ## 贡献

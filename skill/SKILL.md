@@ -51,7 +51,8 @@ read_when:
 - 待办默认使用公历；生日和纪念日可以使用中国农历：传 `calendar: "lunar"`、`lunarMonth`、`lunarDay`。
 - 农历生日按当年转换为公历日期再提醒；普通月每年触发，`leapMonthPolicy: "leap"` 的闰月生日在非对应闰月年份跳过。
 - 创建前确认用户说的是公历还是农历；返回结果时同时说明农历字段和实际触发的公历日期，避免日期错位。
-- 日程提醒当前只通过当前 Profile 的 `notify.pull` 送达，不发送到没有 Profile 路由的公共 webhook/Bark/Server酱。
+- 日程提醒优先通过当前 Profile 的 Hermes `deliver-only` Webhook 主动发送到 QQ；成功后 `notify.pull` 不重复播报，失败或未配置时保留在私有队列兜底。
+- 私有日程不会发送到没有 Profile 路由的公共 webhook/Bark/Server酱。
 
 ## 快递（已封存，暂不可用）
 

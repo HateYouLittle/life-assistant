@@ -181,7 +181,7 @@ scheduler (cron)
 
 MCP 进程必须由 Hermes 显式注入 `HERMES_PROFILE`。日程工具不接受 `profileId` 参数，所有查询都使用不可变的 ProfileContext；Profile 缺失或非法时 fail closed。`notify.pull` 在事务中合并当前 Profile 未读公共通知和当前 Profile 私有通知。
 
-日程通知当前只进入 Profile 私有队列。项目只有一套公共 webhook/Bark/Server酱配置时，不能把私密日程正文发送到公共通道；未来增加 Profile 专属通道路由后再开放直推。
+日程通知先写入 Profile 私有通知和同事务 outbox。配置 `PROFILE_PUSH_ROUTES_JSON` 后，scheduler 使用 HMAC V2 调用对应 Hermes `deliver-only` Webhook，由该 Profile 的 QQ Home 主动发送；成功后避免 `notify.pull` 重复播报，失败按退避计划重试并保留私有队列兜底。公共 webhook/Bark/Server酱仍不接收私密正文。
 
 日程存储使用 Node >=22.5 内置 `node:sqlite`，启用 WAL、事务和 scheduler 租约。JSON `store.json` 只作为旧数据迁移源和备份，不再承担多进程业务并发写入。
 
@@ -193,4 +193,4 @@ MCP 进程必须由 Hermes 显式注入 `HERMES_PROFILE`。日程工具不接受
 
 - v0.2：SQLite 存储、通知通道插件化市场（钉钉/飞书/邮件）
 - v0.3：新模块示例 —— 空气质量、车辆限行、纪念日提醒
-- v0.4：Profile 专属通知通道、静默时段、Web 配置面板
+- v0.4：更多 Profile 专属通知目标、静默时段、Web 配置面板

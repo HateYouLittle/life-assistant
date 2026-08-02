@@ -16,7 +16,7 @@ function ensureColumn(db: DatabaseSync, table: string, name: string, definition:
   }
 }
 
-function migrate(db: DatabaseSync): void {
+export function migrateDatabaseSchema(db: DatabaseSync): void {
   db.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;");
   db.exec("BEGIN IMMEDIATE");
   try {
@@ -63,6 +63,25 @@ function migrate(db: DatabaseSync): void {
       read_at TEXT NOT NULL,
       PRIMARY KEY (profile_id, notification_id)
     );
+    CREATE TABLE IF NOT EXISTS profile_notification_deliveries (
+      profile_id TEXT NOT NULL,
+      notification_id INTEGER NOT NULL,
+      route TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      attempts INTEGER NOT NULL DEFAULT 0,
+      request_generation INTEGER NOT NULL DEFAULT 1,
+      request_started_at TEXT,
+      transport_failures INTEGER NOT NULL DEFAULT 0,
+      next_attempt_at TEXT NOT NULL,
+      claim_token TEXT,
+      claimed_at TEXT,
+      sent_at TEXT,
+      last_error TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (profile_id, notification_id, route),
+      FOREIGN KEY (profile_id, notification_id) REFERENCES profile_notifications(profile_id, id) ON DELETE CASCADE
+    );
     CREATE TABLE IF NOT EXISTS schedules (
       profile_id TEXT NOT NULL,
       id TEXT NOT NULL,
@@ -104,6 +123,8 @@ function migrate(db: DatabaseSync): void {
     );
     CREATE INDEX IF NOT EXISTS idx_schedules_due ON schedules(enabled, next_run_at);
     CREATE INDEX IF NOT EXISTS idx_profile_notifications_owner ON profile_notifications(profile_id, id);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_profile_notifications_composite ON profile_notifications(profile_id, id);
+    CREATE INDEX IF NOT EXISTS idx_profile_deliveries_due ON profile_notification_deliveries(status, next_attempt_at);
     `);
 
     // Additive migration for databases created by early development builds.
@@ -111,8 +132,13 @@ function migrate(db: DatabaseSync): void {
     ensureColumn(db, "schedules", "priority", "TEXT NOT NULL DEFAULT 'normal'");
     ensureColumn(db, "schedules", "status", "TEXT NOT NULL DEFAULT 'active'");
     ensureColumn(db, "schedules", "all_day", "INTEGER NOT NULL DEFAULT 1");
+    ensureColumn(db, "profile_notification_deliveries", "request_generation", "INTEGER NOT NULL DEFAULT 1");
+    ensureColumn(db, "profile_notification_deliveries", "request_started_at", "TEXT");
+    ensureColumn(db, "profile_notification_deliveries", "transport_failures", "INTEGER NOT NULL DEFAULT 0");
+    ensureColumn(db, "profile_notification_deliveries", "claim_token", "TEXT");
+    ensureColumn(db, "profile_notification_deliveries", "claimed_at", "TEXT");
 
-    db.prepare("INSERT OR REPLACE INTO schema_meta(key, value) VALUES('version', '2')").run();
+    db.prepare("INSERT OR REPLACE INTO schema_meta(key, value) VALUES('version', '3')").run();
     db.exec("COMMIT");
   } catch (error) {
     db.exec("ROLLBACK");
@@ -205,7 +231,7 @@ export function getDatabase(): DatabaseSync {
   fs.mkdirSync(config.dataDir, { recursive: true });
   const candidate = new DatabaseSync(path.join(config.dataDir, "life-assistant.sqlite"));
   try {
-    migrate(candidate);
+    migrateDatabaseSchema(candidate);
     migrateLegacyJson(candidate);
     database = candidate;
     return candidate;

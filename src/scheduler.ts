@@ -5,9 +5,8 @@ import cron, { type ScheduledTask } from "node-cron";
 import { DateTime } from "luxon";
 import { getModules } from "./modules/index.js";
 import { getDatabase } from "./core/database.js";
-import { notify } from "./core/notifier.js";
+import { deliverPendingProfileNotifications, notify, publishProfile, type DeliverySummary } from "./core/notifier.js";
 import { notifyModule } from "./core/notify-module.js";
-import { publishProfile } from "./core/notifier.js";
 import { ok, type AssistantModule } from "./core/registry.js";
 import { hydrateRow, findOccurrence, nextEventAfter, reminderMinutes } from "./modules/schedule/service.js";
 import type { ScheduleItem } from "./modules/schedule/types.js";
@@ -54,8 +53,39 @@ function reminderId(reminder: { id?: string; minutesBefore: number }, index: num
   return reminder.id ?? `reminder-${index + 1}`;
 }
 
-function dueRows(at: Date): Record<string, unknown>[] {
-  return getDatabase().prepare("SELECT * FROM schedules WHERE enabled = 1 AND status = 'active' AND next_run_at IS NOT NULL AND next_run_at <= ? ORDER BY next_run_at LIMIT 500").all(at.toISOString()) as Record<string, unknown>[];
+interface DueCursor {
+  nextRunAt: string;
+  profileId: string;
+  id: string;
+}
+
+function dueRows(at: Date, cursor?: DueCursor): Record<string, unknown>[] {
+  const db = getDatabase();
+  if (!cursor) {
+    return db.prepare(`
+      SELECT * FROM schedules
+      WHERE enabled = 1 AND status = 'active' AND next_run_at IS NOT NULL AND next_run_at <= ?
+      ORDER BY next_run_at, profile_id, id LIMIT 500
+    `).all(at.toISOString()) as Record<string, unknown>[];
+  }
+  return db.prepare(`
+    SELECT * FROM schedules
+    WHERE enabled = 1 AND status = 'active' AND next_run_at IS NOT NULL AND next_run_at <= ?
+      AND (
+        next_run_at > ?
+        OR (next_run_at = ? AND profile_id > ?)
+        OR (next_run_at = ? AND profile_id = ? AND id > ?)
+      )
+    ORDER BY next_run_at, profile_id, id LIMIT 500
+  `).all(
+    at.toISOString(),
+    cursor.nextRunAt,
+    cursor.nextRunAt,
+    cursor.profileId,
+    cursor.nextRunAt,
+    cursor.profileId,
+    cursor.id,
+  ) as Record<string, unknown>[];
 }
 
 async function processDue(item: ScheduleItem, at: DateTime<true>): Promise<void> {
@@ -74,10 +104,15 @@ async function processDue(item: ScheduleItem, at: DateTime<true>): Promise<void>
     const trigger = event.minus({ minutes: reminder.minutesBefore });
     if (trigger > at) continue;
     const key = `${event.toISO()}:${reminderId(reminder, index)}`;
-    const inserted = db.prepare("INSERT OR IGNORE INTO schedule_occurrences(profile_id, schedule_id, occurrence_key, occurrence_at, status) VALUES(?, ?, ?, ?, 'notified')").run(item.profileId, item.id, key, event.toISO()) as { changes: number };
-    if (inserted.changes) {
+    const existing = db.prepare(`
+      SELECT 1 FROM schedule_occurrences
+      WHERE profile_id = ? AND schedule_id = ? AND occurrence_key = ?
+    `).get(item.profileId, item.id, key);
+    if (!existing) {
       const localEvent = event.setZone(item.timezone).toFormat("yyyy-LL-dd HH:mm");
       await publishProfile(item.profileId, "schedule", item.title, `${item.title}\n时间：${localEvent}\n提醒：提前 ${reminder.minutesBefore} 分钟`, `schedule:${item.profileId}:${item.id}:${key}`);
+      db.prepare("INSERT OR IGNORE INTO schedule_occurrences(profile_id, schedule_id, occurrence_key, occurrence_at, status) VALUES(?, ?, ?, ?, 'notified')")
+        .run(item.profileId, item.id, key, event.toISO());
     }
   }
 
@@ -103,9 +138,40 @@ async function processDue(item: ScheduleItem, at: DateTime<true>): Promise<void>
 
 export async function runDueSchedules(at = new Date()): Promise<void> {
   const current = DateTime.fromJSDate(at, { zone: "utc" }) as DateTime<true>;
-  for (const row of dueRows(at)) {
-    await processDue(hydrateRow(row), current);
+  const errors: unknown[] = [];
+  let cursor: DueCursor | undefined;
+  while (true) {
+    const rows = dueRows(at, cursor);
+    if (rows.length === 0) break;
+    for (const row of rows) {
+      try {
+        await processDue(hydrateRow(row), current);
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    const last = rows.at(-1) as Record<string, unknown>;
+    cursor = {
+      nextRunAt: String(last.next_run_at),
+      profileId: String(last.profile_id),
+      id: String(last.id),
+    };
+    if (rows.length < 500) break;
   }
+  if (errors.length === 1) throw errors[0];
+  if (errors.length > 1) throw new AggregateError(errors, `${errors.length} due schedules failed`);
+}
+
+export async function runSchedulerTick(at = new Date(), fetchImpl: typeof fetch = fetch): Promise<DeliverySummary> {
+  let scheduleError: unknown;
+  try {
+    await runDueSchedules(at);
+  } catch (error) {
+    scheduleError = error;
+  }
+  const summary = await deliverPendingProfileNotifications({ at, fetchImpl });
+  if (scheduleError) throw scheduleError;
+  return summary;
 }
 
 export interface SchedulerHandle {
@@ -173,7 +239,7 @@ export function startScheduler(): SchedulerHandle {
   tasks.push(cron.schedule("* * * * *", async () => {
     await runFenced(async () => {
       try {
-        await runDueSchedules();
+        await runSchedulerTick();
       } catch (error) {
         console.error("[job schedule.tick] failed:", error);
       }
