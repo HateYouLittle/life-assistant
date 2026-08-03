@@ -1,198 +1,127 @@
-# Life Assistant — 架构设计文档
+# Life Assistant 架构
 
-> 个人生活助理：Skill + MCP 服务，适配 Hermes Agent
-> 当前能力：共享天气/油价信息与公共通知、Profile 私有日程和中国农历提醒
+Life Assistant 是 Hermes Agent 的 Skill + MCP 服务。查询通过 MCP 完成；所有模块的主动通知统一经过 Hermes Webhook，并由 Hermes Gateway 选择一个已连接平台投递。
 
----
+## 1. 设计原则
 
-## 1. 设计目标与原则
-
-| 目标 | 说明 |
-|---|---|
-| Skill + MCP 双形态 | MCP Server 提供工具与数据能力；Skill（SKILL.md）告诉 Agent 何时、如何使用这些工具 |
-| 主动推送 | MCP 本身是请求/响应模型，主动预警由内置调度器 + 通知通道适配器实现，同时提供"拉取待办通知"工具兜底 |
-| 可扩展 | 新功能 = 新增一个模块目录，实现统一 `AssistantModule` 接口即可，核心零改动 |
-| 低成本数据源 | 优先免费/低费率、高 QPS 额度的 API，全部通过 Provider 抽象，可替换 |
-| 可开源 | MIT 协议、README / 贡献指南 / 环境变量示例齐全，密钥一律走环境变量 |
+- 模块只负责产生事件，不直接绑定 QQ、微信、Bark 或 Server酱。
+- 通知先持久化，再尝试主动投递；`notify.pull` 只是失败恢复队列。
+- Profile 私有数据和通知严格隔离；公共事件也按配置的 Profile 独立复制和去重。
+- 保持轻量：显式超时、有限退避、幂等请求和最终 pull fallback，不追求无限重试或 exactly-once 网络语义。
+- 天气简报由确定性天气/油价 Provider 数据生成，不依赖 LLM 的 model/provider 配置。
 
 ## 2. 总体架构
 
-```
-┌─────────────────────────── Hermes Agent ───────────────────────────┐
-│  Skill (SKILL.md)  ── 触发词/使用指引/主动通知消费说明              │
-│        │                                                           │
-│        ▼  stdio (MCP 协议)                                          │
-│  ┌────────────────────── MCP Server ──────────────────────────┐    │
-│  │  Tool Router (模块注册器 registry)                          │    │
-│  │  ├─ weather.*     天气模块                                  │    │
-│  │  ├─ oilprice.*    油价模块                                  │    │
-│  │  ├─ express.*     快递模块                                  │    │
-│  │  ├─ location.*    位置服务（内建）                          │    │
-│  │  └─ notify.*      通知管理（内建）                          │    │
-│  │                                                             │    │
-│  │  Scheduler (node-cron)  ──► 轮询/定时检查 ──► Notifier      │    │
-│  │  Notifier ──► [stdout | webhook | Bark | Server酱 | ...]    │    │
-│  │  Store (JSON 文件 / 可换 SQLite)                            │    │
-│  └─────────────────────────────────────────────────────────────┘    │
-└──────────────────────────────────────────────────────────────────────┘
-              │                    │                    │
-        Open-Meteo / 和风     发改委调价窗口        快递100 / 快递鸟
-        （天气+预警）         + 油价 Provider       （物流轨迹）
+```text
+模块 job / 标准 notify 回调 / 私有日程
+                    |
+                    v
+       Profile notification + SQLite outbox
+                    |
+                    v
+       HMAC V2 Hermes deliver-only Webhook
+                    |
+                    v
+       一个配置的 Hermes Gateway 平台
+       (qqbot / weixin / feishu / ...)
+
+Webhook 失败或 route 缺失
+                    |
+                    v
+          当前 Profile 的 notify.pull
 ```
 
-### 进程形态
+`src/index.ts` 是 Hermes 拉起的 stdio MCP Server。`src/scheduler.ts` 是唯一常驻调度进程，执行模块 cron、私有日程扫描和 outbox 投递。二者共享 `DATA_DIR/life-assistant.sqlite`；同一 `DATA_DIR` 只应运行一个 scheduler，SQLite 中的租约会阻止正常情况下的重复调度。
 
-项目包含两个可独立运行的入口：
-
-1. **`src/index.ts` — MCP Server（stdio）**：被 Hermes Agent 拉起，响应工具调用。
-2. **`src/scheduler.ts` — 常驻调度进程**：运行所有模块注册的定时任务，产生主动通知。与 MCP Server 共享同一份 Store 与配置，可独立部署（systemd / pm2 / docker）。
-
-> 单机场景下也可用 `npm run dev:all` 同进程运行，便于开发调试。
-
-## 3. 核心框架设计
-
-### 3.1 模块插件机制（扩展接口）
+## 3. 模块扩展契约
 
 ```ts
-interface AssistantModule {
-  name: string;                    // 模块名，作为工具名前缀
-  tools?: ToolDef[];               // 暴露给 Agent 的 MCP 工具
-  jobs?: JobDef[];                 // 注册给调度器的定时任务
-}
-
-interface ToolDef {
-  name: string;                    // 如 "current" → 完整名 "weather.current"
-  description: string;             // 给 LLM 看的工具说明（影响调用准确率，需认真写）
-  schema: ZodRawShape;             // 参数 zod schema
-  handler: (args) => Promise<ToolResult>;
+interface JobContext {
+  notify(title: string, body: string, dedupeKey?: string): Promise<void>;
 }
 
 interface JobDef {
   name: string;
-  cron: string;                    // 标准 cron 表达式
-  handler: (ctx: JobContext) => Promise<void>;
+  cron: string;
+  timezone?: string;
+  handler(ctx: JobContext): Promise<void>;
 }
 ```
 
-新增功能（如"空气质量""限行提醒""话费提醒"）只需：
-1. 在 `src/modules/<feature>/index.ts` 实现 `AssistantModule`；
-2. 在 `src/modules/index.ts` 的数组里加一行注册。
+模块在 `src/modules/<feature>/index.ts` 注册 `AssistantModule`，并在 `src/modules/index.ts` 导入。未来模块使用标准 `ctx.notify` 后，会自动进入公共事件发布逻辑，无需了解 route、HMAC 或 Gateway 平台。
 
-**核心文件零改动**，这是预留扩展接口的落点。
+天气预警和油价预通知使用该标准回调。天气模块另有 `weather.daily_brief` job，因为它需要明确的 `weather` source，但最终仍调用同一公共发布和 outbox 路径。
 
-### 3.2 主动推送通道（Notifier）
+## 4. 通知作用域
 
-MCP 无法由服务端主动反向调用客户端，因此采用"双通道"策略：
+### 公共模块事件
 
-- **推（推荐）**：调度进程触发事件 → `Notifier` 扇出到已配置的通道：
-  - `stdout`：本地打印（默认，零配置）；
-  - `webhook`：POST 到任意 URL（可接 Hermes Agent 的回调、飞书/企微机器人）；
-  - `bark`：iOS 推送；`serverchan`：微信推送（Server酱）。
-- **拉（兜底）**：所有通知同时写入 Store 的 `pending_notifications` 队列，暴露 `notify.pull` 工具。Skill 指引 Agent 在每次会话开始时调用一次，取走未读通知 —— 即使推送通道全部失效，用户下次对话也能收到预警。
+`publishGlobal` 枚举 `PROFILE_PUSH_ROUTES_JSON` 中的 Profile，为每个 Profile 写一条 `profile_notifications` 记录及其 outbox delivery。相同 `dedupe_key` 在每个 Profile 内唯一，因此重复执行不会增加投递。
 
-通知去重：每条通知带 `dedupe_key`（如 `weather:alert:北京:2026-07-31:暴雨红色`），Store 记录已发 key，避免重复轰炸。
+配置多个 Profile route 时，同一公共天气或油价事件会产生一份独立投递给每个 Profile。这是为了保持每个 Profile 都能独立接收、pull 和标记已读的既有产品语义，不是重复发送缺陷。没有配置 route 的 Profile 不属于公共主动 fan-out 集合。
 
-### 3.3 存储（Store）
+### 私有事件
 
-默认业务存储使用 `DATA_DIR/life-assistant.sqlite`（Node >=22.5 内置 `node:sqlite`），启用 WAL、事务和 Profile 作用域约束；`Store` 仍提供 `get/set/del` 兼容接口，供公共位置和 Provider 缓存使用。旧 `store.json` 只作为一次性迁移源，并保留 `.pre-sqlite.bak` 备份。
+日程提醒直接调用 `publishProfile(profileId, ...)`，只写所属 Profile。若该 Profile 没有 route，通知仍保留并可由该 Profile 的 `notify.pull` 读取，不会跨 Profile 暴露。
 
-### 3.4 位置服务（Location）
+### 旧数据兼容
 
-首次运行策略（两级）：
+旧版本的 `global_notifications` 和 `global_notification_reads` 表继续保留并可由 `notify.pull` 消费，以兼容已有 SQLite 数据和 `store.json` 迁移结果。新公共事件不再写该旧路径。
 
-1. **自动探测（建议方案）**：调用 `ip-api.com`（免费、无需 Key、45 次/分钟）基于出口 IP 反推城市与经纬度，作为**建议值**返回；
-2. **用户确认**：`location.get` 在没有任何已确认位置时，返回 `{ status: "need_confirm", suggestion }`，由 Agent 向用户复述并请其确认；用户确认后调用 `location.set` 落盘。
+## 5. Outbox 投递语义
 
-> 为什么不做"全自动"：IP 定位在移动网络/VPN 下误差可达城市级，天气和油价都对城市敏感，首次让 Agent 用自然语言确认一次是准确率与体验的最佳平衡。后续可扩展：Hermes 客户端若支持浏览器 Geolocation 或手机 GPS 回传，可在 `location.set` 里直接传精确经纬度，优先级高于 IP 结果。
+Profile 通知和 delivery 在同一 SQLite 事务中创建。投递器提供：
 
-## 4. 数据源选型
+- HMAC SHA-256 V2，签名内容为 `timestamp.body`；secret 只来自环境变量。
+- `X-Request-ID` 作为 Hermes 幂等键；网络结果不确定时重用同一 ID，明确 HTTP 失败时提升 request generation。
+- 每次请求 10 秒超时，HTTP 失败按 1m、5m、15m、1h 退避，最多尝试五次。
+- 原子 claim token、过期 claim 接管和完成时 claim fencing，避免并发 worker 重复完成。
+- route 名变化或 route 缺失时将旧 delivery 转为 fallback；已 sent/read 的通知不会因 route 漂移重新入队。
+- 三次网络结果不确定或请求接近 Hermes 幂等窗口时停止主动重试，转入 fallback。
 
-| 能力 | 首选 | 备选 | 理由 |
-|---|---|---|---|
-| 实时天气/预报 | **Open-Meteo**（免费、无 Key、非商用 1 万次/天） | 和风天气免费版（1000 次/天）、高德天气 | 零成本零门槛起步，Provider 抽象可热替换 |
-| 天气预警 | **和风天气预警 API**（免费版支持） | 中央气象台页面解析 | 国内官方预警口径全；无 Key 时降级为 Open-Meteo 阈值推断（暴雨/高温/大风经验阈值） |
-| 油价查询 | Provider 抽象 + **聚合数据油价 API**（低成本，约 0.01 元/次量级） | 公开油价页解析（兜底，需注意合规与稳定性） | 国内无官方免费 API，故做双实现 |
-| 调价窗口 | **本地算法推算**：发改委"10 个工作日一调"机制 + 内置年度窗口表，调整日前一天 18:00 发布公告 | — | 完全免费且最可靠，预通知在窗口前 24h/1h 各推一次 |
-| 快递轨迹 | **快递100 实时查询 API**（免费额度，需 customer+key） | 快递鸟免费版 | 轮询 + 状态 diff 即可实现"变更通知"，不依赖付费订阅推送接口 |
+Webhook 成功时，delivery 标记为 `sent`，并在同一事务中写入 `profile_notification_reads`，所以 `notify.pull` 不会重复返回。用户先通过 `notify.pull` 看到通知时，尚未发送的 delivery 会被取消。
 
-所有外部调用收敛在各模块的 `provider.ts`，替换数据源 = 实现同一接口 + 改一行配置。
+`NOTIFY_WEBHOOK_URL`、`BARK_URL`、`SERVERCHAN_SENDKEY` 和 stdout fan-out 已退出主动模块投递路径。项目不会把同一事件同时直发第三方通道。
 
-## 5. 工具清单（MCP Tools v0.1）
+## 6. 确定性天气简报
 
-| 工具 | 说明 |
-|---|---|
-| `location.get` / `location.set` / `location.detect` | 位置查询/确认/自动探测 |
-| `weather.current` | 实时天气（温度、体感、风力、湿度） |
-| `weather.forecast` | 未来 N 天预报 |
-| `weather.alerts` | 当前生效的气象预警 |
-| `oilprice.current` | 当地 92#/95#/0# 油价 |
-| `oilprice.next_adjustment` | 下次调价窗口、预计方向与倒计时 |
-| `schedule.create/list/get/update/complete/delete` | 管理当前 Profile 的待办、生日、纪念日和农历提醒 |
-| `notify.pull` | 拉取未读主动通知 |
+`weather.daily_brief` 默认使用 `0 7 * * *`，并在 `LIFE_ASSISTANT_TIMEZONE` 指定的 IANA 时区运行；未配置时使用进程本地时区。`DAILY_WEATHER_BRIEF_CRON` 可覆盖表达式。
 
-## 6. 目录结构
+Job 并发读取当前天气、当天预报和可选油价：
 
-```
-life-assistant/
-├── README.md                 # 项目门面：功能、快速开始、配置、Roadmap
-├── CONTRIBUTING.md           # 贡献指南（分支、Commit、如何新增模块）
-├── LICENSE                   # MIT
-├── package.json / tsconfig.json / .env.example
-├── skill/
-│   └── SKILL.md              # Hermes Agent 技能定义（触发词 + 工具使用指引）
-├── docs/
-│   └── architecture.md       # 本文档
-└── src/
-    ├── index.ts              # MCP Server 入口（stdio）
-    ├── scheduler.ts          # 常驻调度进程入口
-    ├── config.ts             # 环境变量与全局配置
-    ├── core/
-    │   ├── registry.ts       # 模块注册器
-    │   ├── store.ts          # JSON 存储
-    │   ├── notifier.ts       # 通知通道适配器
-    │   ├── location.ts       # 位置服务（IP 探测 + 确认流）
-    │   └── http.ts           # fetch 封装（超时/重试）
-    └── modules/
-        ├── index.ts          # 模块清单（扩展点）
-        ├── weather/          # index.ts + provider.ts
-        ├── oilprice/         # index.ts + schedule.ts + provider.ts
-        └── express/          # index.ts + provider.ts
+- 实时天气或预报单项失败时，用另一个天气结果继续生成。
+- 两个天气源都失败时，本次 job 失败，不发送空的“天气”简报。
+- 油价失败、未配置或返回不可用占位值时直接省略。
+- 正文是简短中文行，不使用 Markdown 表格。
+- `weather:daily-brief:<本地日期>` 作为 dedupe key，每个配置 Profile 每个本地日期至多一条。
+
+简报生成阶段不调用 OpenAI 或其他 LLM。现有外部 Hermes 07:00 LLM cron 不由本仓库管理，本次实现不会修改或删除它。部署并验证新 scheduler 后，运维者必须取得用户明确确认，才可停用或删除旧 cron；只更换旧 cron 的 `--deliver` 不能解决 model/provider 漂移。确认前同时运行可能造成重复通知，旧 cron 的原有失败也仍会出现。
+
+## 7. 平台切换
+
+主动目标属于 Hermes 动态 Webhook 订阅，不属于 Life Assistant 数据模型。若 route 名、URL 和 HMAC secret 保持不变，只需用相同订阅配置重建 Hermes subscription，并把 `--deliver` 改成目标平台：
+
+```text
+life-assistant module -> Profile outbox -> stable webhook route -> --deliver <platform>
 ```
 
-## 7. 主动通知时序
+这种切换不需要迁移 SQLite、不需要修改 Life Assistant 配置，通常也不需要重启 scheduler 或 Gateway，因为 Hermes 动态订阅会热加载。只有修改平台凭据/静态平台配置时才可能需要重启对应 Gateway；修改 route 名、URL 或 secret 时才需要同步 `PROFILE_PUSH_ROUTES_JSON` 并重启 scheduler。
 
-```
-scheduler (cron)
-  │ 每 30min: weather.alerts_check ──► 有新预警? ──是──► Notifier.fanout("⛈ 暴雨红色预警…")
-  │ 每天 09:00: oilprice.watch ──► 距调价窗口<24h? ──是──► Notifier.fanout("⛽ 明晚24时油价或上调…")
-  │ 每 30min: express.poll ──► 轨迹状态 diff? ──是──► Notifier.fanout("📦 顺丰xxx 已签收")
-  │
-  └──► 所有通知同时入 notify.pull 队列（Agent 会话开始时拉取兜底）
-```
+secret 不得打印、检查真实值、粘贴到聊天或提交 Git。当前模型是每个 Profile 一个 Hermes route 和一个 Gateway 投递目标，不支持同时向多个第三方平台 fan-out。
 
-## 8. Profile 作用域与日程隔离
+## 8. 存储与迁移
 
-公共生活信息和 Profile 私有生活记录使用不同的作用域：
+SQLite 启用 WAL、foreign keys、busy timeout 和事务。Profile notification 使用 `(profile_id, dedupe_key)` 唯一约束；delivery 外键绑定 `(profile_id, notification_id)`，防止跨 Profile 引用。迁移是 additive 的，并保留旧 JSON 通知与读取标记的导入逻辑。
 
-| 作用域 | 内容 | 规则 |
+位置、天气 geo cache 等共享数据继续通过 SQLite `kv` facade 访问。Profile 私有日程、occurrence、notification、read 和 delivery 均带 `profile_id`。MCP 进程必须显式提供合法 `HERMES_PROFILE`，不能静默回退到 `default`。
+
+## 9. 数据源
+
+| 能力 | 首选 | 降级 |
 |---|---|---|
-| global | 位置、天气/油价缓存、天气/油价去重键、公共通知 | 所有 Profile 共享；公共通知每个 Profile 各自读取一次 |
-| profile | 日程、重复规则、提醒、occurrence、日程通知 | 只允许所属 `HERMES_PROFILE` 访问 |
+| 实时天气/预报 | QWeather（配置 Key 时） | Open-Meteo |
+| 天气预警 | QWeather 官方预警 | Open-Meteo 阈值推断 |
+| 当前油价 | TianAPI | JUHE；均未配置时返回不可用占位值 |
+| 调价窗口 | 本地年度窗口表 | 无 |
 
-MCP 进程必须由 Hermes 显式注入 `HERMES_PROFILE`。日程工具不接受 `profileId` 参数，所有查询都使用不可变的 ProfileContext；Profile 缺失或非法时 fail closed。`notify.pull` 在事务中合并当前 Profile 未读公共通知和当前 Profile 私有通知。
-
-日程通知先写入 Profile 私有通知和同事务 outbox。配置 `PROFILE_PUSH_ROUTES_JSON` 后，scheduler 使用 HMAC V2 调用对应 Hermes `deliver-only` Webhook，由该 Profile 的当前目标平台（默认 QQ Home）主动发送；成功后避免 `notify.pull` 重复播报，失败按退避计划重试并保留私有队列兜底。公共 webhook/Bark/Server酱仍不接收私密正文。
-
-主动推送的目标平台属于 Hermes 动态订阅层，不属于 Life Assistant 业务代码。单一目标切换只需在对应 Profile 用 `hermes webhook remove` 和 `hermes webhook subscribe --deliver <platform> --deliver-only` 重建同名订阅；保持 route 名、URL、HMAC secret 时不需要改 `.env`、迁移 SQLite 或重启 scheduler，动态订阅会热加载。若修改 Hermes 平台凭据/配置，重启对应 gateway；若修改 `PROFILE_PUSH_ROUTES_JSON`，重启 scheduler。当前每个 Profile 只有一个主动目标；多平台同时发送需要扩展多 route/outbox 配置。切换后必须用 `webhook list` 和临时日程验证，并保留 `notify.pull` 作为兜底。
-
-日程存储使用 Node >=22.5 内置 `node:sqlite`，启用 WAL、事务和 scheduler 租约。JSON `store.json` 只作为旧数据迁移源和备份，不再承担多进程业务并发写入。
-
-### 中国农历
-
-日程日期明确区分 `calendar: "solar" | "lunar"`。农历日程保存 `lunarMonth`、`lunarDay` 和 `leapMonthPolicy`，不能把农历日期伪装成公历日期。普通农历月日每年转换为当年公历 occurrence；闰月策略为 `leap` 时，只在对应闰月年份触发，没有对应闰月的年份默认跳过。农历转换使用经过测试的 `lunar-javascript`，提醒和存储仍按日程自己的 IANA 时区计算。
-
-## 9. Roadmap（预留扩展方向）
-
-- v0.2：SQLite 存储、通知通道插件化市场（钉钉/飞书/邮件）
-- v0.3：新模块示例 —— 空气质量、车辆限行、纪念日提醒
-- v0.4：更多 Profile 专属通知目标、静默时段、Web 配置面板
+外部调用收敛在各模块 `provider.ts`。快递模块当前封存，未注册到运行时。

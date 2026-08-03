@@ -24,6 +24,7 @@ export interface JobContext {
 export interface JobDef {
   name: string;
   cron: string;
+  timezone?: string;
   handler: (ctx: JobContext) => Promise<void>;
 }
 

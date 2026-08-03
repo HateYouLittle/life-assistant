@@ -34,7 +34,7 @@ const { createSchedule, listSchedules, getSchedule, updateSchedule, deleteSchedu
   "../src/modules/schedule/service.js",
 );
 const notifierModule = await import("../src/core/notifier.js");
-const { publishGlobal, publishProfile, pullPending } = notifierModule;
+const { notify, publishGlobal, publishProfile, pullPending } = notifierModule;
 const deliverPendingProfileNotifications = (notifierModule as Record<string, unknown>).deliverPendingProfileNotifications as (
   options: { at: Date; profileId?: string; fetchImpl: typeof fetch; clock?: () => Date },
 ) => Promise<{ attempted: number; sent: number; failed: number }>;
@@ -47,6 +47,23 @@ const runSchedulerTick = (schedulerModule as Record<string, unknown>).runSchedul
   at: Date,
   fetchImpl: typeof fetch,
 ) => Promise<{ attempted: number; sent: number; failed: number }>;
+const weatherModule = await import("../src/modules/weather/index.js");
+const runDailyWeatherBrief = (weatherModule as Record<string, unknown>).runDailyWeatherBrief as (options: {
+  at: Date;
+  timezone: string;
+  getLocation: () => { city: string; lat: number; lon: number };
+  getCurrent: () => Promise<{ temperature: number; apparent: number; humidity: number; windSpeed: number; windSpeedUnit: "km/h"; weatherText: string }>;
+  getForecast: () => Promise<Array<{
+    date: string;
+    tMax: number;
+    tMin: number;
+    weatherText: string;
+    precipProb?: number;
+    precipAmountMm?: number;
+  }>>;
+  getOilPrice: () => Promise<{ region: string; p92: string; p95: string; p0: string }>;
+  publish?: (source: string, title: string, body: string, dedupeKey: string) => Promise<void>;
+}) => Promise<void>;
 
 const db = getDatabase();
 
@@ -115,12 +132,272 @@ test("global notices are visible once independently to each Profile", async () =
   assert.equal(pullPending(requireProfileContext("profile-a")).some((n) => n.body === "shared alert"), false);
 });
 
+test("the two-argument global form preserves its resolved fields for every Profile", async () => {
+  await publishGlobal("Two-argument title", "Two-argument body");
+
+  const rows = db.prepare(`
+    SELECT profile_id, source, title, body, dedupe_key
+    FROM profile_notifications
+    WHERE title = ? OR body = ?
+    ORDER BY profile_id
+  `).all("Two-argument title", "Two-argument body") as Array<Record<string, unknown>>;
+
+  assert.deepEqual(rows.map((row) => ({ ...row })), [
+    {
+      profile_id: "profile-a",
+      source: "general",
+      title: "Two-argument title",
+      body: "Two-argument body",
+      dedupe_key: null,
+    },
+    {
+      profile_id: "profile-b",
+      source: "general",
+      title: "Two-argument title",
+      body: "Two-argument body",
+      dedupe_key: null,
+    },
+  ]);
+});
+
+test("a global event enqueues exactly one Hermes delivery per configured Profile route", async () => {
+  await publishGlobal("weather", "Public alert", "shared active push", "global:push:once");
+  await publishGlobal("weather", "Public alert", "shared active push", "global:push:once");
+
+  const rows = db.prepare(`
+    SELECT n.profile_id, n.source, n.title, n.body, d.route, d.status
+    FROM profile_notifications n
+    JOIN profile_notification_deliveries d
+      ON d.profile_id = n.profile_id AND d.notification_id = n.id
+    WHERE n.dedupe_key = ?
+    ORDER BY n.profile_id
+  `).all("global:push:once") as Array<Record<string, unknown>>;
+
+  assert.deepEqual(rows.map((row) => ({ ...row })), [
+    {
+      profile_id: "profile-a",
+      source: "weather",
+      title: "Public alert",
+      body: "shared active push",
+      route: "qqbot",
+      status: "pending",
+    },
+    {
+      profile_id: "profile-b",
+      source: "weather",
+      title: "Public alert",
+      body: "shared active push",
+      route: "qqbot",
+      status: "pending",
+    },
+  ]);
+});
+
+test("republishing a retained legacy global event does not create Profile duplicates", async () => {
+  const dedupeKey = "global:legacy-retained:1";
+  db.prepare(`
+    INSERT INTO global_notifications(source, title, body, created_at, dedupe_key)
+    VALUES(?, ?, ?, ?, ?)
+  `).run("weather", "Legacy alert", "retained pull item", "2026-08-02T00:00:00.000Z", dedupeKey);
+
+  await publishGlobal("weather", "Republished alert", "duplicate profile item", dedupeKey);
+
+  const profileCopies = db.prepare(`
+    SELECT COUNT(*) AS count FROM profile_notifications WHERE dedupe_key = ?
+  `).get(dedupeKey) as { count: number };
+  assert.equal(profileCopies.count, 0);
+
+  const logicalEvents = pullPending(requireProfileContext("profile-a"))
+    .filter((notice) => notice.dedupeKey === dedupeKey);
+  assert.equal(logicalEvents.length, 1);
+  assert.equal(logicalEvents[0].scope, "global");
+  assert.equal(logicalEvents[0].body, "retained pull item");
+});
+
+test("the deterministic daily brief publishes once per local date through every Profile route", async () => {
+  assert.equal(typeof runDailyWeatherBrief, "function");
+  const options = {
+    timezone: "Asia/Shanghai",
+    getLocation: () => ({ city: "北京", lat: 39.9, lon: 116.4 }),
+    getCurrent: async () => ({
+      temperature: 28,
+      apparent: 30,
+      humidity: 61,
+      windSpeed: 12,
+      windSpeedUnit: "km/h" as const,
+      weatherText: "多云",
+    }),
+    getForecast: async () => [{
+      date: "2026-08-03",
+      tMax: 32,
+      tMin: 24,
+      weatherText: "阵雨",
+      precipProb: 70,
+    }],
+    getOilPrice: async () => ({ region: "北京", p92: "7.21", p95: "7.68", p0: "6.91" }),
+  };
+
+  await runDailyWeatherBrief({ ...options, at: new Date("2026-08-03T00:00:00.000Z") });
+  await runDailyWeatherBrief({ ...options, at: new Date("2026-08-03T10:00:00.000Z") });
+
+  const sameDay = db.prepare(`
+    SELECT profile_id, title, body FROM profile_notifications
+    WHERE dedupe_key = ? ORDER BY profile_id
+  `).all("weather:daily-brief:2026-08-03") as Array<Record<string, unknown>>;
+  assert.equal(sameDay.length, 2);
+  assert.deepEqual(sameDay.map((row) => row.profile_id), ["profile-a", "profile-b"]);
+  assert.match(String(sameDay[0].title), /北京.*生活简报/);
+  assert.match(String(sameDay[0].body), /当前多云，28℃/);
+  assert.match(String(sameDay[0].body), /今日阵雨，24~32℃，降水概率70%/);
+  assert.match(String(sameDay[0].body), /92# 7.21元\/升/);
+  assert.doesNotMatch(String(sameDay[0].body), /\|/);
+
+  await runDailyWeatherBrief({ ...options, at: new Date("2026-08-04T00:00:00.000Z") });
+  const allBriefs = db.prepare(`
+    SELECT COUNT(*) AS count FROM profile_notifications
+    WHERE dedupe_key LIKE 'weather:daily-brief:%'
+  `).get() as { count: number };
+  assert.equal(allBriefs.count, 4);
+});
+
+test("the daily brief labels probability percent and precipitation amount millimeters distinctly", async () => {
+  const bodies: string[] = [];
+  const common = {
+    timezone: "Asia/Shanghai",
+    getLocation: () => ({ city: "北京", lat: 39.9, lon: 116.4 }),
+    getCurrent: async () => { throw new Error("current unavailable"); },
+    getOilPrice: async () => { throw new Error("oil unavailable"); },
+    publish: async (_source: string, _title: string, body: string) => {
+      bodies.push(body);
+    },
+  };
+
+  await runDailyWeatherBrief({
+    ...common,
+    at: new Date("2026-08-07T00:00:00.000Z"),
+    getForecast: async () => [{
+      date: "2026-08-07",
+      tMax: 30,
+      tMin: 23,
+      weatherText: "阵雨",
+      precipProb: 65,
+    }],
+  });
+  await runDailyWeatherBrief({
+    ...common,
+    at: new Date("2026-08-08T00:00:00.000Z"),
+    getForecast: async () => [{
+      date: "2026-08-08",
+      tMax: 29,
+      tMin: 22,
+      weatherText: "中雨",
+      precipAmountMm: 12.7,
+    }],
+  });
+
+  assert.match(bodies[0], /今日阵雨，23~30℃，降水概率65%/);
+  assert.doesNotMatch(bodies[0], /预计降水/);
+  assert.match(bodies[1], /今日中雨，22~29℃，预计降水12\.7mm/);
+  assert.doesNotMatch(bodies[1], /降水概率|undefined%/);
+});
+
+test("the daily brief survives forecast and optional oil provider failures", async () => {
+  const published: Array<{ source: string; title: string; body: string; dedupeKey: string }> = [];
+  await runDailyWeatherBrief({
+    at: new Date("2026-08-05T00:00:00.000Z"),
+    timezone: "Asia/Shanghai",
+    getLocation: () => ({ city: "上海", lat: 31.2, lon: 121.5 }),
+    getCurrent: async () => ({
+      temperature: 30,
+      apparent: 33,
+      humidity: 70,
+      windSpeed: 8,
+      windSpeedUnit: "km/h",
+      weatherText: "晴",
+    }),
+    getForecast: async () => { throw new Error("forecast unavailable"); },
+    getOilPrice: async () => { throw new Error("oil unavailable"); },
+    publish: async (source, title, body, dedupeKey) => {
+      published.push({ source, title, body, dedupeKey });
+    },
+  });
+
+  assert.deepEqual(published, [{
+    source: "weather",
+    title: "早安，上海生活简报",
+    body: "当前晴，30℃，体感33℃，湿度70%",
+    dedupeKey: "weather:daily-brief:2026-08-05",
+  }]);
+});
+
+test("the daily brief leaves its dedupe key free when current weather fails and forecast is empty", async () => {
+  const published: Array<{ source: string; title: string; body: string; dedupeKey: string }> = [];
+  let currentAttempt = 0;
+  const options = {
+    at: new Date("2026-08-06T00:00:00.000Z"),
+    timezone: "Asia/Shanghai",
+    getLocation: () => ({ city: "广州", lat: 23.1, lon: 113.3 }),
+    getCurrent: async () => {
+      currentAttempt += 1;
+      if (currentAttempt === 1) throw new Error("current unavailable");
+      return {
+        temperature: 31,
+        apparent: 35,
+        humidity: 76,
+        windSpeed: 9,
+        windSpeedUnit: "km/h" as const,
+        weatherText: "多云",
+      };
+    },
+    getForecast: async () => [],
+    getOilPrice: async () => ({ region: "广东", p92: "7.31", p95: "7.92", p0: "7.00" }),
+    publish: async (source: string, title: string, body: string, dedupeKey: string) => {
+      published.push({ source, title, body, dedupeKey });
+    },
+  };
+
+  await assert.rejects(() => runDailyWeatherBrief(options), /daily weather brief providers failed/);
+  assert.deepEqual(published, []);
+
+  await runDailyWeatherBrief(options);
+  assert.equal(published.length, 1);
+  assert.equal(published[0].dedupeKey, "weather:daily-brief:2026-08-06");
+  assert.match(published[0].body, /当前多云，31℃/);
+});
+
+test("the standard scheduler notify callback automatically uses Profile Hermes routes", async () => {
+  await notify("Future module notice", "standard callback body", "future:standard-notify:1");
+  const rows = db.prepare(`
+    SELECT n.profile_id, d.route, d.status
+    FROM profile_notifications n
+    JOIN profile_notification_deliveries d
+      ON d.profile_id = n.profile_id AND d.notification_id = n.id
+    WHERE n.dedupe_key = ? ORDER BY n.profile_id
+  `).all("future:standard-notify:1") as Array<Record<string, unknown>>;
+  assert.deepEqual(rows.map((row) => ({ ...row })), [
+    { profile_id: "profile-a", route: "qqbot", status: "pending" },
+    { profile_id: "profile-b", route: "qqbot", status: "pending" },
+  ]);
+});
+
 test("profile notices never cross the queue boundary", async () => {
   await publishProfile("profile-a", "schedule", "A only", "profile:test:a");
   const a = pullPending(requireProfileContext("profile-a"));
   const b = pullPending(requireProfileContext("profile-b"));
   assert.equal(a.some((n) => n.body === "A only"), true);
   assert.equal(b.some((n) => n.body === "A only"), false);
+});
+
+test("a Profile notification with no configured route remains in notify.pull", async () => {
+  await publishProfile("profile-c", "schedule", "No route", "pull fallback", "profile:missing-route:1");
+  const notices = pullPending(requireProfileContext("profile-c"));
+  assert.equal(notices.some((notice) => notice.title === "No route" && notice.body === "pull fallback"), true);
+  const deliveries = db.prepare(`
+    SELECT COUNT(*) AS count FROM profile_notification_deliveries d
+    JOIN profile_notifications n ON n.profile_id = d.profile_id AND n.id = d.notification_id
+    WHERE n.profile_id = ? AND n.dedupe_key = ?
+  `).get("profile-c", "profile:missing-route:1") as { count: number };
+  assert.equal(deliveries.count, 0);
 });
 
 test("configured profiles enqueue one idempotent QQ webhook delivery", async () => {
@@ -386,6 +663,35 @@ test("confirmed HTTP failures may retry a fresh request ID after a one-hour back
   assert.equal(row.status, "sent");
   assert.equal(row.attempts, 5);
   assert.equal(new Set(requestIds).size, 5);
+});
+
+test("confirmed HTTP failures stop after the bounded retry schedule and remain pullable", async () => {
+  await publishProfile("profile-b", "schedule", "Bounded HTTP failure", "recover by pull", "push:http-bounded:b");
+  const notification = db.prepare(
+    "SELECT id FROM profile_notifications WHERE profile_id = ? AND dedupe_key = ?",
+  ).get("profile-b", "push:http-bounded:b") as { id: number };
+  db.prepare(
+    "UPDATE profile_notification_deliveries SET status = 'cancelled' WHERE NOT (profile_id = ? AND notification_id = ?)",
+  ).run("profile-b", notification.id);
+  const failingFetch = (async () => new Response("unavailable", { status: 503 })) as typeof fetch;
+  const attempts = [
+    new Date("2100-02-07T00:00:00.000Z"),
+    new Date("2100-02-07T00:01:01.000Z"),
+    new Date("2100-02-07T00:06:02.000Z"),
+    new Date("2100-02-07T00:21:03.000Z"),
+    new Date("2100-02-07T01:21:04.000Z"),
+  ];
+  for (const at of attempts) {
+    await deliverPendingProfileNotifications({ at, profileId: "profile-b", fetchImpl: failingFetch, clock: () => at });
+  }
+
+  const row = db.prepare(`
+    SELECT status, attempts FROM profile_notification_deliveries
+    WHERE profile_id = ? AND notification_id = ?
+  `).get("profile-b", notification.id) as Record<string, unknown>;
+  assert.deepEqual({ ...row }, { status: "fallback", attempts: 5 });
+  const pulled = pullPending(requireProfileContext("profile-b"));
+  assert.equal(pulled.some((notice) => notice.title === "Bounded HTTP failure"), true);
 });
 
 test("a transport timeout reuses the same webhook request ID", async () => {

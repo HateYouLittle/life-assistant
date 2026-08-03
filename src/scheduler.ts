@@ -231,7 +231,7 @@ export function startScheduler(): SchedulerHandle {
             console.error(`[job ${module.name}.${job.name}] failed:`, error);
           }
         });
-      });
+      }, job.timezone ? { timezone: job.timezone } : undefined);
       tasks.push(task);
       console.log(`[scheduler] registered ${module.name}.${job.name} cron="${job.cron}"`);
     }

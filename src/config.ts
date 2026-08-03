@@ -1,5 +1,9 @@
 import path from "node:path";
 
+function nonBlankOrDefault(value: string | undefined, fallback: string): string {
+  return value?.trim() || fallback;
+}
+
 export interface ProfilePushRoute {
   route: string;
   url: string;
@@ -52,6 +56,7 @@ export function parseProfilePushRoutes(raw: string | undefined): Record<string, 
 export const config = {
   dataDir: path.resolve(process.env.DATA_DIR ?? "./data"),
   profilePushRoutes: parseProfilePushRoutes(process.env.PROFILE_PUSH_ROUTES_JSON),
+  timezone: nonBlankOrDefault(process.env.LIFE_ASSISTANT_TIMEZONE, Intl.DateTimeFormat().resolvedOptions().timeZone),
 
   location: {
     city: process.env.LOCATION_CITY ?? "",
@@ -69,15 +74,10 @@ export const config = {
     key: process.env.KUAIDI100_KEY ?? "",
   },
 
-  notify: {
-    webhookUrl: process.env.NOTIFY_WEBHOOK_URL ?? "",
-    barkUrl: process.env.BARK_URL ?? "",
-    serverchanSendKey: process.env.SERVERCHAN_SENDKEY ?? "",
-  },
-
   /** 调度周期（cron 表达式），可在模块注册时覆盖 */
   cron: {
     weatherAlerts: "*/15 * * * *",
+    dailyWeatherBrief: nonBlankOrDefault(process.env.DAILY_WEATHER_BRIEF_CRON, "0 7 * * *"),
     oilWatch: "0 9 * * *",
     expressPoll: "0 * * * *",
   },

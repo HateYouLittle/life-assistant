@@ -1,9 +1,83 @@
 import { z } from "zod";
+import { DateTime } from "luxon";
 import { config } from "../../config.js";
 import { currentLocation } from "../../core/location.js";
 import { httpJson } from "../../core/http.js";
+import { publishGlobal } from "../../core/notifier.js";
 import { registerModule, ok, fail, type AssistantModule } from "../../core/registry.js";
-import { fetchCurrent, fetchForecast, fetchAlerts, qweatherGeo } from "./provider.js";
+import { fetchOilPrice, type OilPrice } from "../oilprice/provider.js";
+import {
+  fetchCurrent,
+  fetchForecast,
+  fetchAlerts,
+  qweatherGeo,
+  type CurrentWeather,
+  type ForecastDay,
+} from "./provider.js";
+
+export interface DailyWeatherBriefOptions {
+  at?: Date;
+  timezone?: string;
+  getLocation?: () => { city: string; lat: number; lon: number } | null;
+  getCurrent?: (lat: number, lon: number, city: string) => Promise<CurrentWeather>;
+  getForecast?: (lat: number, lon: number, days: number, city: string) => Promise<ForecastDay[]>;
+  getOilPrice?: (city: string) => Promise<OilPrice>;
+  publish?: (source: string, title: string, body: string, dedupeKey: string) => Promise<void>;
+}
+
+function usableOilPrice(oil: OilPrice): boolean {
+  return [oil.p92, oil.p95, oil.p0].every((value) => value !== "—" && !value.includes("未配置"));
+}
+
+export async function runDailyWeatherBrief(options: DailyWeatherBriefOptions = {}): Promise<void> {
+  const location = (options.getLocation ?? currentLocation)();
+  if (!location) return;
+  const at = options.at ?? new Date();
+  const timezone = options.timezone ?? config.timezone;
+  const localDate = DateTime.fromJSDate(at).setZone(timezone).toISODate();
+  if (!localDate) throw new Error(`invalid daily brief timezone: ${timezone}`);
+
+  const getCurrent = options.getCurrent ?? fetchCurrent;
+  const getForecast = options.getForecast ?? fetchForecast;
+  const getOilPrice = options.getOilPrice ?? fetchOilPrice;
+  const [current, forecast, oil] = await Promise.allSettled([
+    getCurrent(location.lat, location.lon, location.city),
+    getForecast(location.lat, location.lon, 1, location.city),
+    getOilPrice(location.city),
+  ]);
+  if (current.status === "rejected" && (forecast.status === "rejected" || forecast.value.length === 0)) {
+    const forecastFailure = forecast.status === "rejected"
+      ? forecast.reason
+      : new Error("daily weather brief forecast was empty");
+    throw new AggregateError([current.reason, forecastFailure], "daily weather brief providers failed");
+  }
+
+  const lines: string[] = [];
+  if (current.status === "fulfilled") {
+    const value = current.value;
+    lines.push(`当前${value.weatherText}，${value.temperature}℃，体感${value.apparent}℃，湿度${value.humidity}%`);
+  }
+  if (forecast.status === "fulfilled" && forecast.value[0]) {
+    const today = forecast.value[0];
+    const precipitation = today.precipProb !== undefined
+      ? `，降水概率${today.precipProb}%`
+      : today.precipAmountMm !== undefined
+        ? `，预计降水${today.precipAmountMm}mm`
+        : "";
+    lines.push(`今日${today.weatherText}，${today.tMin}~${today.tMax}℃${precipitation}`);
+  }
+  if (oil.status === "fulfilled" && usableOilPrice(oil.value)) {
+    lines.push(`${oil.value.region}油价：92# ${oil.value.p92}元/升，95# ${oil.value.p95}元/升，0# ${oil.value.p0}元/升`);
+  }
+
+  const publish = options.publish ?? publishGlobal;
+  await publish(
+    "weather",
+    `早安，${location.city}生活简报`,
+    lines.join("\n"),
+    `weather:daily-brief:${localDate}`,
+  );
+}
 
 function requireLocation() {
   const loc = currentLocation();
@@ -87,6 +161,12 @@ const weatherModule: AssistantModule = {
     },
   ],
   jobs: [
+    {
+      name: "daily_brief",
+      cron: config.cron.dailyWeatherBrief,
+      timezone: config.timezone,
+      handler: async () => runDailyWeatherBrief(),
+    },
     {
       name: "alerts_check",
       cron: config.cron.weatherAlerts,

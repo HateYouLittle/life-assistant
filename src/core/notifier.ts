@@ -2,7 +2,6 @@ import crypto from "node:crypto";
 import { config } from "../config.js";
 import { getDatabase } from "./database.js";
 import { requireProfileContext, type ProfileContext } from "./profile.js";
-import { httpJson } from "./http.js";
 
 export interface Notice {
   id: number;
@@ -21,45 +20,7 @@ export interface DeliverySummary {
   failed: number;
 }
 
-interface Channel {
-  name: string;
-  send: (n: Notice) => Promise<void>;
-}
-
-const channels: Channel[] = [
-  {
-    name: "stdout",
-    send: async (n) => {
-      console.log(`\n[NOTIFY ${n.time}] ${n.title}\n${n.body}\n`);
-    },
-  },
-  ...(config.notify.webhookUrl
-    ? [{
-        name: "webhook",
-        send: async (n: Notice) => httpJson(config.notify.webhookUrl, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(n),
-        }),
-      } as Channel]
-    : []),
-  ...(config.notify.barkUrl
-    ? [{
-        name: "bark",
-        send: async (n: Notice) => httpJson(`${config.notify.barkUrl.replace(/\/$/, "")}/${encodeURIComponent(n.title)}/${encodeURIComponent(n.body)}`),
-      } as Channel]
-    : []),
-  ...(config.notify.serverchanSendKey
-    ? [{
-        name: "serverchan",
-        send: async (n: Notice) => httpJson(`https://sctapi.ftqq.com/${config.notify.serverchanSendKey}.send`, {
-          method: "POST",
-          headers: { "Content-Type": "application/x-www-form-urlencoded" },
-          body: `title=${encodeURIComponent(n.title)}&desp=${encodeURIComponent(n.body)}`,
-        }),
-      } as Channel]
-    : []),
-];
+const MAX_CONFIRMED_HTTP_ATTEMPTS = 5;
 
 function now(): string {
   return new Date().toISOString();
@@ -82,10 +43,6 @@ function noticeFromRow(row: Record<string, unknown>, scope: "global" | "profile"
   };
 }
 
-async function fanoutGlobal(notice: Notice): Promise<void> {
-  await Promise.allSettled(channels.map((channel) => channel.send(notice)));
-}
-
 /** Publish one shared event. Supports (source, title, body, key) and (title, body, key). */
 export async function publishGlobal(sourceOrTitle: string, titleOrBody: string, bodyOrKey?: string, maybeDedupeKey?: string): Promise<void> {
   const hasSource = maybeDedupeKey !== undefined;
@@ -93,25 +50,35 @@ export async function publishGlobal(sourceOrTitle: string, titleOrBody: string, 
   const title = hasSource ? titleOrBody : sourceOrTitle;
   const body = hasSource ? bodyOrKey ?? "" : titleOrBody;
   const dedupeKey = hasSource ? maybeDedupeKey : bodyOrKey;
-  const db = getDatabase();
-  const time = now();
-  const result = db.prepare(
-    "INSERT OR IGNORE INTO global_notifications(source, title, body, created_at, dedupe_key) VALUES(?, ?, ?, ?, ?)",
-  ).run(source, title, body, time, dedupeKey ?? null) as { changes: number; lastInsertRowid: number | bigint };
-  if (!result.changes) return;
-  const id = Number(result.lastInsertRowid);
-  const row = db.prepare("SELECT * FROM global_notifications WHERE id = ?").get(id) as Record<string, unknown>;
-  await fanoutGlobal(noticeFromRow(row, "global"));
+  if (dedupeKey !== undefined) {
+    const legacyMatch = getDatabase().prepare(
+      "SELECT 1 FROM global_notifications WHERE dedupe_key = ?",
+    ).get(dedupeKey);
+    if (legacyMatch) return;
+  }
+  for (const profileId of Object.keys(config.profilePushRoutes)) {
+    await publishResolvedProfile(profileId, source, title, body, dedupeKey);
+  }
 }
 
 /** Publish an event that can only be consumed by one Profile. */
 export async function publishProfile(profileId: string, sourceOrTitle: string, titleOrBody: string, bodyOrKey?: string, maybeDedupeKey?: string): Promise<void> {
-  const profile = requireProfileContext(profileId);
   const hasSource = maybeDedupeKey !== undefined;
   const source = hasSource ? sourceOrTitle : "schedule";
   const title = hasSource ? titleOrBody : sourceOrTitle;
   const body = hasSource ? bodyOrKey ?? "" : titleOrBody;
   const dedupeKey = hasSource ? maybeDedupeKey : bodyOrKey;
+  await publishResolvedProfile(profileId, source, title, body, dedupeKey);
+}
+
+async function publishResolvedProfile(
+  profileId: string,
+  source: string,
+  title: string,
+  body: string,
+  dedupeKey?: string,
+): Promise<void> {
+  const profile = requireProfileContext(profileId);
   const db = getDatabase();
   const time = now();
   db.exec("BEGIN IMMEDIATE");
@@ -158,7 +125,7 @@ export async function publishProfile(profileId: string, sourceOrTitle: string, t
     db.exec("ROLLBACK");
     throw error;
   }
-  // Profile-scoped events intentionally do not use the global stdout/webhook fanout.
+  // All active delivery is handled by the Profile outbox.
 }
 
 export async function deliverPendingProfileNotifications(options: {
@@ -349,7 +316,10 @@ export async function deliverPendingProfileNotifications(options: {
         : row.request_started_at == null ? requestAt.toISOString() : String(row.request_started_at);
       const retrySeconds = [60, 300, 900, 3600][Math.min(attempts - 1, 3)];
       const nextAttemptAt = new Date(requestAt.getTime() + retrySeconds * 1000).toISOString();
-      const nextStatus = !confirmedHttpFailure && transportFailures >= 3 ? "fallback" : "failed";
+      const nextStatus = (!confirmedHttpFailure && transportFailures >= 3)
+        || (confirmedHttpFailure && attempts >= MAX_CONFIRMED_HTTP_ATTEMPTS)
+        ? "fallback"
+        : "failed";
       const completed = db.prepare(`
         UPDATE profile_notification_deliveries
         SET status = ?, attempts = ?, request_generation = ?, request_started_at = ?, transport_failures = ?,

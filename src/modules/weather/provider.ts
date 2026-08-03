@@ -16,7 +16,8 @@ export interface ForecastDay {
   tMax: number;
   tMin: number;
   weatherText: string;
-  precipProb: number;
+  precipProb?: number;
+  precipAmountMm?: number;
 }
 
 export interface WeatherAlert {
@@ -128,7 +129,7 @@ export async function fetchForecast(lat: number, lon: number, days = 3, city?: s
           tMax: Number(d.tempMax),
           tMin: Number(d.tempMin),
           weatherText: d.textDay || (QW_TEXT[d.iconDay] ?? `code ${d.iconDay}`),
-          precipProb: Math.round(Number(d.precip)),
+          precipAmountMm: Number(d.precip),
         }));
       }
     } catch (e) {

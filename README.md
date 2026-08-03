@@ -4,7 +4,7 @@
 
 | 功能 | 说明 |
 |---|---|
-| ⛈ 天气查询与主动预警 | 实时天气、未来预报；恶劣天气自动监测并主动推送 |
+| ⛈ 天气查询、晨间简报与主动预警 | 实时天气、未来预报；每天 07:00 确定性简报；恶劣天气自动监测并主动推送 |
 | ⛽ 油价查询与调价预通知 | 当地 92#/95#/0# 油价；发改委调价窗口前 24h 主动预通知 |
 | 📅 Profile 私有日程 | 待办、生日、纪念日；支持公历和中国农历，提醒按 Profile 隔离 |
 
@@ -13,7 +13,7 @@
 ## 特性
 
 - **Skill + MCP 双形态**：`skill/SKILL.md` 教 Agent 何时用、怎么用；MCP Server 提供工具
-- **主动推送**：公共通知支持原有通道；Profile 私有日程通过 Hermes `deliver-only` Webhook 主动投递，并有 `notify.pull` 拉取兜底
+- **统一主动推送**：所有模块通知先写 Profile 隔离的 SQLite outbox，再通过 Hermes `deliver-only` Webhook 投递到一个 Gateway 平台；`notify.pull` 仅作失败恢复
 - **插件化模块**：新功能实现 `AssistantModule` 接口、注册一行即可，核心零改动
 - **低成本数据源**：Open-Meteo（免费无 Key）、和风天气免费版、聚合数据油价（低成本）、本地调价窗口推算（免费）
 - **Profile 隔离**：天气/油价数据和公共通知共享；日程、提醒和日程通知严格绑定 `HERMES_PROFILE`
@@ -54,7 +54,7 @@ npm run build
 npm run start:scheduler     # 或 pm2 start dist/scheduler.js --name life-assistant
 ```
 
-不启动调度进程也能用全部查询工具，只是没有主动提醒。配置 `PROFILE_PUSH_ROUTES_JSON` 后，日程通知会进入可靠 outbox 并主动投递到目标 Profile；发送失败时仍保留在 `notify.pull`。同一个 `DATA_DIR` 只应运行一个 scheduler。
+不启动调度进程也能用全部查询工具，只是没有主动提醒。配置 `PROFILE_PUSH_ROUTES_JSON` 后，天气、油价、日程以及未来模块通过标准 `notify` 回调发布的通知都会进入可靠 outbox，并主动投递到目标 Profile；发送失败时仍保留在 `notify.pull`。同一个 `DATA_DIR` 只应运行一个 scheduler。
 
 ## 接入 Hermes Agent（详细步骤）
 
@@ -82,9 +82,7 @@ mcp_servers:
       JUHE_KEY: ""              # 可选：聚合数据（油价）
       KUAIDI100_CUSTOMER: ""    # 快递100
       KUAIDI100_KEY: ""         # 快递100
-      NOTIFY_WEBHOOK_URL: ""    # 可选：主动通知 webhook
-      BARK_URL: ""              # 可选：iOS Bark 推送
-      SERVERCHAN_SENDKEY: ""    # 可选：Server酱微信推送
+      PROFILE_PUSH_ROUTES_JSON: "" # Profile → Hermes deliver-only Webhook
     timeout: 120
 ```
 
@@ -119,17 +117,20 @@ hermes skills list | grep life     # 技能应已加载
 | 变量 | 必填 | 说明 |
 |---|---|---|
 | `LOCATION_CITY/LAT/LON` | 否 | 预置位置；不填则首次运行由 Agent 引导确认 |
+| `LIFE_ASSISTANT_TIMEZONE` | 否 | 调度 IANA 时区；默认使用运行环境本地时区 |
+| `DAILY_WEATHER_BRIEF_CRON` | 否 | 确定性晨间简报 cron；默认 `0 7 * * *` |
 | `QWEATHER_KEY` | 否 | 和风天气 Key（官方预警；不填降级为阈值推断） |
-| `JUHE_KEY` | 否 | 聚合数据油价 Key |
+| `TIANAPI_KEY` / `JUHE_KEY` | 否 | 晨间简报可用时附带当前油价；均未配置时自动省略 |
 | `KUAIDI100_CUSTOMER/KEY` | 否* | 快递100 授权（*快递功能必填） |
-| `NOTIFY_WEBHOOK_URL` / `BARK_URL` / `SERVERCHAN_SENDKEY` | 否 | 主动推送通道，可配多个 |
-| `PROFILE_PUSH_ROUTES_JSON` | 否 | Profile 私有 `deliver-only` Webhook 路由；HMAC secret 为 64 位随机十六进制值，`.env` 必须为 `600` |
+| `PROFILE_PUSH_ROUTES_JSON` | 否 | Profile → Hermes `deliver-only` Webhook；HMAC secret 为 64 位随机十六进制值，`.env` 必须为 `600` |
+
+`NOTIFY_WEBHOOK_URL`、`BARK_URL` 和 `SERVERCHAN_SENDKEY` 已退出主动投递路径，即使旧部署环境仍保留这些变量也不会发送。每个配置了 route 的 Profile 都会独立收到一份公共天气/油价通知；配置多个 Profile route 产生多份投递是有意行为。
 
 ## 切换 Profile 主动推送平台
 
-Life Assistant 不直接绑定 QQ SDK；它把私有提醒投递到 Hermes 的 `deliver-only` Webhook，再由 Hermes 选择目标平台。因此，**单个平台切换通常不需要改代码、不需要迁移 SQLite**。
+Life Assistant 不直接绑定 QQ SDK；它把所有主动通知投递到 Hermes 的 `deliver-only` Webhook，再由 Hermes 选择目标平台。因此，**单个平台切换通常不需要改代码、不需要迁移 SQLite**。
 
-当前部署的动态订阅是：
+示例动态订阅是：
 
 ```text
 default → life-assistant-reminder-default → qqbot
@@ -144,7 +145,7 @@ bestie  → life-assistant-reminder-bestie  → qqbot
 # default：QQ → 微信（示例）
 hermes webhook remove life-assistant-reminder-default
 hermes webhook subscribe life-assistant-reminder-default \
-  --prompt $'🎂 {notification.title}\n\n{notification.body}' \
+  --prompt $'{notification.title}\n\n{notification.body}' \
   --deliver weixin \
   --deliver-only \
   --secret "$DEFAULT_ROUTE_SECRET"
@@ -152,7 +153,7 @@ hermes webhook subscribe life-assistant-reminder-default \
 # bestie：QQ → 微信（示例）
 hermes -p bestie webhook remove life-assistant-reminder-bestie
 hermes -p bestie webhook subscribe life-assistant-reminder-bestie \
-  --prompt $'🎂 {notification.title}\n\n{notification.body}' \
+  --prompt $'{notification.title}\n\n{notification.body}' \
   --deliver weixin \
   --deliver-only \
   --secret "$BESTIE_ROUTE_SECRET"
@@ -166,7 +167,13 @@ hermes -p bestie webhook subscribe life-assistant-reminder-bestie \
 
 ### 回滚与多平台限制
 
-回滚就是把 `--deliver weixin/feishu` 改回 `--deliver qqbot`，其它参数保持不变。当前配置模型是**每个 Profile 一个主动推送目标**；如果要同一提醒同时发 QQ、微信、飞书，需要把 Profile route 配置扩展为多个 route，并为每条 route 建立独立 outbox。`notify.pull` 始终是私有兜底，不随平台切换消失。
+回滚就是把 `--deliver weixin/feishu` 改回 `--deliver qqbot`，其它参数保持不变。当前配置模型是**每个 Profile 一个主动推送目标**；不会同时直发 Bark、Server酱或通用 webhook。`notify.pull` 始终是恢复队列，不随平台切换消失。
+
+## 07:00 天气简报迁移
+
+`weather.daily_brief` 由 Life Assistant scheduler 使用天气 Provider 确定性生成，不调用 LLM；实时天气或预报单项失败时会用其余天气数据继续生成，油价不可用时直接省略，并按配置时区的本地日期去重。
+
+现有外部 Hermes 07:00 LLM cron 不属于本仓库，本次变更没有修改或删除它。部署新 scheduler 并验证简报后，运维者仍需先取得用户明确确认，再在 Hermes 中停用或删除旧 cron。确认前保留原任务；两者同时运行期间可能重复通知，且旧任务的模型/provider 漂移故障仍会继续出现。
 
 ## 工具一览
 
@@ -180,7 +187,7 @@ hermes -p bestie webhook subscribe life-assistant-reminder-bestie \
 - `calendar: "lunar"`：使用 `lunarMonth`、`lunarDay`，不能把农历日期当作公历 `date`。
 - 农历生日/纪念日按每年转换为当年的公历日期；普通月每年触发。
 - `leapMonthPolicy: "leap"` 表示只在对应闰月年份触发；没有对应闰月的年份默认跳过。
-- 配置 Profile 私有 Webhook 后，日程提醒会由 scheduler 通过 HMAC V2 主动投递；明确失败按 1m/5m/15m/1h 退避重试，网络结果不确定时复用请求 ID 防重复。
+- 配置 Profile Webhook 后，日程提醒会由 scheduler 通过 HMAC V2 主动投递；明确失败按 1m/5m/15m/1h 退避重试，网络结果不确定时复用请求 ID 防重复。
 - QQ/其他主动投递成功后，`notify.pull` 不会重复播报；主动投递失败或未配置时仍通过当前 Profile 的 `notify.pull` 兜底。
 
 ## 新增一个功能模块（5 分钟）
@@ -201,7 +208,7 @@ registerModule(mod);
 
 ## Roadmap
 
-- v0.2 SQLite 存储、更多通知通道（钉钉/飞书/邮件）
+- v0.2 SQLite 存储、统一 Hermes Webhook 通知路径
 - v0.3 已完成 Profile 专属 Hermes Webhook outbox；后续增加静默时段、snooze
 - v0.4 多位置/多用户、Web 配置面板
 
