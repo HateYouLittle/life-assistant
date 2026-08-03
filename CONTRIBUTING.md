@@ -1,37 +1,69 @@
 # 贡献指南
 
-感谢你的兴趣！本项目刻意保持小而清晰，欢迎以下方向的贡献：
+Life Assistant 的核心边界是模块产生日程或公共事件，SQLite 持久化 Profile notification/outbox，Hermes Gateway 负责具体消息平台。贡献应保持这个分层。
 
-## 高价值贡献点
+## 高价值方向
 
-- **新功能模块**：空气质量、限行提醒、话费/纪念日提醒等（见下文"新增模块"）
-- **新数据源 Provider**：为 weather / oilprice / express 实现更多 Provider（同接口替换）
-- **新通知通道**：钉钉、飞书、企业微信、邮件、Telegram（在 `src/core/notifier.ts` 数组中加一项）
-- **年度调价窗口表校准**：每年初按发改委公告更新 `src/modules/oilprice/schedule.ts`
+- 新生活信息模块，例如空气质量、限行或话费提醒。
+- weather / oilprice 的新 Provider，以及年度油价调价窗口校准。
+- 日程、outbox、Profile 隔离、静默时段和 snooze 的可靠性改进。
+- planned automation：SQLite 配置、白名单 action、scheduler 无 LLM 执行。该能力尚未实现，设计和 PR 不得假设已有通用 automation API。
+
+快递模块已封存，不作为当前 Provider 扩展方向。
 
 ## 开发流程
 
-1. Fork 并克隆， `npm install`
-2. 从 `main` 切功能分支：`feat/xxx` 或 `fix/xxx`
-3. 开发调试：`npm run dev`（MCP Server）、`npm run dev:scheduler`（调度进程）
-4. 提交前确保 `npm run build` 通过（TypeScript strict 模式，零 error）
-5. 提 PR，说明动机、方案、测试方式
+采用 TDD：先写能表达预期行为或复现问题的测试，再实现最小改动，最后补齐边界用例。提交 PR 前运行：
+
+```bash
+npm test
+npm run build
+git diff --check
+```
+
+推荐流程：
+
+1. `npm install` 安装依赖。
+2. 从 `main` 创建 `feat/<name>` 或 `fix/<name>` 分支。
+3. 使用 `npm run dev` 调试 MCP，使用 `npm run dev:scheduler` 调试独立 scheduler。
+4. 保持改动聚焦，并检查没有提交 `.env`、SQLite/WAL、secret 或个人标识。
+5. PR 说明动机、作用域、公共/私有数据语义和验证方式。
+
+## 模块与 Provider
+
+- 模块放在 `src/modules/<name>/index.ts`，实现并注册 `AssistantModule`，再由 `src/modules/index.ts` 导入。
+- 工具 `description` 是给 Agent 的契约，需要明确场景、参数、作用域和失败行为。
+- 外部 API 放在模块 `provider.ts`，通用 HTTP 行为复用 `core/http.ts`；不要在 handler 或 scheduler 中散落请求逻辑。
+- API key、token 和 Webhook secret 只来自环境变量。不得写入源码、测试 fixture、日志、文档示例或 Git。
+- Provider 必须有显式超时、有限重试和可理解的降级/错误信息；日志不得包含 URL query 中的 secret 或完整敏感响应。
+
+## 通知与 Profile 规则
+
+- 模块不得直绑 QQ、微信、Bark、Server酱或其他平台 SDK/HTTP API。
+- 公共模块 job 使用 `ctx.notify`，由 Profile fan-out、outbox 和 Hermes Webhook 处理投递。
+- 私有事件必须有明确 Profile 所有者并使用 Profile 发布路径；日程表、occurrence、notification、read 和 delivery 不得跨 Profile。
+- 不要在核心 notifier 中增加第三方平台分支。平台账号和 `--deliver` 目标由 Hermes Webhook/Gateway 管理。
+- `notify.pull` 是主动投递失败或 route 未配置时的恢复路径，不是第二条并行发送通道。
+
+## 新 job 要求
+
+每个 job 必须：
+
+- 声明适合业务的 cron 和 IANA timezone，不能依赖模糊的服务器本地时间假设；
+- 使用跨重启稳定的 `dedupeKey`，通常包含业务事件身份和目标本地日期/occurrence；
+- 对单轮 Provider 失败容错，不让异常阻断 scheduler 的后续轮次；
+- 明确事件是公共还是 Profile 私有，并覆盖相应隔离测试；
+- 通过 `ctx.notify` 或明确的 Profile 发布接口进入持久 outbox。
+
+静态或重复个人提醒应优先使用现有 `schedule`，无需增加模块 job。实时数据驱动的固定任务适合 code-defined job。通用动态任务属于 planned automation，在实现前不得对外暴露虚假工具。
 
 ## Commit 规范
 
-`type(scope): message`，如：
+格式为 `type(scope): message`，例如：
 
 - `feat(weather): add air quality provider`
-- `fix(express): dedupe notification on retry`
-- `docs: update README quickstart`
-
-## 新增模块约定
-
-- 目录：`src/modules/<name>/index.ts`（+ 可选 `provider.ts` 隔离外部 API）
-- 实现 `AssistantModule` 接口并自注册（`registerModule`）
-- 工具 `description` 写给 LLM 看：说清适用场景、参数含义、失败行为
-- 所有外部 HTTP 调用走 `core/http.ts`（统一超时重试）；所有密钥走环境变量 + `config.ts`
-- 定时任务必须做失败容错（单轮失败不影响下轮）与通知去重（`dedupeKey`）
+- `fix(schedule): preserve profile ownership on update`
+- `docs: update Hermes webhook setup`
 
 ## 行为准则
 

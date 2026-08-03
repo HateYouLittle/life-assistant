@@ -1,220 +1,309 @@
-# Life Assistant — 个人生活助理（Skill + MCP Server）
+# Life Assistant - Hermes 个人生活助理
 
-适配 **Hermes Agent** 的个人生活助理。当前提供公共生活信息与 Profile 私有日程能力：
+Life Assistant 是面向 Hermes Agent 的 Skill + MCP 服务，提供天气、油价和 Profile 私有日程，并通过可靠 outbox 将主动通知交给 Hermes Gateway 投递。
 
-| 功能 | 说明 |
+| 能力 | 当前行为 |
 |---|---|
-| ⛈ 天气查询、晨间简报与主动预警 | 实时天气、未来预报；每天 07:00 确定性简报；恶劣天气自动监测并主动推送 |
-| ⛽ 油价查询与调价预通知 | 当地 92#/95#/0# 油价；发改委调价窗口前 24h 主动预通知 |
-| 📅 Profile 私有日程 | 待办、生日、纪念日；支持公历和中国农历，提醒按 Profile 隔离 |
+| 天气 | 实时天气、7 日预报、气象预警、确定性每日生活简报 |
+| 油价 | 当前 92#/95#/0# 油价、下一次调价窗口与提前通知 |
+| 日程 | 待办、生日、纪念日；支持公历、中国农历和重复提醒 |
+| 通知 | Profile SQLite outbox、Hermes HMAC V2 `deliver-only` Webhook、`notify.pull` 失败兜底 |
 
-架构与扩展设计详见 [docs/architecture.md](docs/architecture.md)。
+当前共注册 15 个 MCP 工具。快递追踪已经封存，未注册到运行时。
 
-## 特性
+## 架构概览
 
-- **Skill + MCP 双形态**：`skill/SKILL.md` 教 Agent 何时用、怎么用；MCP Server 提供工具
-- **统一主动推送**：所有模块通知先写 Profile 隔离的 SQLite outbox，再通过 Hermes `deliver-only` Webhook 投递到一个 Gateway 平台；`notify.pull` 仅作失败恢复
-- **插件化模块**：新功能实现 `AssistantModule` 接口、注册一行即可，核心零改动
-- **低成本数据源**：Open-Meteo（免费无 Key）、和风天气免费版、聚合数据油价（低成本）、本地调价窗口推算（免费）
-- **Profile 隔离**：天气/油价数据和公共通知共享；日程、提醒和日程通知严格绑定 `HERMES_PROFILE`
-- **中国农历**：生日/纪念日可保存农历月日，按当年转换为公历触发；闰月生日默认只在对应闰月年份提醒
-- **首次运行位置确认**：IP 自动探测给建议值，Agent 用自然语言向用户确认一次后落盘
+```text
+Hermes Profile -> stdio MCP -> 查询工具 / Profile 私有日程
+                                  |
+独立 scheduler -> 模块 job / 日程扫描 -> SQLite Profile outbox
+                                               |
+                                               v
+                             Hermes deliver-only Webhook
+                                               |
+                                               v
+                                  该 Profile 的一个 Gateway 平台
 
-## 快速开始
+已 materialize 的投递失败/fallback 通知
+或无 route 的 Profile 私有日程 -> 所属 Profile 的 notify.pull
+```
+
+- MCP 进程只处理查询和工具调用，不运行 cron。
+- `src/scheduler.ts` 是唯一常驻调度器，执行模块 cron、日程扫描和 outbox 投递。
+- 所有进程必须使用同一个绝对 `DATA_DIR`。同一 `DATA_DIR` 只能运行一个 scheduler。
+- 位置、天气和油价数据共享；日程及日程通知严格按 `HERMES_PROFILE` 隔离。
+- 公共天气、油价和生活简报事件只为 `PROFILE_PUSH_ROUTES_JSON` 中的 Profile 独立 materialize；未配置 route 的 Profile 不会通过 `notify.pull` 收到这些公共事件。
+- Profile 私有日程通知即使没有 route 仍可 pull；已经 materialize 但投递失败或进入 fallback 的通知也保持可 pull。
+
+长期设计与投递语义见 [docs/architecture.md](docs/architecture.md)。
+
+## 安装
+
+要求 Node.js >= 22.5 和已安装的 Hermes CLI。
 
 ```bash
 npm install
-cp .env.example .env   # 按需填写（全部可留空，留空也能跑）
+cp .env.example .env
+chmod 600 .env
 npm run build
 ```
 
-> 当前 SQLite 实现使用 Node 内置 `node:sqlite`，运行环境要求 Node >= 22.5。
+将 `.env` 中的 `DATA_DIR` 改为绝对路径。Node 进程不会自动读取 `.env`；下文的 systemd unit 使用 `EnvironmentFile` 加载它，前台调试时需要先在 shell 中加载：
 
-### 1. 接入 Hermes Agent（MCP Server）
+```bash
+set -a
+source .env
+set +a
+```
 
-在 Hermes 的 MCP 配置中加入：
+## 注册 Hermes MCP Server
+
+优先使用 Hermes CLI 管理 MCP，不直接手改 `config.yaml`。先准备项目绝对路径并加载项目 `.env`：
+
+```bash
+LIFE_ASSISTANT_DIR=/absolute/path/to/life-assistant
+set -a
+source "$LIFE_ASSISTANT_DIR/.env"
+set +a
+```
+
+`.env` 中的 `DATA_DIR` 必须是一个绝对路径。所有 MCP Profile 与 scheduler 必须使用这同一个值；`HERMES_PROFILE` 必须显式设置。`--args` 会消费后续参数，因此必须放在命令最后。
+
+```bash
+hermes mcp add life-assistant \
+  --command node \
+  --env DATA_DIR="$DATA_DIR" HERMES_PROFILE=default \
+  --args "$LIFE_ASSISTANT_DIR/dist/index.js"
+```
+
+注册时 Hermes 会连接服务、列出发现的工具，并交互询问是否启用全部工具；请在可交互终端中确认。若名称已存在，还会先询问是否覆盖。
+
+其他 Profile 使用各自的 Hermes Profile 和不同的 `HERMES_PROFILE`，但仍共享同一个 `DATA_DIR`。将 `<profile>` 替换为实际 Profile ID：
+
+```bash
+hermes -p "<profile>" mcp add life-assistant \
+  --command node \
+  --env DATA_DIR="$DATA_DIR" HERMES_PROFILE="<profile>" \
+  --args "$LIFE_ASSISTANT_DIR/dist/index.js"
+```
+
+需要让 MCP 查询进程读取天气/油价 Key、预置位置或 `PROFILE_PUSH_ROUTES_JSON` 时，把对应 `KEY=value` 一并放在 `--env` 后、`--args` 前。不要省略 Profile 身份，也不要让不同 Profile 指向不同的数据目录。
+
+验证和调整工具选择：
+
+```bash
+hermes mcp list
+hermes mcp test life-assistant
+hermes mcp configure life-assistant
+
+hermes -p "<profile>" mcp list
+hermes -p "<profile>" mcp test life-assistant
+```
+
+Hermes 中的工具名形如 `mcp_life_assistant_weather_current`，即 MCP 工具名中的点号会转换为下划线。
+
+### 安装 Skill
+
+Hermes 的 Profile skill store 相互隔离，每个需要 Life Assistant 的 Profile 都必须单独安装或同步一份。下面的 `LIFE_ASSISTANT_PROFILE_HOME` 只是 shell 辅助变量：标准 default Profile 通常是 `$HOME/.hermes`，其他 Profile 通常是 `$HOME/.hermes/profiles/<profile>`：
+
+```bash
+LIFE_ASSISTANT_PROFILE_HOME=/absolute/path/to/current/hermes-profile
+install -D -m 0644 "$LIFE_ASSISTANT_DIR/skill/SKILL.md" \
+  "$LIFE_ASSISTANT_PROFILE_HOME/skills/life-assistant/SKILL.md"
+test -f "$LIFE_ASSISTANT_PROFILE_HOME/skills/life-assistant/SKILL.md"
+hermes skills list --source local
+```
+
+安装到额外 Profile 时，将 `<profile>` 替换为实际 Profile ID：
+
+```bash
+LIFE_ASSISTANT_PROFILE_HOME="$HOME/.hermes/profiles/<profile>"
+install -D -m 0644 "$LIFE_ASSISTANT_DIR/skill/SKILL.md" \
+  "$LIFE_ASSISTANT_PROFILE_HOME/skills/life-assistant/SKILL.md"
+hermes -p "<profile>" skills list --source local
+```
+
+Skill 安装后，Agent 会执行首次位置确认和每次会话的 `notify.pull` 兜底规则。
+
+## 配置主动 Webhook
+
+主动推送需要为每个 Profile 创建一条 Hermes 动态订阅。每条 route 只投递到一个平台，并使用自己的 64 位随机十六进制 HMAC secret。
+
+创建 subscription 前，先在目标 Profile 中通过 Gateway setup 启用并配置 Hermes Webhook platform 以及计划用于 `--deliver` 的消息平台，再显式保存监听端口。本节命令中的 `<profile>` 替换为实际 Profile ID；default Profile 可省略 `-p "<profile>"`：
+
+```bash
+hermes -p "<profile>" gateway setup
+hermes -p "<profile>" config set platforms.webhook.extra.port <gateway-port>
+```
+
+同时运行的 Profile Gateway 必须使用不同的 `<gateway-port>`。全新 Profile 应使用 `hermes -p "<profile>" gateway install --start-now` 安装并启动 Gateway，或通过选定的现有服务/容器管理器启动；若 Gateway 已在运行，请通过其正常的服务或进程管理器重启，使静态端口变更生效。`gateway run` 只是可选的前台运行方式。完成启动或重启后再验证：
+
+```bash
+hermes -p "<profile>" config get platforms.webhook.enabled
+hermes -p "<profile>" config get platforms.webhook.extra.port
+hermes -p "<profile>" gateway status --deep
+```
+
+两个 `config get` 输出应分别显示 Webhook 已启用和显式设置的 `<gateway-port>`，status 应确认该 Profile 的 Gateway 正在运行。这些命令不读取或输出 Webhook secret。
+
+1. 生成并安全保存 secret，例如 `openssl rand -hex 32`。不要把真实值写入聊天、Git、命令历史或普通日志。
+2. 在每个 Profile 的 Hermes Gateway 上创建同名 `deliver-only` route。prompt 必须为 `{notification.title}\n\n{notification.body}`。
+3. 把该 route 的 loopback URL、route 名和同一 secret 写入 `PROFILE_PUSH_ROUTES_JSON`。
+4. 让 scheduler 和对应 MCP 进程读取一致的 route 配置。
+
+以下命令中的平台和变量只是配置形状；secret 变量应从权限受限的文件或环境安全加载：
+
+```bash
+hermes -p "<profile>" webhook subscribe "life-assistant-<profile>" \
+  --prompt $'{notification.title}\n\n{notification.body}' \
+  --deliver qqbot \
+  --secret "$PROFILE_ROUTE_SECRET" \
+  --deliver-only
+```
+
+Hermes route URL 必须使用上面显式保存的同一个 `<gateway-port>`，形如 `http://127.0.0.1:<gateway-port>/webhooks/<route-name>`。Life Assistant 只接受 loopback HTTP(S) URL。对应的配置形状如下，值均为占位符：
 
 ```json
 {
-  "mcpServers": {
-    "life-assistant": {
-      "command": "node",
-      "args": ["/path/to/life-assistant/dist/index.js"],
-      "env": { "DATA_DIR": "/path/to/life-assistant/data", "HERMES_PROFILE": "default" }
-    }
+  "<profile>": {
+    "route": "life-assistant-<profile>",
+    "url": "http://127.0.0.1:<gateway-port>/webhooks/life-assistant-<profile>",
+    "secret": "<64-hex-secret>"
   }
 }
 ```
 
-再把 `skill/SKILL.md` 安装到 Hermes 的技能目录。
-
-### 2. 启动唯一主动通知调度进程
+替换占位符、压缩成单行后写入 `.env`。整个 JSON 值必须用单引号包裹，才能同时被 `source .env` 和 systemd `EnvironmentFile` 正确读取：
 
 ```bash
-npm run start:scheduler     # 或 pm2 start dist/scheduler.js --name life-assistant
+PROFILE_PUSH_ROUTES_JSON='{"<profile>":{"route":"life-assistant-<profile>","url":"http://127.0.0.1:<gateway-port>/webhooks/life-assistant-<profile>","secret":"<64-hex-secret>"}}'
 ```
 
-不启动调度进程也能用全部查询工具，只是没有主动提醒。配置 `PROFILE_PUSH_ROUTES_JSON` 后，天气、油价、日程以及未来模块通过标准 `notify` 回调发布的通知都会进入可靠 outbox，并主动投递到目标 Profile；发送失败时仍保留在 `notify.pull`。同一个 `DATA_DIR` 只应运行一个 scheduler。
+route 名、URL、secret 必须与 Hermes subscription 一致；一个 Profile 当前只支持一个目标平台。每增加一个 Profile，就在同一个 JSON 对象中增加一个条目。
 
-## 接入 Hermes Agent（详细步骤）
-
-Hermes 内置原生 MCP 客户端（`native-mcp` 技能），启动时自动连接 `mcp_servers` 里配置的服务并发现工具。
-
-### 前置条件
+用以下命令检查订阅，然后创建一条临时日程做端到端验证：
 
 ```bash
-pip install mcp    # Hermes 的 MCP 客户端依赖；未安装则 MCP 支持被静默禁用
+hermes -p "<profile>" webhook list
 ```
 
-### 1. 注册 MCP Server
+## 启动唯一 scheduler
 
-编辑 `~/.hermes/config.yaml`，在 `mcp_servers` 下添加（**整个文件只能有一个 `mcp_servers:` 块**，已有其他配置请合并，否则会被静默丢弃）：
-
-```yaml
-mcp_servers:
-  life-assistant:
-    command: "node"
-    args: ["/绝对路径/life-assistant/dist/index.js"]
-    env:
-      DATA_DIR: "/绝对路径/life-assistant/data"
-      HERMES_PROFILE: "default"  # 必须显式设置；其他 Profile 使用自己的值
-      QWEATHER_KEY: ""          # 可选：和风天气（官方预警）
-      JUHE_KEY: ""              # 可选：聚合数据（油价）
-      KUAIDI100_CUSTOMER: ""    # 快递100
-      KUAIDI100_KEY: ""         # 快递100
-      PROFILE_PUSH_ROUTES_JSON: "" # Profile → Hermes deliver-only Webhook
-    timeout: 120
-```
-
-### 2. 安装 Skill
+查询工具不依赖 scheduler，但主动天气预警、油价通知、每日生活简报、日程扫描和 outbox 投递都依赖它。前台验证可运行：
 
 ```bash
-mkdir -p ~/.hermes/skills/life-assistant
-cp skill/SKILL.md ~/.hermes/skills/life-assistant/SKILL.md
+set -a
+source .env
+set +a
+npm run start:scheduler
 ```
 
-### 3. 启动唯一调度进程（主动推送能力）
+生产环境推荐由 systemd 托管。先确认 Node >= 22.5，并取得实际 Node 可执行文件的绝对路径：
 
 ```bash
-npm run start:scheduler        # 前台
-# 生产建议托管：pm2 start dist/scheduler.js --name life-assistant-scheduler
+node --version
+node -p "process.execPath"
 ```
 
-### 4. 重启 Hermes 并验证
+将 unit 保存为 `/etc/systemd/system/life-assistant-scheduler.service`，并把 `ExecStart` 中的 Node 占位符替换为上一步输出。未过期的 SQLite singleton lease 会让新 scheduler 成功早退，因此 unit 必须继续重试，直到 lease 过期后能够接管：
+
+```ini
+[Unit]
+Description=Life Assistant scheduler
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=<service-user>
+WorkingDirectory=/absolute/path/to/life-assistant
+EnvironmentFile=/absolute/path/to/life-assistant/.env
+ExecStart=/absolute/path/to/node /absolute/path/to/life-assistant/dist/scheduler.js
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+保存或修改 unit 后加载、启动并验证：
 
 ```bash
-hermes mcp list                    # life-assistant 应显示已连接
-hermes tools list | grep life      # 应看到 15 个工具
-hermes skills list | grep life     # 技能应已加载
+sudo systemctl daemon-reload
+sudo systemctl enable --now life-assistant-scheduler.service
+systemctl is-active life-assistant-scheduler.service
+systemctl status --no-pager life-assistant-scheduler.service
 ```
 
-**工具名映射**：Hermes 注册为 `mcp_life_assistant_<工具名>`（点号转下划线），如 `weather.current` → `mcp_life_assistant_weather_current`。
+确保 `.env` 中的 `DATA_DIR` 为绝对路径，且与所有 MCP 注册一致。同一 `DATA_DIR` 不要启动第二个 scheduler；SQLite 租约是故障防护，不是多实例部署模式。
 
-接入后首次对话，Agent 会按 Skill 指引自动走位置确认流程。
+## 配置项
 
-## 配置（.env）
+| 变量 | 用途 |
+|---|---|
+| `DATA_DIR` | SQLite/WAL 和旧 `store.json` 迁移源；生产必须使用绝对路径 |
+| `HERMES_PROFILE` | MCP 进程的 Profile 身份；必填且不得静默回退 |
+| `PROFILE_PUSH_ROUTES_JSON` | Profile 到 Hermes route、loopback URL、HMAC secret 的映射 |
+| `LIFE_ASSISTANT_TIMEZONE` | scheduler 使用的 IANA 时区 |
+| `DAILY_WEATHER_BRIEF_CRON` | 每日生活简报 cron，默认 `0 7 * * *` |
+| `LOCATION_CITY/LAT/LON` | 可选预置共享位置；未设置时由 Agent 首次确认 |
+| `QWEATHER_KEY` | 可选，和风天气实时/预报/官方预警和 GeoAPI |
+| `QWEATHER_API_HOST` | 可选，和风天气 API host |
+| `TIANAPI_KEY` | 可选，油价首选数据源 |
+| `JUHE_KEY` | 可选，油价兜底数据源 |
 
-| 变量 | 必填 | 说明 |
-|---|---|---|
-| `LOCATION_CITY/LAT/LON` | 否 | 预置位置；不填则首次运行由 Agent 引导确认 |
-| `LIFE_ASSISTANT_TIMEZONE` | 否 | 调度 IANA 时区；默认使用运行环境本地时区 |
-| `DAILY_WEATHER_BRIEF_CRON` | 否 | 确定性晨间简报 cron；默认 `0 7 * * *` |
-| `QWEATHER_KEY` | 否 | 和风天气 Key（官方预警；不填降级为阈值推断） |
-| `TIANAPI_KEY` / `JUHE_KEY` | 否 | 晨间简报可用时附带当前油价；均未配置时自动省略 |
-| `KUAIDI100_CUSTOMER/KEY` | 否* | 快递100 授权（*快递功能必填） |
-| `PROFILE_PUSH_ROUTES_JSON` | 否 | Profile → Hermes `deliver-only` Webhook；HMAC secret 为 64 位随机十六进制值，`.env` 必须为 `600` |
+旧 `NOTIFY_WEBHOOK_URL`、`BARK_URL`、`SERVERCHAN_SENDKEY` 已是迁移期 no-op，不要在新部署中配置。
 
-`NOTIFY_WEBHOOK_URL`、`BARK_URL` 和 `SERVERCHAN_SENDKEY` 已退出主动投递路径，即使旧部署环境仍保留这些变量也不会发送。每个配置了 route 的 Profile 都会独立收到一份公共天气/油价通知；配置多个 Profile route 产生多份投递是有意行为。
+## 07:00 确定性生活简报
 
-## 切换 Profile 主动推送平台
+`weather.daily_brief` 的默认时间是配置时区每天 07:00，可分别通过 `DAILY_WEATHER_BRIEF_CRON` 和 `LIFE_ASSISTANT_TIMEZONE` 调整。内容由当前天气、当日预报以及可用时的油价确定性生成，不调用 LLM；单个天气源失败时使用另一个结果继续，油价不可用时省略。
 
-Life Assistant 不直接绑定 QQ SDK；它把所有主动通知投递到 Hermes 的 `deliver-only` Webhook，再由 Hermes 选择目标平台。因此，**单个平台切换通常不需要改代码、不需要迁移 SQLite**。
+迁移旧部署时，如果 Hermes 中仍存在外部 LLM 天气 cron，应先端到端验证内置简报，再暂停或删除旧任务；验证期间两者并存会产生重复通知。
 
-示例动态订阅是：
+## 平台切换
 
-```text
-default → life-assistant-reminder-default → qqbot
-bestie  → life-assistant-reminder-bestie  → qqbot
-```
-
-### 只切换一个 Profile 的目标平台
-
-先确保目标平台已经在对应 Hermes Profile 中配置好账号、Home 会话或目标 chat ID。然后删除旧订阅，用相同的 route 名、URL 和 HMAC secret 重建；只把 `--deliver qqbot` 换成目标平台，例如 `weixin` 或 `feishu`：
+目标平台属于 Hermes 动态订阅，不属于 Life Assistant 的 SQLite 数据模型。保持 route 名、URL 和 HMAC secret 不变，删除并用相同配置重建 subscription，只修改 `--deliver`：
 
 ```bash
-# default：QQ → 微信（示例）
-hermes webhook remove life-assistant-reminder-default
-hermes webhook subscribe life-assistant-reminder-default \
+hermes -p "<profile>" webhook remove "<route-name>"
+hermes -p "<profile>" webhook subscribe "<route-name>" \
   --prompt $'{notification.title}\n\n{notification.body}' \
   --deliver weixin \
-  --deliver-only \
-  --secret "$DEFAULT_ROUTE_SECRET"
-
-# bestie：QQ → 微信（示例）
-hermes -p bestie webhook remove life-assistant-reminder-bestie
-hermes -p bestie webhook subscribe life-assistant-reminder-bestie \
-  --prompt $'{notification.title}\n\n{notification.body}' \
-  --deliver weixin \
-  --deliver-only \
-  --secret "$BESTIE_ROUTE_SECRET"
+  --secret "$PROFILE_ROUTE_SECRET" \
+  --deliver-only
 ```
 
-- 不要把真实 secret 粘贴到聊天、脚本或 Git；从权限为 `600` 的 secret 文件安全加载到环境变量。
-- 仅更换 `--deliver` 时，`PROFILE_PUSH_ROUTES_JSON`、scheduler 和 SQLite 不需要修改。
-- 动态订阅会热加载，通常不需要重启 gateway；如果同时修改了 Hermes 平台凭据或平台配置，才重启对应 Profile 的 gateway。
-- 如果修改了 route 名、URL 或 HMAC secret，必须同步更新项目 `.env` 的 `PROFILE_PUSH_ROUTES_JSON`，然后重启 scheduler。
-- 切换后用 `hermes webhook list`（bestie 使用 `hermes -p bestie webhook list`）确认目标，再创建一条临时日程做端到端测试。
-
-### 回滚与多平台限制
-
-回滚就是把 `--deliver weixin/feishu` 改回 `--deliver qqbot`，其它参数保持不变。当前配置模型是**每个 Profile 一个主动推送目标**；不会同时直发 Bark、Server酱或通用 webhook。`notify.pull` 始终是恢复队列，不随平台切换消失。
-
-## 07:00 天气简报迁移
-
-`weather.daily_brief` 由 Life Assistant scheduler 使用天气 Provider 确定性生成，不调用 LLM；实时天气或预报单项失败时会用其余天气数据继续生成，油价不可用时直接省略，并按配置时区的本地日期去重。
-
-现有外部 Hermes 07:00 LLM cron 不属于本仓库，本次变更没有修改或删除它。部署新 scheduler 并验证简报后，运维者仍需先取得用户明确确认，再在 Hermes 中停用或删除旧 cron。确认前保留原任务；两者同时运行期间可能重复通知，且旧任务的模型/provider 漂移故障仍会继续出现。
+这种切换通常无需修改 `PROFILE_PUSH_ROUTES_JSON`、SQLite 或 scheduler，也无需重启 Gateway。只有平台凭据或静态平台配置变化时才可能需要重启对应 Gateway；route 名、URL 或 secret 变化时，必须同步更新 `PROFILE_PUSH_ROUTES_JSON` 并重启 scheduler。
 
 ## 工具一览
 
-`location.get/set/detect` · `weather.current/forecast/alerts` · `oilprice.current/next_adjustment` · `schedule.create/list/get/update/complete/delete` · `notify.pull`
+`location.get` · `location.set` · `location.detect` · `weather.current` · `weather.forecast` · `weather.alerts` · `oilprice.current` · `oilprice.next_adjustment` · `schedule.create` · `schedule.list` · `schedule.get` · `schedule.update` · `schedule.complete` · `schedule.delete` · `notify.pull`
 
-## 日程与中国农历
+日程工具不接受 `profileId`，而是绑定启动 MCP 时显式注入的 `HERMES_PROFILE`。农历生日或纪念日使用 `calendar: "lunar"`、`lunarMonth`、`lunarDay`；`leapMonthPolicy: "leap"` 仅在对应闰月年份触发。
 
-日程工具不接受 `profileId` 参数，而是自动绑定当前 MCP 进程的 `HERMES_PROFILE`。Profile 缺失或非法时直接拒绝访问，避免误落入 `default`。
+## 如何新增定时推送
 
-- `calendar: "solar"`：使用 `date: "YYYY-MM-DD"`。
-- `calendar: "lunar"`：使用 `lunarMonth`、`lunarDay`，不能把农历日期当作公历 `date`。
-- 农历生日/纪念日按每年转换为当年的公历日期；普通月每年触发。
-- `leapMonthPolicy: "leap"` 表示只在对应闰月年份触发；没有对应闰月的年份默认跳过。
-- 配置 Profile Webhook 后，日程提醒会由 scheduler 通过 HMAC V2 主动投递；明确失败按 1m/5m/15m/1h 退避重试，网络结果不确定时复用请求 ID 防重复。
-- QQ/其他主动投递成功后，`notify.pull` 不会重复播报；主动投递失败或未配置时仍通过当前 Profile 的 `notify.pull` 兜底。
+选择与需求匹配的层级：
 
-## 新增一个功能模块（5 分钟）
+1. 静态或重复的个人提醒：使用现有 `schedule.*`，数据和通知属于当前 Profile。
+2. 需要实时天气、油价或其他外部数据的固定任务：实现 `AssistantModule` job，在指定 timezone 下运行，并通过 `ctx.notify` 发布。公共 job 会按配置 Profile fan-out；私有事件必须显式使用 Profile 发布路径。
+3. 通用自然语言动态信息推送：当前尚未实现。规划中的 automation 将使用 SQLite 配置、白名单 action，并由 scheduler 在无需 LLM 的情况下执行。不要把它当作现有能力。
 
-```ts
-// src/modules/mymodule/index.ts
-import { registerModule, ok, type AssistantModule } from "../../core/registry.js";
+模块、job、Provider 和通知作用域的贡献要求见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
-const mod: AssistantModule = {
-  name: "mymodule",
-  tools: [{ name: "hello", description: "...", schema: {}, handler: async () => ok("hi") }],
-  jobs:  [{ name: "tick", cron: "0 8 * * *", handler: async ({ notify }) => { await notify("早安", "..."); } }],
-};
-registerModule(mod);
-```
+## 当前状态与计划
 
-然后在 `src/modules/index.ts` 加一行 `import "./mymodule/index.js";` —— 完成。
+已完成：SQLite 存储与旧数据迁移、Profile 私有日程、Profile notification/outbox、统一 Hermes HMAC V2 Webhook、`notify.pull` fallback、确定性生活简报、scheduler 单实例租约。
 
-## Roadmap
+计划中：
 
-- v0.2 SQLite 存储、统一 Hermes Webhook 通知路径
-- v0.3 已完成 Profile 专属 Hermes Webhook outbox；后续增加静默时段、snooze
-- v0.4 多位置/多用户、Web 配置面板
+- 动态信息推送 automation：SQLite 配置、白名单 action、scheduler 无 LLM 执行。
+- 静默时段、snooze 和更完整的通知管理。
+- 多位置支持与配置界面。
 
-## 贡献
+## 归档能力
 
-欢迎 PR！请阅读 [CONTRIBUTING.md](CONTRIBUTING.md)。年度调价窗口表（`src/modules/oilprice/schedule.ts`）每年初需要按发改委公告校准，这是新手友好的贡献点。
+快递追踪模块已封存且未在 `src/modules/index.ts` 注册，不属于当前工具或正常配置。恢复前应重新评估数据源、额度、隐私和测试覆盖。
 
 ## License
 

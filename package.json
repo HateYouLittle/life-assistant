@@ -1,7 +1,7 @@
 {
   "name": "life-assistant",
   "version": "0.1.0",
-  "description": "Personal life assistant (Skill + MCP server) for Hermes Agent: weather alerts, oil price notices, express tracking.",
+  "description": "Personal life assistant for Hermes Agent: weather, oil prices, Profile-private schedules, and reliable Hermes Webhook notifications.",
   "type": "module",
   "license": "MIT",
   "engines": {
