@@ -43,32 +43,82 @@ function noticeFromRow(row: Record<string, unknown>, scope: "global" | "profile"
   };
 }
 
+function findLegacyDedupeId(
+  table: "global_notifications" | "profile_notifications",
+  legacyDedupeKeys: readonly string[],
+  profileId?: string,
+): number | undefined {
+  const db = getDatabase();
+  for (const legacyDedupeKey of legacyDedupeKeys) {
+    let row: Record<string, unknown> | undefined;
+    if (table === "global_notifications") {
+      row = db.prepare(
+        "SELECT id FROM global_notifications WHERE dedupe_key = ?",
+      ).get(legacyDedupeKey);
+    } else {
+      if (profileId === undefined) throw new Error("profile ID is required for a Profile dedupe lookup");
+      row = db.prepare(
+        "SELECT id FROM profile_notifications WHERE profile_id = ? AND dedupe_key = ?",
+      ).get(profileId, legacyDedupeKey);
+    }
+    if (row) return Number((row as { id: number }).id);
+  }
+  return undefined;
+}
+
+function suppressRetainedGlobal(dedupeKey: string, legacyDedupeKeys: readonly string[]): boolean {
+  const db = getDatabase();
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const current = db.prepare(
+      "SELECT id FROM global_notifications WHERE dedupe_key = ?",
+    ).get(dedupeKey);
+    const legacyId = current ? undefined : findLegacyDedupeId("global_notifications", legacyDedupeKeys);
+    if (legacyId !== undefined) {
+      db.prepare("UPDATE global_notifications SET dedupe_key = ? WHERE id = ?").run(dedupeKey, legacyId);
+    }
+    db.exec("COMMIT");
+    return Boolean(current) || legacyId !== undefined;
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+}
+
 /** Publish one shared event. Supports (source, title, body, key) and (title, body, key). */
-export async function publishGlobal(sourceOrTitle: string, titleOrBody: string, bodyOrKey?: string, maybeDedupeKey?: string): Promise<void> {
+export async function publishGlobal(
+  sourceOrTitle: string,
+  titleOrBody: string,
+  bodyOrKey?: string,
+  maybeDedupeKey?: string,
+  legacyDedupeKeys: readonly string[] = [],
+): Promise<void> {
   const hasSource = maybeDedupeKey !== undefined;
   const source = hasSource ? sourceOrTitle : "general";
   const title = hasSource ? titleOrBody : sourceOrTitle;
   const body = hasSource ? bodyOrKey ?? "" : titleOrBody;
   const dedupeKey = hasSource ? maybeDedupeKey : bodyOrKey;
-  if (dedupeKey !== undefined) {
-    const legacyMatch = getDatabase().prepare(
-      "SELECT 1 FROM global_notifications WHERE dedupe_key = ?",
-    ).get(dedupeKey);
-    if (legacyMatch) return;
-  }
+  if (dedupeKey !== undefined && suppressRetainedGlobal(dedupeKey, legacyDedupeKeys)) return;
   for (const profileId of Object.keys(config.profilePushRoutes)) {
-    await publishResolvedProfile(profileId, source, title, body, dedupeKey);
+    await publishResolvedProfile(profileId, source, title, body, dedupeKey, legacyDedupeKeys);
   }
 }
 
 /** Publish an event that can only be consumed by one Profile. */
-export async function publishProfile(profileId: string, sourceOrTitle: string, titleOrBody: string, bodyOrKey?: string, maybeDedupeKey?: string): Promise<void> {
+export async function publishProfile(
+  profileId: string,
+  sourceOrTitle: string,
+  titleOrBody: string,
+  bodyOrKey?: string,
+  maybeDedupeKey?: string,
+  legacyDedupeKeys: readonly string[] = [],
+): Promise<void> {
   const hasSource = maybeDedupeKey !== undefined;
   const source = hasSource ? sourceOrTitle : "schedule";
   const title = hasSource ? titleOrBody : sourceOrTitle;
   const body = hasSource ? bodyOrKey ?? "" : titleOrBody;
   const dedupeKey = hasSource ? maybeDedupeKey : bodyOrKey;
-  await publishResolvedProfile(profileId, source, title, body, dedupeKey);
+  await publishResolvedProfile(profileId, source, title, body, dedupeKey, legacyDedupeKeys);
 }
 
 async function publishResolvedProfile(
@@ -77,6 +127,7 @@ async function publishResolvedProfile(
   title: string,
   body: string,
   dedupeKey?: string,
+  legacyDedupeKeys: readonly string[] = [],
 ): Promise<void> {
   const profile = requireProfileContext(profileId);
   const db = getDatabase();
@@ -84,14 +135,34 @@ async function publishResolvedProfile(
   db.exec("BEGIN IMMEDIATE");
   try {
     db.prepare("INSERT OR IGNORE INTO profiles(profile_id, created_at) VALUES(?, ?)").run(profile.id, time);
-    const inserted = db.prepare(
-      "INSERT OR IGNORE INTO profile_notifications(profile_id, source, title, body, created_at, dedupe_key) VALUES(?, ?, ?, ?, ?, ?)",
-    ).run(profile.id, source, title, body, time, dedupeKey ?? null) as { changes: number; lastInsertRowid: number | bigint };
-    const notificationId = inserted.changes
-      ? Number(inserted.lastInsertRowid)
-      : Number((db.prepare(
+    const current = dedupeKey === undefined
+      ? undefined
+      : db.prepare(
           "SELECT id FROM profile_notifications WHERE profile_id = ? AND dedupe_key = ?",
-        ).get(profile.id, dedupeKey ?? null) as { id?: number } | undefined)?.id ?? 0);
+        ).get(profile.id, dedupeKey) as { id: number } | undefined;
+    const legacyId = current || dedupeKey === undefined
+      ? undefined
+      : findLegacyDedupeId("profile_notifications", legacyDedupeKeys, profile.id);
+    if (legacyId !== undefined) {
+      if (dedupeKey === undefined) throw new Error("dedupe key is required for legacy key promotion");
+      db.prepare(
+        "UPDATE profile_notifications SET dedupe_key = ? WHERE profile_id = ? AND id = ?",
+      ).run(dedupeKey, profile.id, legacyId);
+    }
+    let notificationId = current?.id ?? legacyId;
+    if (notificationId === undefined) {
+      const inserted = db.prepare(
+        "INSERT OR IGNORE INTO profile_notifications(profile_id, source, title, body, created_at, dedupe_key) VALUES(?, ?, ?, ?, ?, ?)",
+      ).run(profile.id, source, title, body, time, dedupeKey ?? null) as {
+        changes: number;
+        lastInsertRowid: number | bigint;
+      };
+      notificationId = inserted.changes
+        ? Number(inserted.lastInsertRowid)
+        : Number((db.prepare(
+            "SELECT id FROM profile_notifications WHERE profile_id = ? AND dedupe_key = ?",
+          ).get(profile.id, dedupeKey ?? null) as { id?: number } | undefined)?.id ?? 0);
+    }
     const route = Object.prototype.hasOwnProperty.call(config.profilePushRoutes, profile.id)
       ? config.profilePushRoutes[profile.id]
       : undefined;

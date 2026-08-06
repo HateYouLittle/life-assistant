@@ -3,9 +3,10 @@ import { DateTime } from "luxon";
 import { config } from "../../config.js";
 import { currentLocation } from "../../core/location.js";
 import { httpJson } from "../../core/http.js";
+import { publishNotification } from "../../core/notification-publisher.js";
+import type { DailyWeatherPayload, NotificationEnvelope } from "../../core/notification.js";
 import { publishGlobal } from "../../core/notifier.js";
 import { registerModule, ok, fail, type AssistantModule } from "../../core/registry.js";
-import { fetchOilPrice, type OilPrice } from "../oilprice/provider.js";
 import {
   fetchCurrent,
   fetchForecast,
@@ -13,7 +14,9 @@ import {
   qweatherGeo,
   type CurrentWeather,
   type ForecastDay,
+  type WeatherAlert,
 } from "./provider.js";
+import { legacyWeatherAlertDedupeKeys, officialAlertNotification } from "./notification.js";
 
 export interface DailyWeatherBriefOptions {
   at?: Date;
@@ -21,12 +24,32 @@ export interface DailyWeatherBriefOptions {
   getLocation?: () => { city: string; lat: number; lon: number } | null;
   getCurrent?: (lat: number, lon: number, city: string) => Promise<CurrentWeather>;
   getForecast?: (lat: number, lon: number, days: number, city: string) => Promise<ForecastDay[]>;
-  getOilPrice?: (city: string) => Promise<OilPrice>;
-  publish?: (source: string, title: string, body: string, dedupeKey: string) => Promise<void>;
+  publish?: (
+    source: string,
+    title: string,
+    body: string,
+    dedupeKey: string,
+    legacyDedupeKeys?: readonly string[],
+  ) => Promise<void>;
 }
 
-function usableOilPrice(oil: OilPrice): boolean {
-  return [oil.p92, oil.p95, oil.p0].every((value) => value !== "—" && !value.includes("未配置"));
+function dailyAdvice(today: ForecastDay | undefined): string | undefined {
+  if (!today) return undefined;
+  const advice: string[] = [];
+  if (today.tMax >= 35) advice.push("减少午后长时间户外活动");
+  if ((today.precipProb ?? 0) >= 60 || (today.precipAmountMm ?? 0) > 0) advice.push("外出记得带伞");
+  return advice.length > 0 ? advice.join("，") : undefined;
+}
+
+function dailyHeadline(city: string, current: CurrentWeather | undefined, today: ForecastDay | undefined): string {
+  if (today) {
+    const advice = dailyAdvice(today);
+    const shortAdvice = advice
+      ? `，注意${advice.includes("减少午后") ? "防暑" : ""}${advice.includes("带伞") ? "带伞" : ""}`
+      : "";
+    return `${city}今天${today.weatherText}，${today.tMin}～${today.tMax}℃${shortAdvice}`;
+  }
+  return `${city}当前${current!.weatherText}，${current!.temperature}℃`;
 }
 
 export async function runDailyWeatherBrief(options: DailyWeatherBriefOptions = {}): Promise<void> {
@@ -39,11 +62,9 @@ export async function runDailyWeatherBrief(options: DailyWeatherBriefOptions = {
 
   const getCurrent = options.getCurrent ?? fetchCurrent;
   const getForecast = options.getForecast ?? fetchForecast;
-  const getOilPrice = options.getOilPrice ?? fetchOilPrice;
-  const [current, forecast, oil] = await Promise.allSettled([
+  const [current, forecast] = await Promise.allSettled([
     getCurrent(location.lat, location.lon, location.city),
     getForecast(location.lat, location.lon, 1, location.city),
-    getOilPrice(location.city),
   ]);
   if (current.status === "rejected" && (forecast.status === "rejected" || forecast.value.length === 0)) {
     const forecastFailure = forecast.status === "rejected"
@@ -52,31 +73,88 @@ export async function runDailyWeatherBrief(options: DailyWeatherBriefOptions = {
     throw new AggregateError([current.reason, forecastFailure], "daily weather brief providers failed");
   }
 
-  const lines: string[] = [];
-  if (current.status === "fulfilled") {
-    const value = current.value;
-    lines.push(`当前${value.weatherText}，${value.temperature}℃，体感${value.apparent}℃，湿度${value.humidity}%`);
-  }
-  if (forecast.status === "fulfilled" && forecast.value[0]) {
-    const today = forecast.value[0];
-    const precipitation = today.precipProb !== undefined
-      ? `，降水概率${today.precipProb}%`
-      : today.precipAmountMm !== undefined
-        ? `，预计降水${today.precipAmountMm}mm`
-        : "";
-    lines.push(`今日${today.weatherText}，${today.tMin}~${today.tMax}℃${precipitation}`);
-  }
-  if (oil.status === "fulfilled" && usableOilPrice(oil.value)) {
-    lines.push(`${oil.value.region}油价：92# ${oil.value.p92}元/升，95# ${oil.value.p95}元/升，0# ${oil.value.p0}元/升`);
-  }
+  const currentValue = current.status === "fulfilled" ? current.value : undefined;
+  const today = forecast.status === "fulfilled" ? forecast.value[0] : undefined;
+  const precipitation = today?.precipProb !== undefined
+    ? { probabilityPercent: today.precipProb }
+    : today?.precipAmountMm !== undefined
+      ? { amountMm: today.precipAmountMm }
+      : undefined;
+  const payload: DailyWeatherPayload = {
+    city: location.city,
+    current: currentValue ? {
+      weather: currentValue.weatherText,
+      temperatureC: currentValue.temperature,
+      apparentTemperatureC: currentValue.apparent,
+      humidityPercent: currentValue.humidity,
+    } : undefined,
+    today: today ? {
+      weather: today.weatherText,
+      minTemperatureC: today.tMin,
+      maxTemperatureC: today.tMax,
+    } : undefined,
+    precipitation,
+    advice: dailyAdvice(today),
+  };
+  const notification: NotificationEnvelope = {
+    kind: "weather.daily_brief",
+    identity: `daily-brief:${localDate}`,
+    source: "weather",
+    scope: { type: "global" },
+    headline: dailyHeadline(location.city, currentValue, today),
+    generatedAt: at.toISOString(),
+    payload,
+  };
+  await publishNotification(notification, options.publish ? { publishGlobal: options.publish } : {});
+}
 
+export interface WeatherAlertsCheckOptions {
+  at?: Date;
+  timezone?: string;
+  getLocation?: () => { city: string; lat: number; lon: number } | null;
+  getAlerts?: (city: string, lat: number, lon: number) => Promise<WeatherAlert[]>;
+  publish?: (
+    source: string,
+    title: string,
+    body: string,
+    dedupeKey: string,
+    legacyDedupeKeys?: readonly string[],
+  ) => Promise<void>;
+}
+
+export async function runWeatherAlertsCheck(options: WeatherAlertsCheckOptions = {}): Promise<void> {
+  const location = (options.getLocation ?? currentLocation)();
+  if (!location) return;
+  const at = options.at ?? new Date();
+  const timezone = options.timezone ?? config.timezone;
   const publish = options.publish ?? publishGlobal;
-  await publish(
-    "weather",
-    `早安，${location.city}生活简报`,
-    lines.join("\n"),
-    `weather:daily-brief:${localDate}`,
-  );
+  const alerts = await (options.getAlerts ?? fetchAlerts)(location.city, location.lat, location.lon);
+  for (const alert of alerts) {
+    const legacyDedupeKeys = legacyWeatherAlertDedupeKeys(alert, at);
+    if (alert.kind === "inferred") {
+      const localDate = DateTime.fromJSDate(at).setZone(timezone).toISODate();
+      if (!localDate) throw new Error(`invalid weather alert timezone: ${timezone}`);
+      await publish(
+        "weather",
+        `系统推断风险：${alert.title}`,
+        alert.description,
+        `weather:inferred:${encodeURIComponent(alert.title)}:${localDate}`,
+        legacyDedupeKeys,
+      );
+      continue;
+    }
+    let notification: ReturnType<typeof officialAlertNotification>;
+    try {
+      notification = officialAlertNotification(alert, {
+        generatedAt: at.toISOString(),
+        timezone,
+      });
+    } catch (error) {
+      console.error(`[weather] official alert omitted: ${(error as Error).message}`);
+      continue;
+    }
+    await publishNotification(notification, { publishGlobal: publish }, legacyDedupeKeys);
+  }
 }
 
 function requireLocation() {
@@ -170,16 +248,7 @@ const weatherModule: AssistantModule = {
     {
       name: "alerts_check",
       cron: config.cron.weatherAlerts,
-      handler: async ({ notify }) => {
-        const loc = currentLocation();
-        if (!loc) return;
-        const alerts = await fetchAlerts(loc.city, loc.lat, loc.lon);
-        for (const a of alerts) {
-          // dedupeKey 含标题与日期：同一天同一预警只推一次
-          const key = `weather:alert:${a.title}:${new Date().toISOString().slice(0, 10)}`;
-          await notify(`⛈ ${a.title}`, a.description, key);
-        }
-      },
+      handler: async () => runWeatherAlertsCheck(),
     },
   ],
 };

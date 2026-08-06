@@ -1,0 +1,44 @@
+{
+  "metadata": {
+    "tag": "fixture-tag",
+    "zeroResult": false,
+    "attributions": [
+      "国家预警信息发布中心",
+      "当前预警数据可能存在延迟或信息过时，以官方数据发布为准。"
+    ]
+  },
+  "alerts": [
+    {
+      "id": "202608041411009200029230",
+      "senderName": "江西省气象台",
+      "issuedTime": "2026-08-04T06:11Z",
+      "messageType": {
+        "code": "alert",
+        "supersedes": []
+      },
+      "eventType": {
+        "name": "雷电",
+        "code": "1014"
+      },
+      "urgency": null,
+      "severity": "severe",
+      "certainty": null,
+      "icon": "1014",
+      "color": {
+        "code": "orange",
+        "red": 250,
+        "green": 120,
+        "blue": 0,
+        "alpha": 1
+      },
+      "effectiveTime": "2026-08-04T06:11Z",
+      "onsetTime": "2026-08-04T06:11Z",
+      "expireTime": "2026-08-04T11:11Z",
+      "headline": "江西省气象台2026年08月04日14时11分发布雷电橙色预警信号。",
+      "description": "江西省气象台2026年08月04日14时11分发布雷电橙色预警信号：预计未来2小时内，鹰潭、南昌、萍乡三市和上饶市南部及九江市北部、抚州市东部、吉安市西部的部分地区有强雷电活动，局地伴有短时强降水、雷雨大风等强对流天气，请注意防范。",
+      "criteria": "2小时内发生雷电活动的可能性很大，或者已经受雷电活动影响，且可能持续，出现雷电灾害事故的可能性比较大。",
+      "responseTypes": [],
+      "instruction": "1.政府及相关部门按照职责做好防雷工作；2.密切关注天气，尽量避免户外活动。"
+    }
+  ]
+}

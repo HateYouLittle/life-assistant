@@ -6,6 +6,7 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { Lunar, Solar } from "lunar-javascript";
+import type { WeatherAlert } from "../src/modules/weather/provider.js";
 
 const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "life-assistant-test-"));
 const testSecretA = crypto.createHash("sha256").update("profile-a test fixture").digest("hex");
@@ -61,7 +62,13 @@ const runDailyWeatherBrief = (weatherModule as Record<string, unknown>).runDaily
     precipProb?: number;
     precipAmountMm?: number;
   }>>;
-  getOilPrice: () => Promise<{ region: string; p92: string; p95: string; p0: string }>;
+  publish?: (source: string, title: string, body: string, dedupeKey: string) => Promise<void>;
+}) => Promise<void>;
+const runWeatherAlertsCheck = (weatherModule as Record<string, unknown>).runWeatherAlertsCheck as (options: {
+  at?: Date;
+  timezone?: string;
+  getLocation?: () => { city: string; lat: number; lon: number } | null;
+  getAlerts?: (city: string, lat: number, lon: number) => Promise<WeatherAlert[]>;
   publish?: (source: string, title: string, body: string, dedupeKey: string) => Promise<void>;
 }) => Promise<void>;
 
@@ -214,8 +221,96 @@ test("republishing a retained legacy global event does not create Profile duplic
   assert.equal(logicalEvents[0].body, "retained pull item");
 });
 
+test("a retained global weather alert promotes an exact legacy alias without fan-out", async () => {
+  const legacyKey = "weather:alert:保留的官方原始标题:2026-08-04";
+  const stableKey = "weather:alert:id:retained-global-upgrade";
+  const inserted = db.prepare(`
+    INSERT INTO global_notifications(source, title, body, created_at, dedupe_key)
+    VALUES(?, ?, ?, ?, ?)
+  `).run("weather", "Legacy global title", "Legacy global body", "2026-08-04T23:58:00.000Z", legacyKey) as {
+    lastInsertRowid: number | bigint;
+  };
+
+  await publishGlobal(
+    "weather",
+    "New rendered title",
+    "New rendered body",
+    stableKey,
+    [legacyKey, "weather:alert:保留的官方原始标题:2026-08-03"],
+  );
+
+  const row = db.prepare(`
+    SELECT id, title, body, dedupe_key FROM global_notifications WHERE id = ?
+  `).get(Number(inserted.lastInsertRowid)) as Record<string, unknown>;
+  assert.deepEqual({ ...row }, {
+    id: Number(inserted.lastInsertRowid),
+    title: "Legacy global title",
+    body: "Legacy global body",
+    dedupe_key: stableKey,
+  });
+  const profileCopies = db.prepare(`
+    SELECT COUNT(*) AS count FROM profile_notifications WHERE dedupe_key = ?
+  `).get(stableKey) as { count: number };
+  assert.equal(profileCopies.count, 0);
+});
+
+test("an existing stable key wins without deleting its legacy alias row", async () => {
+  const globalLegacyKey = "weather:alert:global-conflict-title:2026-08-04";
+  const globalStableKey = "weather:alert:id:global-conflict";
+  db.prepare(`
+    INSERT INTO global_notifications(source, title, body, created_at, dedupe_key)
+    VALUES('weather', 'Global legacy', 'Global legacy body', ?, ?),
+          ('weather', 'Global stable', 'Global stable body', ?, ?)
+  `).run(
+    "2026-08-04T00:00:00.000Z",
+    globalLegacyKey,
+    "2026-08-04T01:00:00.000Z",
+    globalStableKey,
+  );
+
+  await publishGlobal(
+    "weather",
+    "Ignored replacement",
+    "Ignored replacement body",
+    globalStableKey,
+    [globalLegacyKey],
+  );
+
+  const globalRows = db.prepare(`
+    SELECT title, dedupe_key FROM global_notifications
+    WHERE dedupe_key IN (?, ?) ORDER BY dedupe_key
+  `).all(globalStableKey, globalLegacyKey) as Array<Record<string, unknown>>;
+  assert.deepEqual(globalRows.map((row) => ({ ...row })), [
+    { title: "Global legacy", dedupe_key: globalLegacyKey },
+    { title: "Global stable", dedupe_key: globalStableKey },
+  ]);
+
+  const profileLegacyKey = "weather:alert:profile-conflict-title:2026-08-04";
+  const profileStableKey = "weather:alert:id:profile-conflict";
+  await publishProfile("profile-a", "weather", "Profile legacy", "Legacy body", profileLegacyKey);
+  await publishProfile("profile-a", "weather", "Profile stable", "Stable body", profileStableKey);
+  await publishProfile(
+    "profile-a",
+    "weather",
+    "Ignored replacement",
+    "Ignored replacement body",
+    profileStableKey,
+    [profileLegacyKey],
+  );
+
+  const profileRows = db.prepare(`
+    SELECT title, dedupe_key FROM profile_notifications
+    WHERE profile_id = ? AND dedupe_key IN (?, ?) ORDER BY dedupe_key
+  `).all("profile-a", profileStableKey, profileLegacyKey) as Array<Record<string, unknown>>;
+  assert.deepEqual(profileRows.map((row) => ({ ...row })), [
+    { title: "Profile stable", dedupe_key: profileStableKey },
+    { title: "Profile legacy", dedupe_key: profileLegacyKey },
+  ]);
+});
+
 test("the deterministic daily brief publishes once per local date through every Profile route", async () => {
   assert.equal(typeof runDailyWeatherBrief, "function");
+  let oilProviderCalls = 0;
   const options = {
     timezone: "Asia/Shanghai",
     getLocation: () => ({ city: "北京", lat: 39.9, lon: 116.4 }),
@@ -234,7 +329,10 @@ test("the deterministic daily brief publishes once per local date through every 
       weatherText: "阵雨",
       precipProb: 70,
     }],
-    getOilPrice: async () => ({ region: "北京", p92: "7.21", p95: "7.68", p0: "6.91" }),
+    getOilPrice: async () => {
+      oilProviderCalls += 1;
+      return { region: "北京", p92: "7.21", p95: "7.68", p0: "6.91" };
+    },
   };
 
   await runDailyWeatherBrief({ ...options, at: new Date("2026-08-03T00:00:00.000Z") });
@@ -246,10 +344,14 @@ test("the deterministic daily brief publishes once per local date through every 
   `).all("weather:daily-brief:2026-08-03") as Array<Record<string, unknown>>;
   assert.equal(sameDay.length, 2);
   assert.deepEqual(sameDay.map((row) => row.profile_id), ["profile-a", "profile-b"]);
-  assert.match(String(sameDay[0].title), /北京.*生活简报/);
-  assert.match(String(sameDay[0].body), /当前多云，28℃/);
-  assert.match(String(sameDay[0].body), /今日阵雨，24~32℃，降水概率70%/);
-  assert.match(String(sameDay[0].body), /92# 7.21元\/升/);
+  assert.equal(sameDay[0].title, "北京今天阵雨，24～32℃，注意带伞");
+  assert.equal(sameDay[0].body, [
+    "当前：多云，28℃，体感30℃，湿度61%",
+    "今日：24～32℃，阵雨",
+    "降水：最高概率70%",
+    "建议：外出记得带伞",
+  ].join("\n"));
+  assert.doesNotMatch(String(sameDay[0].body), /油价|92#|95#|0#/);
   assert.doesNotMatch(String(sameDay[0].body), /\|/);
 
   await runDailyWeatherBrief({ ...options, at: new Date("2026-08-04T00:00:00.000Z") });
@@ -258,6 +360,7 @@ test("the deterministic daily brief publishes once per local date through every 
     WHERE dedupe_key LIKE 'weather:daily-brief:%'
   `).get() as { count: number };
   assert.equal(allBriefs.count, 4);
+  assert.equal(oilProviderCalls, 0);
 });
 
 test("the daily brief labels probability percent and precipitation amount millimeters distinctly", async () => {
@@ -266,7 +369,6 @@ test("the daily brief labels probability percent and precipitation amount millim
     timezone: "Asia/Shanghai",
     getLocation: () => ({ city: "北京", lat: 39.9, lon: 116.4 }),
     getCurrent: async () => { throw new Error("current unavailable"); },
-    getOilPrice: async () => { throw new Error("oil unavailable"); },
     publish: async (_source: string, _title: string, body: string) => {
       bodies.push(body);
     },
@@ -295,13 +397,13 @@ test("the daily brief labels probability percent and precipitation amount millim
     }],
   });
 
-  assert.match(bodies[0], /今日阵雨，23~30℃，降水概率65%/);
+  assert.match(bodies[0], /今日：23～30℃，阵雨\n降水：最高概率65%/);
   assert.doesNotMatch(bodies[0], /预计降水/);
-  assert.match(bodies[1], /今日中雨，22~29℃，预计降水12\.7mm/);
+  assert.match(bodies[1], /今日：22～29℃，中雨\n降水：预计12\.7mm/);
   assert.doesNotMatch(bodies[1], /降水概率|undefined%/);
 });
 
-test("the daily brief survives forecast and optional oil provider failures", async () => {
+test("the daily brief survives a forecast provider failure", async () => {
   const published: Array<{ source: string; title: string; body: string; dedupeKey: string }> = [];
   await runDailyWeatherBrief({
     at: new Date("2026-08-05T00:00:00.000Z"),
@@ -316,7 +418,6 @@ test("the daily brief survives forecast and optional oil provider failures", asy
       weatherText: "晴",
     }),
     getForecast: async () => { throw new Error("forecast unavailable"); },
-    getOilPrice: async () => { throw new Error("oil unavailable"); },
     publish: async (source, title, body, dedupeKey) => {
       published.push({ source, title, body, dedupeKey });
     },
@@ -324,8 +425,8 @@ test("the daily brief survives forecast and optional oil provider failures", asy
 
   assert.deepEqual(published, [{
     source: "weather",
-    title: "早安，上海生活简报",
-    body: "当前晴，30℃，体感33℃，湿度70%",
+    title: "上海当前晴，30℃",
+    body: "当前：晴，30℃，体感33℃，湿度70%",
     dedupeKey: "weather:daily-brief:2026-08-05",
   }]);
 });
@@ -350,7 +451,6 @@ test("the daily brief leaves its dedupe key free when current weather fails and 
       };
     },
     getForecast: async () => [],
-    getOilPrice: async () => ({ region: "广东", p92: "7.31", p95: "7.92", p0: "7.00" }),
     publish: async (source: string, title: string, body: string, dedupeKey: string) => {
       published.push({ source, title, body, dedupeKey });
     },
@@ -362,7 +462,232 @@ test("the daily brief leaves its dedupe key free when current weather fails and 
   await runDailyWeatherBrief(options);
   assert.equal(published.length, 1);
   assert.equal(published[0].dedupeKey, "weather:daily-brief:2026-08-06");
-  assert.match(published[0].body, /当前多云，31℃/);
+  assert.match(published[0].body, /当前：多云，31℃/);
+});
+
+test("an official alert ID publishes one weather event through every Profile route", async () => {
+  assert.equal(typeof runWeatherAlertsCheck, "function");
+  const alert: WeatherAlert = {
+    kind: "official",
+    id: "integration-provider-id-1",
+    publisher: "江西省气象台",
+    issuedAt: "2026-08-04T06:11Z",
+    eventType: "雷电",
+    eventCode: "1014",
+    level: "橙色",
+    severity: "severe",
+    effectiveAt: "2026-08-04T06:11Z",
+    onsetAt: "2026-08-04T06:11Z",
+    expiresAt: "2026-08-04T11:11Z",
+    headline: "官方标题原文",
+    description: "官方完整原文。",
+    criteria: "雷电灾害事故发生可能性较大。",
+    instruction: "密切关注天气，尽量避免户外活动。",
+    attributions: ["国家预警信息发布中心"],
+  };
+  const options = {
+    at: new Date("2026-08-04T11:30:00Z"),
+    timezone: "Asia/Shanghai",
+    getLocation: () => ({ city: "萍乡", lat: 27.62, lon: 113.85 }),
+    getAlerts: async () => [alert],
+  };
+
+  await runWeatherAlertsCheck(options);
+  await runWeatherAlertsCheck(options);
+
+  const rows = db.prepare(`
+    SELECT profile_id, source, title, body FROM profile_notifications
+    WHERE dedupe_key = ? ORDER BY profile_id
+  `).all("weather:alert:id:integration-provider-id-1") as Array<Record<string, unknown>>;
+  assert.equal(rows.length, 2);
+  assert.deepEqual(rows.map((row) => row.profile_id), ["profile-a", "profile-b"]);
+  assert.ok(rows.every((row) => row.source === "weather"));
+  assert.ok(rows.every((row) => row.title === "雷电橙色预警：雷电灾害事故发生可能性较大。"));
+  assert.match(String(rows[0].body), /^时间：.*\n风险：.*\n建议：.*\n来源：.*\n\n官方原文：\n官方完整原文。$/);
+  assert.doesNotMatch(String(rows[0].body), /区域：|undefined/);
+});
+
+test("an official alert upgrades an exact legacy Profile key without resending", async () => {
+  const alert: WeatherAlert = {
+    kind: "official",
+    id: "upgrade-provider-id-1",
+    publisher: "江西省气象台",
+    issuedAt: "2026-08-04T23:45Z",
+    eventType: "暴雨",
+    level: "橙色",
+    headline: "跨 UTC 午夜的官方原始标题",
+    description: "新版官方完整原文。",
+    criteria: "短时强降雨风险较高。",
+    instruction: "注意防范城乡积涝。",
+    attributions: ["国家预警信息发布中心"],
+  };
+  const legacyKey = "weather:alert:跨 UTC 午夜的官方原始标题:2026-08-04";
+  const stableKey = "weather:alert:id:upgrade-provider-id-1";
+  const createdAt = "2026-08-04T23:55:00.000Z";
+  const inserted = db.prepare(`
+    INSERT INTO profile_notifications(profile_id, source, title, body, created_at, dedupe_key)
+    VALUES(?, ?, ?, ?, ?, ?)
+  `).run("profile-a", "weather", "Legacy profile title", "Legacy profile body", createdAt, legacyKey) as {
+    lastInsertRowid: number | bigint;
+  };
+  const legacyNotificationId = Number(inserted.lastInsertRowid);
+  db.prepare(`
+    INSERT INTO profile_notification_deliveries(
+      profile_id, notification_id, route, status, attempts,
+      next_attempt_at, sent_at, created_at, updated_at
+    ) VALUES(?, ?, 'qqbot', 'sent', 3, ?, ?, ?, ?)
+  `).run("profile-a", legacyNotificationId, createdAt, createdAt, createdAt, createdAt);
+  const options = {
+    at: new Date("2026-08-05T00:03:00.000Z"),
+    timezone: "Asia/Shanghai",
+    getLocation: () => ({ city: "萍乡", lat: 27.62, lon: 113.85 }),
+    getAlerts: async () => [alert],
+  };
+
+  await runWeatherAlertsCheck(options);
+
+  const profileA = db.prepare(`
+    SELECT id, title, body, created_at, dedupe_key
+    FROM profile_notifications WHERE profile_id = ? AND id = ?
+  `).get("profile-a", legacyNotificationId) as Record<string, unknown>;
+  assert.deepEqual({ ...profileA }, {
+    id: legacyNotificationId,
+    title: "Legacy profile title",
+    body: "Legacy profile body",
+    created_at: createdAt,
+    dedupe_key: stableKey,
+  });
+  const profileADelivery = db.prepare(`
+    SELECT status, attempts FROM profile_notification_deliveries
+    WHERE profile_id = ? AND notification_id = ?
+  `).get("profile-a", legacyNotificationId) as Record<string, unknown>;
+  assert.deepEqual({ ...profileADelivery }, { status: "sent", attempts: 3 });
+
+  const profileB = db.prepare(`
+    SELECT n.id, n.dedupe_key, d.status, d.attempts
+    FROM profile_notifications n
+    JOIN profile_notification_deliveries d
+      ON d.profile_id = n.profile_id AND d.notification_id = n.id
+    WHERE n.profile_id = ? AND n.dedupe_key = ?
+  `).get("profile-b", stableKey) as Record<string, unknown>;
+  assert.equal(profileB.dedupe_key, stableKey);
+  assert.equal(profileB.status, "pending");
+  assert.equal(profileB.attempts, 0);
+
+  await runWeatherAlertsCheck(options);
+
+  const counts = db.prepare(`
+    SELECT profile_id, COUNT(*) AS count
+    FROM profile_notifications
+    WHERE dedupe_key IN (?, ?)
+    GROUP BY profile_id ORDER BY profile_id
+  `).all(stableKey, legacyKey) as Array<Record<string, unknown>>;
+  assert.deepEqual(counts.map((row) => ({ ...row })), [
+    { profile_id: "profile-a", count: 1 },
+    { profile_id: "profile-b", count: 1 },
+  ]);
+  const unchangedDelivery = db.prepare(`
+    SELECT status, attempts FROM profile_notification_deliveries
+    WHERE profile_id = ? AND notification_id = ?
+  `).get("profile-a", legacyNotificationId) as Record<string, unknown>;
+  assert.deepEqual({ ...unchangedDelivery }, { status: "sent", attempts: 3 });
+});
+
+test("an inferred weather risk is explicitly labeled and never rendered as an official alert", async () => {
+  const published: Array<{ source: string; title: string; body: string; dedupeKey: string }> = [];
+  await runWeatherAlertsCheck({
+    at: new Date("2026-08-04T11:30:00Z"),
+    timezone: "Asia/Shanghai",
+    getLocation: () => ({ city: "萍乡", lat: 27.62, lon: 113.85 }),
+    getAlerts: async () => [{
+      kind: "inferred",
+      title: "萍乡高温推断提醒",
+      level: "inferred",
+      description: "未来48小时最高气温约36℃，注意防暑降温。",
+    }],
+    publish: async (source, title, body, dedupeKey) => {
+      published.push({ source, title, body, dedupeKey });
+    },
+  });
+
+  assert.deepEqual(published, [{
+    source: "weather",
+    title: "系统推断风险：萍乡高温推断提醒",
+    body: "未来48小时最高气温约36℃，注意防暑降温。",
+    dedupeKey: "weather:inferred:%E8%90%8D%E4%B9%A1%E9%AB%98%E6%B8%A9%E6%8E%A8%E6%96%AD%E6%8F%90%E9%86%92:2026-08-04",
+  }]);
+  assert.doesNotMatch(published[0].title + published[0].body, /官方预警|官方原文/);
+});
+
+test("fallback alert identity dedupes repeats but treats a new issued time as a new event", async () => {
+  const baseAlert: WeatherAlert = {
+    kind: "official",
+    publisher: "fallback-integration气象台",
+    issuedAt: "2026-08-04T06:11Z",
+    eventType: "雷电",
+    level: "黄色",
+    severity: "moderate",
+    headline: "官方标题原文",
+    description: "第一份官方完整原文。",
+    attributions: ["国家预警信息发布中心"],
+  };
+  const common = {
+    at: new Date("2026-08-04T11:30:00Z"),
+    timezone: "Asia/Shanghai",
+    getLocation: () => ({ city: "萍乡", lat: 27.62, lon: 113.85 }),
+  };
+
+  await runWeatherAlertsCheck({ ...common, getAlerts: async () => [baseAlert] });
+  await runWeatherAlertsCheck({ ...common, getAlerts: async () => [baseAlert] });
+  await runWeatherAlertsCheck({
+    ...common,
+    getAlerts: async () => [{
+      ...baseAlert,
+      issuedAt: "2026-08-04T07:11Z",
+      description: "发布时间变化后的官方完整原文。",
+    }],
+  });
+
+  const rows = db.prepare(`
+    SELECT profile_id, source, dedupe_key FROM profile_notifications
+    WHERE dedupe_key LIKE 'weather:alert:fallback:fallback-integration%'
+    ORDER BY dedupe_key, profile_id
+  `).all() as Array<Record<string, unknown>>;
+  assert.equal(rows.length, 4);
+  assert.equal(new Set(rows.map((row) => row.dedupe_key)).size, 2);
+  assert.ok(rows.every((row) => row.source === "weather"));
+  assert.deepEqual(rows.map((row) => row.profile_id), ["profile-a", "profile-b", "profile-a", "profile-b"]);
+});
+
+test("an alert without a usable identity is omitted without blocking later official alerts", async () => {
+  const published: Array<{ dedupeKey: string }> = [];
+  await runWeatherAlertsCheck({
+    at: new Date("2026-08-04T11:30:00Z"),
+    timezone: "Asia/Shanghai",
+    getLocation: () => ({ city: "萍乡", lat: 27.62, lon: 113.85 }),
+    getAlerts: async () => [{
+      kind: "official",
+      eventType: "雷电",
+      headline: "字段不完整的官方标题",
+      description: "字段不完整的官方原文。",
+      attributions: [],
+    }, {
+      kind: "official",
+      id: "valid-after-incomplete",
+      publisher: "萍乡市气象台",
+      issuedAt: "2026-08-04T10:11Z",
+      eventType: "大风",
+      level: "蓝色",
+      headline: "完整的官方标题",
+      description: "完整的官方原文。",
+      attributions: [],
+    }],
+    publish: async (_source, _title, _body, dedupeKey) => {
+      published.push({ dedupeKey });
+    },
+  });
+
+  assert.deepEqual(published, [{ dedupeKey: "weather:alert:id:valid-after-incomplete" }]);
 });
 
 test("the standard scheduler notify callback automatically uses Profile Hermes routes", async () => {

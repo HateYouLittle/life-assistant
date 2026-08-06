@@ -20,11 +20,33 @@ export interface ForecastDay {
   precipAmountMm?: number;
 }
 
-export interface WeatherAlert {
+export interface OfficialWeatherAlert {
+  kind: "official";
+  id?: string;
+  publisher?: string;
+  issuedAt?: string;
+  eventType: string;
+  eventCode?: string;
+  level?: string;
+  severity?: string;
+  effectiveAt?: string;
+  onsetAt?: string;
+  expiresAt?: string;
+  headline: string;
+  description: string;
+  criteria?: string;
+  instruction?: string;
+  attributions: string[];
+}
+
+export interface InferredWeatherRisk {
+  kind: "inferred";
   title: string;
-  level: string; // 红/橙/黄/蓝 或 inferred
+  level: "inferred";
   description: string;
 }
+
+export type WeatherAlert = OfficialWeatherAlert | InferredWeatherRisk;
 
 const WMO: Record<number, string> = {
   0: "晴", 1: "大部晴朗", 2: "多云", 3: "阴",
@@ -48,6 +70,13 @@ const QW_TEXT: Record<string, string> = {
   "507": "沙尘暴", "508": "强沙尘暴", "509": "浓雾", "510": "强浓雾",
   "511": "中度霾", "512": "重度霾", "513": "严重霾", "514": "大雾",
   "515": "特强浓雾", "900": "热", "901": "冷", "999": "未知",
+};
+
+const QW_ALERT_LEVEL: Record<string, string> = {
+  blue: "蓝色",
+  yellow: "黄色",
+  orange: "橙色",
+  red: "红色",
 };
 
 /**
@@ -160,19 +189,43 @@ export async function fetchAlerts(city: string, lat: number, lon: number): Promi
     try {
       // 新版和风实时天气预警 API：直接按经纬度查询，无需先查城市 ID
       const r = await httpJson<{
+        metadata?: { attributions?: string[] };
         alerts?: Array<{
+          id?: string;
+          senderName?: string;
+          issuedTime?: string;
           headline?: string;
           description?: string;
-          eventType?: { name?: string };
+          eventType?: { name?: string; code?: string };
           severity?: string | null;
+          color?: { code?: string } | null;
+          effectiveTime?: string;
+          onsetTime?: string;
+          expireTime?: string;
+          criteria?: string;
+          instruction?: string;
         }>;
       }>(
         `https://${config.qweatherApiHost}/weatheralert/v1/current/${lat.toFixed(2)}/${lon.toFixed(2)}?key=${config.qweatherKey}`,
       );
-      return (r.alerts ?? []).map((w) => ({
-        title: w.headline ?? w.eventType?.name ?? "天气预警",
-        level: w.severity ?? "unknown",
+      const attributions = r.metadata?.attributions ?? [];
+      return (r.alerts ?? []).map((w): OfficialWeatherAlert => ({
+        kind: "official",
+        id: w.id,
+        publisher: w.senderName,
+        issuedAt: w.issuedTime,
+        eventType: w.eventType?.name ?? "天气预警",
+        eventCode: w.eventType?.code,
+        level: w.color?.code ? (QW_ALERT_LEVEL[w.color.code] ?? w.color.code) : undefined,
+        severity: w.severity ?? undefined,
+        effectiveAt: w.effectiveTime,
+        onsetAt: w.onsetTime,
+        expiresAt: w.expireTime,
+        headline: w.headline ?? w.eventType?.name ?? "天气预警",
         description: w.description ?? w.headline ?? "",
+        criteria: w.criteria,
+        instruction: w.instruction,
+        attributions,
       }));
     } catch (e) {
       // 预警接口失败（403 无权限 / 网络异常）→ 降级为阈值推断，不阻断整体功能
@@ -189,8 +242,8 @@ export async function fetchAlerts(city: string, lat: number, lon: number): Promi
   const maxPrecip = Math.max(...h.precipitation);
   const maxTemp = Math.max(...h.temperature_2m);
   const maxWind = Math.max(...h.wind_speed_10m);
-  if (maxPrecip >= 16) alerts.push({ title: `${city}强降雨推断提醒`, level: "inferred", description: `未来48小时小时降水峰值约 ${maxPrecip}mm，可能达暴雨量级，注意出行安全。` });
-  if (maxTemp >= 35) alerts.push({ title: `${city}高温推断提醒`, level: "inferred", description: `未来48小时最高气温约 ${maxTemp}℃，注意防暑降温。` });
-  if (maxWind >= 17.2) alerts.push({ title: `${city}大风推断提醒`, level: "inferred", description: `未来48小时风速峰值约 ${maxWind}m/s（约8级），注意防风。` });
+  if (maxPrecip >= 16) alerts.push({ kind: "inferred", title: `${city}强降雨推断提醒`, level: "inferred", description: `未来48小时小时降水峰值约 ${maxPrecip}mm，可能达暴雨量级，注意出行安全。` });
+  if (maxTemp >= 35) alerts.push({ kind: "inferred", title: `${city}高温推断提醒`, level: "inferred", description: `未来48小时最高气温约 ${maxTemp}℃，注意防暑降温。` });
+  if (maxWind >= 17.2) alerts.push({ kind: "inferred", title: `${city}大风推断提醒`, level: "inferred", description: `未来48小时风速峰值约 ${maxWind}m/s（约8级），注意防风。` });
   return alerts;
 }
