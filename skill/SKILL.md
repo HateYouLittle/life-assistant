@@ -25,8 +25,8 @@ Hermes 将 MCP 工具注册为 `mcp_life_assistant_<tool>`，点号转换为下�
 天气或油价依赖位置时先调用 `location.get`：
 
 - `confirmed`：直接使用。
-- `need_confirm`：把 suggestion 自然地请用户确认；确认后调用 `location.set`。
-- suggestion 不正确：询问城市名，调用 `location.detect(city)`，再让用户确认并调用 `location.set`。
+- `need_confirm`：把 suggestion 自然地请用户确认；确认后调用 `location.set`，suggestion 含 `province` 时一并传回。
+- suggestion 不正确：询问城市名，调用 `location.detect(city)`，再让用户确认并调用 `location.set`；保留 detect 返回的 `province`。
 
 用户只查询其他城市时，直接给天气工具传 `city`，不要修改已保存位置，也不要要求用户提供经纬度。
 

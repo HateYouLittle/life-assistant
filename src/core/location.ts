@@ -6,6 +6,7 @@ import { registerModule, ok, fail, type AssistantModule } from "./registry.js";
 
 export interface Location {
   city: string;
+  province?: string;
   lat: number;
   lon: number;
   source: "manual" | "ip" | "env";
@@ -13,6 +14,13 @@ export interface Location {
 }
 
 const KEY = "location:current";
+
+export const locationSetSchema = z.object({
+  city: z.string(),
+  province: z.string().optional(),
+  lat: z.number(),
+  lon: z.number(),
+});
 
 /** 获取已确认位置；未确认返回 null */
 export function currentLocation(): Location | null {
@@ -48,7 +56,7 @@ const locationModule: AssistantModule = {
     {
       name: "get",
       description:
-        "获取用户当前位置。首次使用天气/油价/快递功能前必须调用。若返回 need_confirm，请把 suggestion 用自然语言复述给用户并请其确认，确认后调用 location.set 保存。",
+        "获取用户当前位置。首次使用天气/油价/快递功能前必须调用。若返回 need_confirm，请把 suggestion 用自然语言复述给用户并请其确认，确认后将 city、province（如有）和经纬度传给 location.set 保存。",
       schema: {},
       handler: async () => {
         const loc = currentLocation();
@@ -57,13 +65,13 @@ const locationModule: AssistantModule = {
         return ok({
           status: "need_confirm",
           suggestion,
-          hint: "请向用户确认所在地。用户确认后调用 location.set(city, lat, lon) 保存；若 IP 建议不准确，请让用户告知城市名后再次调用 location.detect(city) 获取坐标。",
+          hint: "请向用户确认所在地。用户确认后调用 location.set(city, province, lat, lon) 保存（province 缺失时可省略）；若 IP 建议不准确，请让用户告知城市名后再次调用 location.detect(city)，并把返回的 province 一并传回 location.set。",
         });
       },
     },
     {
       name: "detect",
-      description: "按城市名解析经纬度（先和风 GeoAPI，再 Open-Meteo Geocoding 兜底，均免费无 Key），用于用户口述城市后补全坐标。",
+      description: "按城市名解析经纬度和省级行政区（先和风 GeoAPI，再 Open-Meteo Geocoding 兜底），用于用户口述城市后补全位置；确认后请把 province 一并传给 location.set。",
       schema: { city: z.string().describe("城市名，如 北京 / 上海 / 朔城区") },
       handler: async (args) => {
         const { city } = z.object({ city: z.string() }).parse(args);
@@ -74,27 +82,25 @@ const locationModule: AssistantModule = {
               `https://${config.qweatherApiHost}/geo/v2/city/lookup?location=${encodeURIComponent(city)}&key=${config.qweatherKey}`,
             );
             const hit = geo.location?.[0];
-            if (hit) return ok({ city: hit.name, lat: Number(hit.lat), lon: Number(hit.lon), adm1: hit.adm1 });
+            if (hit) return ok({ city: hit.name, province: hit.adm1, lat: Number(hit.lat), lon: Number(hit.lon) });
           } catch { /* 和风失败则走 Open-Meteo */ }
         }
-        const r = await httpJson<{ results?: Array<{ name: string; latitude: number; longitude: number }> }>(
+        const r = await httpJson<{
+          results?: Array<{ name: string; admin1?: string; latitude: number; longitude: number }>;
+        }>(
           `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(city)}&count=1&language=zh`,
         );
         const hit = r.results?.[0];
         if (!hit) return fail(`未找到城市：${city}`);
-        return ok({ city: hit.name, lat: hit.latitude, lon: hit.longitude });
+        return ok({ city: hit.name, province: hit.admin1, lat: hit.latitude, lon: hit.longitude });
       },
     },
     {
       name: "set",
-      description: "保存用户确认后的位置（城市 + 经纬度）。",
-      schema: {
-        city: z.string(),
-        lat: z.number(),
-        lon: z.number(),
-      },
+      description: "保存用户确认后的位置（城市、省级行政区〔如 detect 返回〕和经纬度）。",
+      schema: locationSetSchema.shape,
       handler: async (args) => {
-        const p = z.object({ city: z.string(), lat: z.number(), lon: z.number() }).parse(args);
+        const p = locationSetSchema.parse(args);
         const loc: Location = { ...p, source: "manual", confirmedAt: new Date().toISOString() };
         store.set(KEY, loc);
         return ok({ status: "saved", location: loc });

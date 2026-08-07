@@ -1,0 +1,11 @@
+{
+  "code": 200,
+  "result": {
+    "prov": "江西",
+    "last_adjusted": "20260801",
+    "next_adjustment": "20260815",
+    "p92": { "price": "7.93", "previous_price": "7.38", "price_change": "0.55" },
+    "p95": { "price": "8.51", "previous_price": "7.92", "price_change": "0.59" },
+    "p0": { "price": "7.69", "previous_price": "7.12", "price_change": "0.57" }
+  }
+}
