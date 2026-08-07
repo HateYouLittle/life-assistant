@@ -4,10 +4,12 @@ export type Frequency = "once" | "daily" | "weekly" | "monthly" | "yearly";
 export type LeapMonthPolicy = "normal" | "leap" | "both" | "prefer-leap";
 export type ScheduleStatus = "active" | "completed" | "archived";
 export type Priority = "low" | "normal" | "high";
+export type ReminderTarget = "occurrence" | "deadline";
 
 export interface ReminderInput {
   minutesBefore: number;
   id?: string;
+  target?: ReminderTarget;
 }
 
 export interface RecurrenceRule {
@@ -38,6 +40,9 @@ export interface ScheduleInput {
   leapMonthPolicy?: LeapMonthPolicy;
   recurrence?: Partial<RecurrenceRule> | Frequency;
   reminders?: ReminderInput[];
+  deadlineAt?: string;
+  deadlineOffsetMinutes?: number;
+  clearDeadline?: boolean;
 }
 
 export interface ScheduleItem {
@@ -58,6 +63,8 @@ export interface ScheduleItem {
   isLeapMonth?: boolean;
   recurrence: RecurrenceRule;
   reminders: ReminderInput[];
+  deadlineAt?: string;
+  deadlineOffsetMinutes?: number;
   enabled: boolean;
   nextRunAt?: string;
   version: number;

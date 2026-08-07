@@ -100,6 +100,8 @@ export function migrateDatabaseSchema(db: DatabaseSync): void {
       timezone TEXT NOT NULL,
       recurrence_json TEXT NOT NULL,
       reminders_json TEXT NOT NULL,
+      deadline_at TEXT,
+      deadline_offset_minutes INTEGER,
       enabled INTEGER NOT NULL DEFAULT 1,
       next_run_at TEXT,
       version INTEGER NOT NULL DEFAULT 1,
@@ -132,6 +134,8 @@ export function migrateDatabaseSchema(db: DatabaseSync): void {
     ensureColumn(db, "schedules", "priority", "TEXT NOT NULL DEFAULT 'normal'");
     ensureColumn(db, "schedules", "status", "TEXT NOT NULL DEFAULT 'active'");
     ensureColumn(db, "schedules", "all_day", "INTEGER NOT NULL DEFAULT 1");
+    ensureColumn(db, "schedules", "deadline_at", "TEXT");
+    ensureColumn(db, "schedules", "deadline_offset_minutes", "INTEGER");
     ensureColumn(db, "profile_notification_deliveries", "request_generation", "INTEGER NOT NULL DEFAULT 1");
     ensureColumn(db, "profile_notification_deliveries", "request_started_at", "TEXT");
     ensureColumn(db, "profile_notification_deliveries", "transport_failures", "INTEGER NOT NULL DEFAULT 0");

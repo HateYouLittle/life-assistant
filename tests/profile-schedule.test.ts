@@ -1292,6 +1292,53 @@ test("scheduler tick actively delivers a newly due Profile reminder", async () =
   assert.equal(delivery.status, "sent");
 });
 
+test("a due reminder stores the new semantic snapshot with Profile-scoped target identity", async () => {
+  const schedule = createSchedule(requireProfileContext("profile-a"), {
+    type: "anniversary",
+    title: "semantic bridge reminder",
+    note: "structured only for now",
+    priority: "high",
+    calendar: "solar",
+    date: "2026-08-08",
+    time: "09:30",
+    timezone: "Asia/Shanghai",
+    reminders: [{ id: "one-hour", minutesBefore: 60 }],
+  });
+  db.prepare("UPDATE schedules SET enabled = 0 WHERE NOT (profile_id = ? AND id = ?)")
+    .run("profile-a", schedule.id);
+
+  const dueAt = new Date("2026-08-08T00:30:00.000Z");
+  await runDueSchedules(dueAt);
+  await runDueSchedules(dueAt);
+
+  const occurrenceKey = "2026-08-08T01:30:00.000Z:occurrence:one-hour";
+  const rows = db.prepare(`
+    SELECT profile_id, source, title, body, dedupe_key
+    FROM profile_notifications
+    WHERE dedupe_key = ?
+  `).all(`schedule:profile-a:${schedule.id}:${occurrenceKey}`) as Array<Record<string, unknown>>;
+  assert.deepEqual(rows.map((row) => ({ ...row })), [{
+    profile_id: "profile-a",
+    source: "schedule",
+    title: "纪念日 · 发生提醒：semantic bridge reminder",
+    body: [
+      "纪念日 · 发生提醒：semantic bridge reminder",
+      "发生时间：今天 09:30",
+      "相对：还有 1 小时 0 分钟",
+      "备注：structured only for now",
+    ].join("\n"),
+    dedupe_key: `schedule:profile-a:${schedule.id}:${occurrenceKey}`,
+  }]);
+  assert.equal(db.prepare(`
+    SELECT COUNT(*) AS count FROM schedule_occurrences
+    WHERE profile_id = ? AND schedule_id = ? AND occurrence_key = ?
+  `).get("profile-a", schedule.id, occurrenceKey)?.count, 1);
+  assert.equal(db.prepare(`
+    SELECT COUNT(*) AS count FROM profile_notifications
+    WHERE profile_id = ? AND title = ?
+  `).get("profile-b", "semantic bridge reminder")?.count, 0);
+});
+
 test("a notification insert failure does not consume the schedule occurrence", async () => {
   const schedule = createSchedule(requireProfileContext("profile-a"), {
     title: "retry-safe reminder",
@@ -1405,7 +1452,7 @@ test("more than 500 poison schedules cannot starve a later healthy schedule", as
   db.exec(`
     CREATE TRIGGER fail_poison_batch_notifications
     BEFORE INSERT ON profile_notifications
-    WHEN NEW.title LIKE 'poison batch %'
+    WHEN NEW.title LIKE '%poison batch %'
     BEGIN
       SELECT RAISE(FAIL, 'poison batch failure');
     END;

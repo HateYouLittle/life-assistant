@@ -13,6 +13,7 @@ import {
 const reminderSchema = z.object({
   id: z.string().optional(),
   minutesBefore: z.number().int().min(0).max(525600),
+  target: z.enum(["occurrence", "deadline"]).optional(),
 });
 
 const recurrenceSchema = z.union([
@@ -44,6 +45,9 @@ const commonFields = {
   leapMonthPolicy: z.enum(["normal", "leap"]).optional(),
   recurrence: recurrenceSchema.optional(),
   reminders: z.array(reminderSchema).optional(),
+  deadlineAt: z.string().optional(),
+  deadlineOffsetMinutes: z.number().int().min(0).max(525600).optional(),
+  clearDeadline: z.boolean().optional(),
 };
 
 const updateFields = {
@@ -63,6 +67,9 @@ const updateFields = {
   leapMonthPolicy: z.enum(["normal", "leap"]).optional(),
   recurrence: recurrenceSchema.optional(),
   reminders: z.array(reminderSchema).optional(),
+  deadlineAt: z.string().optional(),
+  deadlineOffsetMinutes: z.number().int().min(0).max(525600).optional(),
+  clearDeadline: z.boolean().optional(),
 };
 
 const scheduleModule: AssistantModule = {

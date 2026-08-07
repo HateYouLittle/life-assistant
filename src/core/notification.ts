@@ -58,6 +58,24 @@ export interface OilPriceOfficialResultPayload {
   source: string;
 }
 
+export interface ScheduleReminderPayload {
+  title: string;
+  eventAt: string;
+  occurrenceAt?: string;
+  deadlineAt?: string;
+  targetAt?: string;
+  target?: "occurrence" | "deadline";
+  reminderId?: string;
+  timezone: string;
+  reminderMinutes: number;
+  type?: "todo" | "birthday" | "anniversary";
+  status?: "active" | "completed" | "archived";
+  note?: string;
+  priority?: "low" | "normal" | "high";
+  allDay?: boolean;
+  generatedAt?: string;
+}
+
 interface NotificationCore {
   identity: string;
   source: string;
@@ -73,12 +91,24 @@ export type NotificationEnvelope = NotificationCore & (
   | { kind: "weather.official_alert"; payload: OfficialWeatherAlertPayload }
   | { kind: "oilprice.advance_notice"; payload: OilPriceAdvanceNoticePayload }
   | { kind: "oilprice.official_result"; payload: OilPriceOfficialResultPayload }
+  | { kind: "schedule.reminder"; payload: ScheduleReminderPayload }
 );
 
 export interface RenderedNotification {
   title: string;
   body: string;
 }
+
+export type NotificationRenderTarget =
+  | "plain"
+  | "qq-markdown"
+  | "feishu-markdown"
+  | "wechat-plain";
+
+export type NotificationRenderer = (
+  notification: NotificationEnvelope,
+  target?: NotificationRenderTarget,
+) => RenderedNotification;
 
 function renderDailyWeather(payload: DailyWeatherPayload): string {
   const lines: string[] = [];
@@ -172,14 +202,72 @@ function renderOilPriceResult(
   return lines.join("\n");
 }
 
-export function renderNotification(notification: NotificationEnvelope): RenderedNotification {
+function renderScheduleReminder(payload: ScheduleReminderPayload): string {
+  if (!payload.target || !payload.occurrenceAt || !payload.targetAt || !payload.generatedAt) {
+    const localEvent = DateTime.fromISO(payload.eventAt, { setZone: true })
+      .setZone(payload.timezone)
+      .toFormat("yyyy-LL-dd HH:mm");
+    return `${payload.title}\n时间：${localEvent}\n提醒：提前 ${payload.reminderMinutes} 分钟`;
+  }
+  const targetAt = DateTime.fromISO(payload.targetAt, { setZone: true }).setZone(payload.timezone);
+  const generatedAt = DateTime.fromISO(payload.generatedAt, { setZone: true }).setZone(payload.timezone);
+  const targetLabel = payload.target === "deadline" ? "截止提醒" : "发生提醒";
+  const typeLabel = { todo: "待办", birthday: "生日", anniversary: "纪念日" }[payload.type ?? "todo"];
+  const firstLine = `${typeLabel} · ${targetLabel}：${payload.title}`;
+  const sameDay = targetAt.toISODate() === generatedAt.toISODate();
+  const tomorrow = targetAt.toISODate() === generatedAt.plus({ days: 1 }).toISODate();
+  const clock = targetAt.toFormat("HH:mm");
+  const hideClock = payload.target === "occurrence" && payload.allDay === true;
+  let displayTime: string;
+  if (sameDay) displayTime = hideClock ? "今天" : `今天 ${clock}`;
+  else if (tomorrow) displayTime = hideClock ? "明天" : `明天 ${clock}`;
+  else displayTime = targetAt.toFormat(hideClock ? "yyyy-LL-dd" : "yyyy-LL-dd HH:mm");
+
+  const differenceMs = targetAt.toMillis() - generatedAt.toMillis();
+  let relative: string;
+  if (differenceMs === 0) {
+    relative = "现在";
+  } else if (differenceMs > 0 && differenceMs < 60_000) {
+    relative = "马上";
+  } else if (differenceMs > 0 && differenceMs < 24 * 60 * 60 * 1000) {
+    const totalMinutes = Math.floor(differenceMs / 60_000);
+    relative = `还有 ${Math.floor(totalMinutes / 60)} 小时 ${totalMinutes % 60} 分钟`;
+  } else if (differenceMs > 0) {
+    const calendarDays = Math.max(1, Math.round(
+      targetAt.startOf("day").diff(generatedAt.startOf("day"), "days").days,
+    ));
+    relative = `还有 ${calendarDays} 天`;
+  } else if (-differenceMs < 60 * 60 * 1000) {
+    relative = `已逾期 ${Math.max(1, Math.floor(-differenceMs / 60_000))} 分钟`;
+  } else if (-differenceMs < 24 * 60 * 60 * 1000) {
+    relative = `已逾期 ${Math.floor(-differenceMs / (60 * 60 * 1000))} 小时`;
+  } else {
+    relative = `已逾期 ${Math.floor(-differenceMs / (24 * 60 * 60 * 1000))} 天`;
+  }
+  const timeLabel = payload.target === "deadline" ? "截止时间" : "发生时间";
+  const lines = [firstLine, `${timeLabel}：${displayTime}`, `相对：${relative}`];
+  if (payload.note) lines.push(`备注：${payload.note}`);
+  return lines.join("\n");
+}
+
+function renderPlainNotification(notification: NotificationEnvelope): RenderedNotification {
   let body: string;
   if (notification.kind === "weather.daily_brief") body = renderDailyWeather(notification.payload);
   else if (notification.kind === "weather.official_alert") body = renderOfficialAlert(notification);
   else if (notification.kind === "oilprice.advance_notice") body = renderOilPriceAdvance(notification.payload);
-  else body = renderOilPriceResult(notification);
+  else if (notification.kind === "oilprice.official_result") body = renderOilPriceResult(notification);
+  else body = renderScheduleReminder(notification.payload);
   return {
     title: notification.headline,
     body,
   };
+}
+
+export function renderNotification(
+  notification: NotificationEnvelope,
+  target: NotificationRenderTarget = "plain",
+): RenderedNotification {
+  // Platform-specific renderers are intentionally deferred; every target currently uses the stable plain snapshot.
+  void target;
+  return renderPlainNotification(notification);
 }

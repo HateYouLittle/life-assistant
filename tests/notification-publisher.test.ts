@@ -32,3 +32,44 @@ test("the semantic bridge renders before using the existing global publish contr
     dedupeKey: "weather:daily-brief:2026-08-04",
   }]);
 });
+
+test("the semantic bridge accepts a render target and snapshots an injected renderer result", async () => {
+  const calls: Array<{ profileId: string; source: string; title: string; body: string; dedupeKey: string }> = [];
+  let renderCalls = 0;
+  const notification: NotificationEnvelope = {
+    kind: "schedule.reminder",
+    identity: "profile-a:schedule-42:occurrence-1",
+    source: "schedule",
+    scope: { type: "profile", profileId: "profile-a" },
+    headline: "Legacy title",
+    generatedAt: "2026-08-07T00:00:00.000Z",
+    payload: {
+      title: "Legacy title",
+      eventAt: "2026-08-10T01:30:00.000Z",
+      timezone: "Asia/Shanghai",
+      reminderMinutes: 0,
+    },
+  };
+
+  await publishNotification(notification, {
+    renderTarget: "qq-markdown",
+    renderer: (received, target) => {
+      renderCalls += 1;
+      assert.strictEqual(received, notification);
+      assert.equal(target, "qq-markdown");
+      return { title: "Rendered once", body: "Stored snapshot" };
+    },
+    publishProfile: async (profileId, source, title, body, dedupeKey) => {
+      calls.push({ profileId, source, title, body, dedupeKey });
+    },
+  });
+
+  assert.equal(renderCalls, 1);
+  assert.deepEqual(calls, [{
+    profileId: "profile-a",
+    source: "schedule",
+    title: "Rendered once",
+    body: "Stored snapshot",
+    dedupeKey: "schedule:profile-a:schedule-42:occurrence-1",
+  }]);
+});

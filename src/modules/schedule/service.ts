@@ -11,6 +11,7 @@ import type {
   Priority,
   RecurrenceRule,
   ReminderInput,
+  ReminderTarget,
   ScheduleInput,
   ScheduleItem,
   ScheduleListOptions,
@@ -115,7 +116,49 @@ function normalizeReminders(value: ReminderInput[] | undefined): ReminderInput[]
   return reminders.map((reminder, index) => ({
     id: reminder.id ?? `reminder-${index + 1}`,
     minutesBefore: reminder.minutesBefore,
+    target: reminder.target ?? "occurrence",
   }));
+}
+
+function normalizeDeadline(
+  input: ScheduleInput,
+  recurrence: RecurrenceRule,
+  timezone: string,
+  time: string,
+): Pick<ScheduleInput, "deadlineAt" | "deadlineOffsetMinutes"> {
+  const deadlineAt = input.clearDeadline ? undefined : input.deadlineAt;
+  const deadlineOffsetMinutes = input.clearDeadline ? undefined : input.deadlineOffsetMinutes;
+  if (deadlineOffsetMinutes !== undefined && (
+    !Number.isInteger(deadlineOffsetMinutes)
+    || deadlineOffsetMinutes < 0
+    || deadlineOffsetMinutes > 525600
+  )) {
+    throw new Error("deadlineOffsetMinutes must be an integer between 0 and 525600");
+  }
+  if (recurrence.frequency === "once" && deadlineOffsetMinutes !== undefined) {
+    throw new Error("once schedules require deadlineAt instead of deadlineOffsetMinutes");
+  }
+  if (recurrence.frequency !== "once" && deadlineAt !== undefined) {
+    throw new Error("recurring schedules require deadlineOffsetMinutes instead of deadlineAt");
+  }
+
+  let normalizedDeadlineAt: string | undefined;
+  if (deadlineAt !== undefined) {
+    const parsed = DateTime.fromISO(deadlineAt, { zone: timezone });
+    if (!parsed.isValid) {
+      throw new Error("deadlineAt must be a valid ISO date-time in the schedule timezone");
+    }
+    if (!input.date) throw new Error("deadlineAt requires a dated occurrence");
+    const occurrence = localDate(input.date, time, timezone);
+    if (parsed < occurrence) throw new Error("deadline must not be earlier than occurrence");
+    normalizedDeadlineAt = parsed.toUTC().toISO() ?? undefined;
+  }
+  if (input.reminders?.some((reminder) => reminder.target === "deadline")
+    && normalizedDeadlineAt === undefined
+    && deadlineOffsetMinutes === undefined) {
+    throw new Error("deadline target requires a deadline");
+  }
+  return { deadlineAt: normalizedDeadlineAt, deadlineOffsetMinutes };
 }
 
 function normalizeInput(input: ScheduleInput): ScheduleInput & { type: ScheduleType; timezone: string; time: string; recurrence: RecurrenceRule; reminders: ReminderInput[]; allDay: boolean } {
@@ -135,8 +178,10 @@ function normalizeInput(input: ScheduleInput): ScheduleInput & { type: ScheduleT
   }
   const recurrence = normalizeRecurrence(input, calendar, type);
   const reminders = normalizeReminders(input.reminders);
+  const deadline = normalizeDeadline(input, recurrence, timezone, time);
+  const { clearDeadline: _clearDeadline, ...persistentInput } = input;
   return {
-    ...input,
+    ...persistentInput,
     type,
     calendar,
     timezone,
@@ -144,6 +189,7 @@ function normalizeInput(input: ScheduleInput): ScheduleInput & { type: ScheduleT
     allDay: input.allDay ?? !input.time,
     recurrence,
     reminders,
+    ...deadline,
     priority: input.priority ?? "normal",
     status: input.status ?? "active",
   };
@@ -210,13 +256,92 @@ export function findOccurrence(item: ScheduleItem, from: ValidDateTime = DateTim
   return item.calendar === "lunar" ? lunarEventAt(item, from, inclusive) : solarEventAt(item, from, inclusive);
 }
 
-function maxReminder(item: ScheduleItem): number {
-  return Math.max(...item.reminders.map((reminder) => reminder.minutesBefore), 0);
+export function deadlineForOccurrence(item: ScheduleItem, occurrence: ValidDateTime): ValidDateTime | null {
+  if (item.deadlineAt !== undefined) {
+    const parsed = DateTime.fromISO(item.deadlineAt, { zone: item.timezone });
+    return parsed.isValid ? parsed.toUTC() as ValidDateTime : null;
+  }
+  if (item.deadlineOffsetMinutes !== undefined) {
+    return occurrence.plus({ minutes: item.deadlineOffsetMinutes }) as ValidDateTime;
+  }
+  return null;
+}
+
+export interface ReminderTiming {
+  target: ReminderTarget;
+  targetAt: ValidDateTime;
+  triggerAt: ValidDateTime;
+}
+
+export function reminderTiming(
+  item: ScheduleItem,
+  occurrence: ValidDateTime,
+  reminder: ReminderInput,
+): ReminderTiming | null {
+  const target = reminder.target ?? "occurrence";
+  const targetAt = target === "deadline" ? deadlineForOccurrence(item, occurrence) : occurrence;
+  if (!targetAt) return null;
+  return {
+    target,
+    targetAt,
+    triggerAt: targetAt.minus({ minutes: reminder.minutesBefore }) as ValidDateTime,
+  };
+}
+
+function isAtOrAfter(candidate: ValidDateTime, from: ValidDateTime, inclusive: boolean): boolean {
+  return inclusive ? candidate.toMillis() >= from.toMillis() : candidate.toMillis() > from.toMillis();
+}
+
+export function nextReminderTiming(
+  item: ScheduleItem,
+  reminder: ReminderInput,
+  from: ValidDateTime,
+  inclusive = true,
+): (ReminderTiming & { occurrenceAt: ValidDateTime }) | null {
+  const target = reminder.target ?? "occurrence";
+  let shiftMinutes: number;
+  if (target === "occurrence") {
+    shiftMinutes = -reminder.minutesBefore;
+  } else if (item.deadlineOffsetMinutes !== undefined) {
+    shiftMinutes = item.deadlineOffsetMinutes - reminder.minutesBefore;
+  } else {
+    const occurrenceAt = findOccurrence(item, from, inclusive);
+    if (!occurrenceAt) return null;
+    const timing = reminderTiming(item, occurrenceAt, reminder);
+    return timing && isAtOrAfter(timing.triggerAt, from, inclusive) ? { ...timing, occurrenceAt } : null;
+  }
+
+  const occurrenceAt = findOccurrence(
+    item,
+    from.minus({ minutes: shiftMinutes }) as ValidDateTime,
+    inclusive,
+  );
+  if (!occurrenceAt) return null;
+  const timing = reminderTiming(item, occurrenceAt, reminder);
+  return timing && isAtOrAfter(timing.triggerAt, from, inclusive) ? { ...timing, occurrenceAt } : null;
 }
 
 export function calculateNextRun(item: ScheduleItem, from: ValidDateTime = DateTime.utc(), inclusive = true): ValidDateTime | null {
-  const event = findOccurrence(item, from.plus({ minutes: maxReminder(item) }), inclusive);
-  return event?.minus({ minutes: maxReminder(item) }) ?? null;
+  const candidates = item.reminders
+    .map((reminder) => nextReminderTiming(item, reminder, from, inclusive)?.triggerAt)
+    .filter((candidate): candidate is ValidDateTime => candidate !== undefined)
+    .sort((a, b) => a.toMillis() - b.toMillis());
+  return candidates[0] ?? null;
+}
+
+function calculateInitialNextRun(
+  item: ScheduleItem,
+  occurrence: ValidDateTime | null,
+  from: ValidDateTime,
+): ValidDateTime | null {
+  if (item.recurrence.frequency !== "once" || !occurrence) {
+    return calculateNextRun(item, from, true);
+  }
+  const triggers = item.reminders
+    .map((reminder) => reminderTiming(item, occurrence, reminder)?.triggerAt)
+    .filter((trigger): trigger is ValidDateTime => trigger !== undefined)
+    .sort((a, b) => a.toMillis() - b.toMillis());
+  return triggers[0] ?? null;
 }
 
 function rowToItem(row: Record<string, unknown>): ScheduleItem {
@@ -225,7 +350,8 @@ function rowToItem(row: Record<string, unknown>): ScheduleItem {
     interval: 1,
     calendar: String(row.calendar) as CalendarType,
   });
-  const reminders = parseJson<ReminderInput[]>(row.reminders_json, [{ minutesBefore: 0, id: "reminder-1" }]);
+  const reminders = parseJson<ReminderInput[]>(row.reminders_json, [{ minutesBefore: 0, id: "reminder-1" }])
+    .map((reminder) => ({ ...reminder, target: reminder.target ?? "occurrence" }));
   const item: ScheduleItem = {
     id: String(row.id),
     profileId: String(row.profile_id),
@@ -244,6 +370,8 @@ function rowToItem(row: Record<string, unknown>): ScheduleItem {
     isLeapMonth: row.leap_month_policy === "leap",
     recurrence,
     reminders,
+    deadlineAt: row.deadline_at == null ? undefined : String(row.deadline_at),
+    deadlineOffsetMinutes: row.deadline_offset_minutes == null ? undefined : Number(row.deadline_offset_minutes),
     enabled: Boolean(row.enabled),
     nextRunAt: row.next_run_at == null ? undefined : String(row.next_run_at),
     version: Number(row.version ?? 1),
@@ -258,8 +386,8 @@ function rowToItem(row: Record<string, unknown>): ScheduleItem {
 function insertSchedule(profile: ProfileContext, item: ScheduleItem): void {
   const db = getDatabase();
   db.prepare(`
-    INSERT INTO schedules(profile_id, id, type, title, note, priority, status, calendar, date, lunar_month, lunar_day, leap_month_policy, time, all_day, timezone, recurrence_json, reminders_json, enabled, next_run_at, version, created_at, updated_at)
-    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO schedules(profile_id, id, type, title, note, priority, status, calendar, date, lunar_month, lunar_day, leap_month_policy, time, all_day, timezone, recurrence_json, reminders_json, deadline_at, deadline_offset_minutes, enabled, next_run_at, version, created_at, updated_at)
+    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     profile.id,
     item.id,
@@ -278,6 +406,8 @@ function insertSchedule(profile: ProfileContext, item: ScheduleItem): void {
     item.timezone,
     JSON.stringify(item.recurrence),
     JSON.stringify(item.reminders),
+    item.deadlineAt ?? null,
+    item.deadlineOffsetMinutes ?? null,
     item.enabled ? 1 : 0,
     item.nextRunAt ?? null,
     item.version,
@@ -309,13 +439,16 @@ export function createSchedule(value: ProfileContext | string, input: ScheduleIn
     isLeapMonth: normalized.recurrence.leapMonthPolicy === "leap",
     recurrence: normalized.recurrence,
     reminders: normalized.reminders,
+    deadlineAt: normalized.deadlineAt,
+    deadlineOffsetMinutes: normalized.deadlineOffsetMinutes,
     enabled: normalized.status !== "archived",
     version: 1,
     createdAt,
     updatedAt: createdAt,
   };
-  const event = findOccurrence(base, DateTime.utc(), true);
-  base.nextRunAt = event?.minus({ minutes: maxReminder(base) }).toISO() ?? undefined;
+  const now = DateTime.utc();
+  const event = findOccurrence(base, now, true);
+  base.nextRunAt = calculateInitialNextRun(base, event, now)?.toISO() ?? undefined;
   base.nextOccurrenceSolar = event?.toISO() ?? undefined;
   insertSchedule(profile, base);
   return base;
@@ -361,6 +494,8 @@ export function updateSchedule(value: ProfileContext | string, id: string, chang
     leapMonthPolicy: current.recurrence.leapMonthPolicy,
     recurrence: current.recurrence,
     reminders: current.reminders,
+    deadlineAt: current.deadlineAt,
+    deadlineOffsetMinutes: current.deadlineOffsetMinutes,
     ...changes,
   };
   const normalized = normalizeInput(merged);
@@ -375,15 +510,16 @@ export function updateSchedule(value: ProfileContext | string, id: string, chang
     version: current.version + 1,
     enabled: normalized.status !== "archived",
   };
-  const event = findOccurrence(next, DateTime.utc(), true);
-  next.nextRunAt = event?.minus({ minutes: maxReminder(next) }).toISO() ?? undefined;
+  const now = DateTime.utc();
+  const event = findOccurrence(next, now, true);
+  next.nextRunAt = calculateInitialNextRun(next, event, now)?.toISO() ?? undefined;
   next.nextOccurrenceSolar = event?.toISO() ?? undefined;
   const result = getDatabase().prepare(`
-    UPDATE schedules SET type=?, title=?, note=?, priority=?, status=?, calendar=?, date=?, lunar_month=?, lunar_day=?, leap_month_policy=?, time=?, all_day=?, timezone=?, recurrence_json=?, reminders_json=?, enabled=?, next_run_at=?, version=?, updated_at=?
+    UPDATE schedules SET type=?, title=?, note=?, priority=?, status=?, calendar=?, date=?, lunar_month=?, lunar_day=?, leap_month_policy=?, time=?, all_day=?, timezone=?, recurrence_json=?, reminders_json=?, deadline_at=?, deadline_offset_minutes=?, enabled=?, next_run_at=?, version=?, updated_at=?
     WHERE profile_id=? AND id=? AND version=?
   `).run(
     next.type, next.title, next.note ?? null, next.priority, next.status, next.calendar, next.date ?? null, next.lunarMonth ?? null, next.lunarDay ?? null,
-    next.recurrence.leapMonthPolicy ?? null, next.time, next.allDay ? 1 : 0, next.timezone, JSON.stringify(next.recurrence), JSON.stringify(next.reminders), next.enabled ? 1 : 0,
+    next.recurrence.leapMonthPolicy ?? null, next.time, next.allDay ? 1 : 0, next.timezone, JSON.stringify(next.recurrence), JSON.stringify(next.reminders), next.deadlineAt ?? null, next.deadlineOffsetMinutes ?? null, next.enabled ? 1 : 0,
     next.nextRunAt ?? null, next.version, next.updatedAt, profile.id, id, current.version,
   ) as { changes: number };
   if (!result.changes) throw new Error("schedule update conflict");
@@ -399,9 +535,16 @@ export function deleteSchedule(value: ProfileContext | string, id: string): void
 export function completeSchedule(value: ProfileContext | string, id: string, occurrenceKey?: string): ScheduleItem {
   const profile = context(value);
   const item = getSchedule(profile, id);
-  const key = occurrenceKey ?? item.nextRunAt ?? nowIso();
-  const occurrenceAt = item.nextRunAt ?? nowIso();
-  getDatabase().prepare("INSERT OR REPLACE INTO schedule_occurrences(profile_id, schedule_id, occurrence_key, occurrence_at, status) VALUES(?, ?, ?, ?, 'completed')").run(profile.id, id, key, occurrenceAt);
+  let occurrenceAt = occurrenceKey?.match(/^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z)(?::.*)?$/)?.[1];
+  if (!occurrenceAt && item.nextRunAt) {
+    const triggerAt = fromUtc(item.nextRunAt);
+    occurrenceAt = item.reminders
+      .map((reminder) => nextReminderTiming(item, reminder, triggerAt, true))
+      .find((timing) => timing?.triggerAt.equals(triggerAt))
+      ?.occurrenceAt.toISO() ?? undefined;
+  }
+  occurrenceAt ??= item.nextRunAt ?? nowIso();
+  getDatabase().prepare("INSERT OR REPLACE INTO schedule_occurrences(profile_id, schedule_id, occurrence_key, occurrence_at, status) VALUES(?, ?, ?, ?, 'completed')").run(profile.id, id, occurrenceAt, occurrenceAt);
   if (item.recurrence.frequency === "once") return updateSchedule(profile, id, { status: "completed" });
   return item;
 }

@@ -5,10 +5,12 @@ import cron, { type ScheduledTask } from "node-cron";
 import { DateTime } from "luxon";
 import { getModules } from "./modules/index.js";
 import { getDatabase } from "./core/database.js";
+import { publishNotification } from "./core/notification-publisher.js";
 import { deliverPendingProfileNotifications, notify, publishProfile, type DeliverySummary } from "./core/notifier.js";
 import { notifyModule } from "./core/notify-module.js";
 import { ok, type AssistantModule } from "./core/registry.js";
-import { hydrateRow, findOccurrence, nextEventAfter, reminderMinutes } from "./modules/schedule/service.js";
+import { buildScheduleReminderNotification } from "./modules/schedule/notification.js";
+import { calculateNextRun, deadlineForOccurrence, hydrateRow, nextReminderTiming } from "./modules/schedule/service.js";
 import type { ScheduleItem } from "./modules/schedule/types.js";
 
 export { notifyModule };
@@ -53,6 +55,33 @@ function reminderId(reminder: { id?: string; minutesBefore: number }, index: num
   return reminder.id ?? `reminder-${index + 1}`;
 }
 
+function occurrenceCompleted(item: ScheduleItem, occurrenceAt: string): boolean {
+  return Boolean(getDatabase().prepare(`
+    SELECT 1 FROM schedule_occurrences
+    WHERE profile_id = ? AND schedule_id = ? AND status = 'completed'
+      AND (occurrence_key = ? OR occurrence_key LIKE ?)
+    LIMIT 1
+  `).get(item.profileId, item.id, occurrenceAt, `${occurrenceAt}:%`));
+}
+
+function calculateNextIncompleteRun(
+  item: ScheduleItem,
+  from: DateTime<true>,
+): DateTime<true> | null {
+  let cursor = from;
+  while (true) {
+    const candidate = calculateNextRun(item, cursor, true);
+    if (!candidate) return null;
+    const hasIncompleteOccurrence = item.reminders.some((reminder) => {
+      const timing = nextReminderTiming(item, reminder, candidate, true);
+      return timing?.triggerAt.equals(candidate)
+        && !occurrenceCompleted(item, timing.occurrenceAt.toISO());
+    });
+    if (hasIncompleteOccurrence) return candidate;
+    cursor = candidate.plus({ milliseconds: 1 }) as DateTime<true>;
+  }
+}
+
 interface DueCursor {
   nextRunAt: string;
   profileId: string;
@@ -91,40 +120,51 @@ function dueRows(at: Date, cursor?: DueCursor): Record<string, unknown>[] {
 async function processDue(item: ScheduleItem, at: DateTime<true>): Promise<void> {
   if (!item.nextRunAt) return;
   const triggerAt = DateTime.fromISO(item.nextRunAt, { zone: "utc" }).toUTC() as DateTime<true>;
-  const event = findOccurrence(item, triggerAt.plus({ minutes: Math.max(...reminderMinutes(item), 0) }), true);
-  if (!event) {
-    getDatabase().prepare("UPDATE schedules SET enabled = 0, status = 'completed', next_run_at = NULL, version = version + 1, updated_at = ? WHERE profile_id = ? AND id = ?").run(isoNow(), item.profileId, item.id);
-    return;
-  }
-
   const db = getDatabase();
   const reminders = item.reminders.length ? item.reminders : [{ id: "reminder-1", minutesBefore: 0 }];
   for (let index = 0; index < reminders.length; index += 1) {
     const reminder = reminders[index];
-    const trigger = event.minus({ minutes: reminder.minutesBefore });
-    if (trigger > at) continue;
-    const key = `${event.toISO()}:${reminderId(reminder, index)}`;
+    const timing = nextReminderTiming(item, reminder, triggerAt, true);
+    if (!timing || timing.triggerAt > at) continue;
+    const id = reminderId(reminder, index);
+    const occurrenceIso = timing.occurrenceAt.toISO();
+    if (occurrenceCompleted(item, occurrenceIso)) continue;
+    const key = `${occurrenceIso}:${timing.target}:${id}`;
+    const legacyOccurrenceKey = timing.target === "occurrence" ? `${occurrenceIso}:${id}` : undefined;
     const existing = db.prepare(`
       SELECT 1 FROM schedule_occurrences
-      WHERE profile_id = ? AND schedule_id = ? AND occurrence_key = ?
-    `).get(item.profileId, item.id, key);
+      WHERE profile_id = ? AND schedule_id = ?
+        AND (occurrence_key = ? OR occurrence_key = ?)
+    `).get(item.profileId, item.id, key, legacyOccurrenceKey ?? key);
     if (!existing) {
-      const localEvent = event.setZone(item.timezone).toFormat("yyyy-LL-dd HH:mm");
-      await publishProfile(item.profileId, "schedule", item.title, `${item.title}\n时间：${localEvent}\n提醒：提前 ${reminder.minutesBefore} 分钟`, `schedule:${item.profileId}:${item.id}:${key}`);
+      const legacyDedupeKey = legacyOccurrenceKey
+        ? `schedule:${item.profileId}:${item.id}:${legacyOccurrenceKey}`
+        : undefined;
+      const legacyNotification = legacyDedupeKey
+        ? db.prepare(`
+            SELECT 1 FROM profile_notifications
+            WHERE profile_id = ? AND dedupe_key = ?
+          `).get(item.profileId, legacyDedupeKey)
+        : undefined;
+      if (!legacyNotification) {
+        const notification = buildScheduleReminderNotification({
+          item,
+          occurrenceKey: key,
+          occurrenceAt: occurrenceIso,
+          deadlineAt: deadlineForOccurrence(item, timing.occurrenceAt)?.toISO(),
+          target: timing.target,
+          reminderId: id,
+          reminderMinutes: reminder.minutesBefore,
+          generatedAt: at.toISO(),
+        });
+        await publishNotification(notification, { publishProfile });
+      }
       db.prepare("INSERT OR IGNORE INTO schedule_occurrences(profile_id, schedule_id, occurrence_key, occurrence_at, status) VALUES(?, ?, ?, ?, 'notified')")
-        .run(item.profileId, item.id, key, event.toISO());
+        .run(item.profileId, item.id, key, occurrenceIso);
     }
   }
 
-  const futureReminder = reminders
-    .map((reminder, index) => ({ trigger: event.minus({ minutes: reminder.minutesBefore }), index }))
-    .filter((entry) => entry.trigger > at)
-    .sort((a, b) => a.trigger.toMillis() - b.trigger.toMillis())[0];
-  let nextRun: DateTime<true> | null = futureReminder?.trigger as DateTime<true> | undefined ?? null;
-  if (!nextRun) {
-    const nextEvent = item.recurrence.frequency === "once" ? null : nextEventAfter(item, event);
-    nextRun = nextEvent ? nextEvent.minus({ minutes: Math.max(...reminderMinutes(item), 0) }) as DateTime<true> : null;
-  }
+  const nextRun = calculateNextIncompleteRun(item, at.plus({ milliseconds: 1 }) as DateTime<true>);
   db.prepare("UPDATE schedules SET next_run_at = ?, enabled = ?, status = ?, version = version + 1, updated_at = ? WHERE profile_id = ? AND id = ? AND version = ?").run(
     nextRun?.toISO() ?? null,
     nextRun ? 1 : 0,

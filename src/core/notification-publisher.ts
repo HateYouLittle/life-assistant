@@ -1,5 +1,10 @@
 import { publishGlobal, publishProfile } from "./notifier.js";
-import { renderNotification, type NotificationEnvelope } from "./notification.js";
+import {
+  renderNotification,
+  type NotificationEnvelope,
+  type NotificationRenderer,
+  type NotificationRenderTarget,
+} from "./notification.js";
 
 type GlobalPublisher = (
   source: string,
@@ -20,6 +25,8 @@ type ProfilePublisher = (
 export interface NotificationPublishers {
   publishGlobal?: GlobalPublisher;
   publishProfile?: ProfilePublisher;
+  renderTarget?: NotificationRenderTarget;
+  renderer?: NotificationRenderer;
 }
 
 export async function publishNotification(
@@ -27,7 +34,7 @@ export async function publishNotification(
   publishers: NotificationPublishers = {},
   legacyDedupeKeys: readonly string[] = [],
 ): Promise<void> {
-  const rendered = renderNotification(notification);
+  const rendered = (publishers.renderer ?? renderNotification)(notification, publishers.renderTarget);
   const dedupeKey = `${notification.source}:${notification.identity}`;
   if (notification.scope.type === "global") {
     await (publishers.publishGlobal ?? publishGlobal)(
