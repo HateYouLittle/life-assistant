@@ -5,8 +5,10 @@ import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
+import { DateTime } from "luxon";
 import { Lunar, Solar } from "lunar-javascript";
 import type { WeatherAlert } from "../src/modules/weather/provider.js";
+import type { NotificationEnvelope, NotificationRenderTarget } from "../src/core/notification.js";
 
 const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "life-assistant-test-"));
 const testSecretA = crypto.createHash("sha256").update("profile-a test fixture").digest("hex");
@@ -26,6 +28,8 @@ process.env.PROFILE_PUSH_ROUTES_JSON = JSON.stringify({
   },
 });
 
+const { publishNotification } = await import("../src/core/notification-publisher.js");
+const { renderNotification } = await import("../src/core/notification.js");
 const { requireProfileContext } = await import("../src/core/profile.js");
 const configModule = await import("../src/config.js");
 const parseProfilePushRoutes = (configModule as Record<string, unknown>).parseProfilePushRoutes as (
@@ -1293,13 +1297,15 @@ test("scheduler tick actively delivers a newly due Profile reminder", async () =
 });
 
 test("a due reminder stores the new semantic snapshot with Profile-scoped target identity", async () => {
+  // 动态"明天"：避免固定日期过期后 createSchedule 跳到下一年（日期炸弹）
+  const tomorrowShanghai = DateTime.now().setZone("Asia/Shanghai").plus({ days: 1 }).startOf("day");
   const schedule = createSchedule(requireProfileContext("profile-a"), {
     type: "anniversary",
     title: "semantic bridge reminder",
     note: "structured only for now",
     priority: "high",
     calendar: "solar",
-    date: "2026-08-08",
+    date: tomorrowShanghai.toFormat("yyyy-MM-dd"),
     time: "09:30",
     timezone: "Asia/Shanghai",
     reminders: [{ id: "one-hour", minutesBefore: 60 }],
@@ -1307,11 +1313,11 @@ test("a due reminder stores the new semantic snapshot with Profile-scoped target
   db.prepare("UPDATE schedules SET enabled = 0 WHERE NOT (profile_id = ? AND id = ?)")
     .run("profile-a", schedule.id);
 
-  const dueAt = new Date("2026-08-08T00:30:00.000Z");
+  const dueAt = tomorrowShanghai.plus({ hours: 8, minutes: 30 }).toUTC().toJSDate();
   await runDueSchedules(dueAt);
   await runDueSchedules(dueAt);
 
-  const occurrenceKey = "2026-08-08T01:30:00.000Z:occurrence:one-hour";
+  const occurrenceKey = `${tomorrowShanghai.plus({ hours: 9, minutes: 30 }).toUTC().toISO()}:occurrence:one-hour`;
   const rows = db.prepare(`
     SELECT profile_id, source, title, body, dedupe_key
     FROM profile_notifications
@@ -1608,4 +1614,282 @@ test("partial update preserves the calendar of a lunar schedule", () => {
   assert.equal(updated.calendar, "lunar");
   assert.equal(updated.recurrence.calendar, "lunar");
   assert.equal(updated.title, "改名后的农历纪念日");
+});
+
+// ============================================================================
+// 阶段 D：端到端集成验证（双 Profile 分别渲染 / 快照即投递 / 降级路径）
+//
+// 关键语义：渲染只发生在「入队/物化」前（publishNotification → renderForProfile fan-out），
+// profile_notifications 只存 title/body 快照；投递/重试/notify.pull 全部读快照，不重渲染。
+// 5 参 publishGlobal 不按 Profile 渲染，因此本阶段 global 用例一律走 publishNotification
+// （默认解析器按 config.profilePushRoutes 的 renderTarget 求每 Profile target）。
+// ============================================================================
+
+type StageDRoute = { route: string; url: string; secret: string; renderTarget?: string };
+
+const stageDWeatherEnvelope = (identity: string, scope: NotificationEnvelope["scope"]): NotificationEnvelope => ({
+  kind: "weather.daily_brief",
+  identity,
+  source: "weather",
+  scope,
+  headline: "萍乡今天晴，最高33℃",
+  generatedAt: "2026-08-10T07:00:00+08:00",
+  payload: { city: "萍乡", today: { weather: "晴", minTemperatureC: 25, maxTemperatureC: 33 } },
+});
+
+test("阶段D：双 Profile 不同 renderTarget 的 global 事件分别渲染（qq-markdown vs plain）", async () => {
+  const routes = (configModule.config as { profilePushRoutes: Record<string, StageDRoute> }).profilePushRoutes;
+  const originalA = routes["profile-a"];
+  const originalB = routes["profile-b"];
+  routes["profile-a"] = { ...originalA, renderTarget: "qq-markdown" };
+  routes["profile-b"] = { ...originalB }; // 无 renderTarget → 缺省 plain
+  try {
+    await publishNotification(stageDWeatherEnvelope("stage-d:render:diff:1", { type: "global" }), {});
+
+    const rows = db.prepare(`
+      SELECT profile_id, title, body FROM profile_notifications
+      WHERE dedupe_key = ? ORDER BY profile_id
+    `).all("weather:stage-d:render:diff:1") as Array<Record<string, unknown>>;
+    assert.deepEqual(rows.map((row) => ({ ...row })), [
+      { profile_id: "profile-a", title: "# 萍乡今天晴，最高33℃", body: "**今日**：25～33℃，晴" },
+      { profile_id: "profile-b", title: "萍乡今天晴，最高33℃", body: "今日：25～33℃，晴" },
+    ]);
+
+    const deliveries = db.prepare(`
+      SELECT d.profile_id, d.status FROM profile_notification_deliveries d
+      JOIN profile_notifications n ON n.id = d.notification_id AND n.profile_id = d.profile_id
+      WHERE n.dedupe_key = ? ORDER BY d.profile_id
+    `).all("weather:stage-d:render:diff:1") as Array<Record<string, unknown>>;
+    assert.deepEqual(deliveries.map((row) => ({ ...row })), [
+      { profile_id: "profile-a", status: "pending" },
+      { profile_id: "profile-b", status: "pending" },
+    ]);
+  } finally {
+    routes["profile-a"] = originalA;
+    routes["profile-b"] = originalB;
+  }
+});
+
+test("阶段D：双 Profile 不同 renderTarget 的 global 事件分别渲染（qq-markdown vs wechat-markdown）", async () => {
+  const routes = (configModule.config as { profilePushRoutes: Record<string, StageDRoute> }).profilePushRoutes;
+  const originalA = routes["profile-a"];
+  const originalB = routes["profile-b"];
+  routes["profile-a"] = { ...originalA, renderTarget: "qq-markdown" };
+  routes["profile-b"] = { ...originalB, renderTarget: "wechat-markdown" };
+  try {
+    await publishNotification(stageDWeatherEnvelope("stage-d:render:wechat:1", { type: "global" }), {});
+
+    const rows = db.prepare(`
+      SELECT profile_id, title, body FROM profile_notifications
+      WHERE dedupe_key = ? ORDER BY profile_id
+    `).all("weather:stage-d:render:wechat:1") as Array<Record<string, unknown>>;
+    // 当前三平台 markdown 同集（D6：QQ/飞书/微信统一保守集合）——关键断言是
+    // wechat-markdown 从配置解析并进入 fan-out：profile-b 不再按缺省回落 plain。
+    assert.deepEqual(rows.map((row) => ({ ...row })), [
+      { profile_id: "profile-a", title: "# 萍乡今天晴，最高33℃", body: "**今日**：25～33℃，晴" },
+      { profile_id: "profile-b", title: "# 萍乡今天晴，最高33℃", body: "**今日**：25～33℃，晴" },
+    ]);
+
+    const deliveries = db.prepare(`
+      SELECT d.profile_id, d.status FROM profile_notification_deliveries d
+      JOIN profile_notifications n ON n.id = d.notification_id AND n.profile_id = d.profile_id
+      WHERE n.dedupe_key = ? ORDER BY d.profile_id
+    `).all("weather:stage-d:render:wechat:1") as Array<Record<string, unknown>>;
+    assert.deepEqual(deliveries.map((row) => ({ ...row })), [
+      { profile_id: "profile-a", status: "pending" },
+      { profile_id: "profile-b", status: "pending" },
+    ]);
+  } finally {
+    routes["profile-a"] = originalA;
+    routes["profile-b"] = originalB;
+  }
+});
+
+test("阶段D：日程 due reminder 在 qq-markdown profile 落库为 markdown 快照，plain profile 保持纯文本", async () => {
+  const routes = (configModule.config as { profilePushRoutes: Record<string, StageDRoute> }).profilePushRoutes;
+  const originalA = routes["profile-a"];
+  const originalB = routes["profile-b"];
+  routes["profile-a"] = { ...originalA, renderTarget: "qq-markdown" };
+  routes["profile-b"] = { ...originalB }; // 无 renderTarget → plain
+  try {
+    // 动态"明天"：避免固定日期过期后 createSchedule 跳到下一年（日期炸弹）。
+    const tomorrowShanghai = DateTime.now().setZone("Asia/Shanghai").plus({ days: 1 }).startOf("day");
+    const scheduleA = createSchedule(requireProfileContext("profile-a"), {
+      type: "birthday",
+      title: "render markdown reminder",
+      note: "render markdown note",
+      priority: "high",
+      calendar: "solar",
+      date: tomorrowShanghai.toFormat("yyyy-MM-dd"),
+      time: "09:30",
+      timezone: "Asia/Shanghai",
+      reminders: [{ id: "one-hour", minutesBefore: 60 }],
+    });
+    const scheduleB = createSchedule(requireProfileContext("profile-b"), {
+      type: "birthday",
+      title: "render plain reminder",
+      note: "render plain note",
+      priority: "high",
+      calendar: "solar",
+      date: tomorrowShanghai.toFormat("yyyy-MM-dd"),
+      time: "09:30",
+      timezone: "Asia/Shanghai",
+      reminders: [{ id: "one-hour", minutesBefore: 60 }],
+    });
+    db.prepare("UPDATE schedules SET enabled = 0 WHERE id NOT IN (?, ?)").run(scheduleA.id, scheduleB.id);
+
+    const dueAt = tomorrowShanghai.plus({ hours: 8, minutes: 30 }).toUTC().toJSDate();
+    await runDueSchedules(dueAt);
+
+    const occurrenceKey = `${tomorrowShanghai.plus({ hours: 9, minutes: 30 }).toUTC().toISO()}:occurrence:one-hour`;
+    const rows = db.prepare(`
+      SELECT profile_id, source, title, body, dedupe_key
+      FROM profile_notifications
+      WHERE dedupe_key IN (?, ?)
+      ORDER BY profile_id
+    `).all(
+      `schedule:profile-a:${scheduleA.id}:${occurrenceKey}`,
+      `schedule:profile-b:${scheduleB.id}:${occurrenceKey}`,
+    ) as Array<Record<string, unknown>>;
+
+    assert.deepEqual(rows.map((row) => ({ ...row })), [
+      {
+        profile_id: "profile-a",
+        source: "schedule",
+        title: "# 生日 · 发生提醒：render markdown reminder",
+        body: "**发生时间**：今天 09:30\n\n**相对**：还有 1 小时 0 分钟\n\n**备注**：render markdown note",
+        dedupe_key: `schedule:profile-a:${scheduleA.id}:${occurrenceKey}`,
+      },
+      {
+        profile_id: "profile-b",
+        source: "schedule",
+        title: "生日 · 发生提醒：render plain reminder",
+        body: "生日 · 发生提醒：render plain reminder\n发生时间：今天 09:30\n相对：还有 1 小时 0 分钟\n备注：render plain note",
+        dedupe_key: `schedule:profile-b:${scheduleB.id}:${occurrenceKey}`,
+      },
+    ]);
+
+    // 两个 Profile 各有一个 pending delivery（快照即投递的 outbox 侧）。
+    const deliveries = db.prepare(`
+      SELECT d.profile_id, d.status, d.route FROM profile_notification_deliveries d
+      JOIN profile_notifications n ON n.id = d.notification_id AND n.profile_id = d.profile_id
+      WHERE n.dedupe_key IN (?, ?)
+      ORDER BY d.profile_id
+    `).all(
+      `schedule:profile-a:${scheduleA.id}:${occurrenceKey}`,
+      `schedule:profile-b:${scheduleB.id}:${occurrenceKey}`,
+    ) as Array<Record<string, unknown>>;
+    assert.deepEqual(deliveries.map((row) => ({ ...row })), [
+      { profile_id: "profile-a", status: "pending", route: "qqbot" },
+      { profile_id: "profile-b", status: "pending", route: "qqbot" },
+    ]);
+  } finally {
+    routes["profile-a"] = originalA;
+    routes["profile-b"] = originalB;
+  }
+});
+
+test("阶段D：快照即投递——webhook body 的 title/body 与落库快照逐字一致（不重渲染）", async () => {
+  const routes = (configModule.config as { profilePushRoutes: Record<string, StageDRoute> }).profilePushRoutes;
+  const originalA = routes["profile-a"];
+  routes["profile-a"] = { ...originalA, renderTarget: "qq-markdown" };
+  try {
+    await publishNotification(stageDWeatherEnvelope("stage-d:snapshot:delivery:1", { type: "profile", profileId: "profile-a" }), {});
+
+    const dedupeKey = "weather:stage-d:snapshot:delivery:1";
+    const snapshot = db.prepare(`
+      SELECT title, body FROM profile_notifications
+      WHERE profile_id = ? AND dedupe_key = ?
+    `).get("profile-a", dedupeKey) as { title: string; body: string };
+    assert.equal(snapshot.title, "# 萍乡今天晴，最高33℃");
+    assert.equal(snapshot.body, "**今日**：25～33℃，晴");
+
+    // 只投递本条：取消 profile-a 其他历史 delivery，避免干扰 summary/请求计数。
+    const notification = db.prepare("SELECT id FROM profile_notifications WHERE profile_id = ? AND dedupe_key = ?")
+      .get("profile-a", dedupeKey) as { id: number };
+    db.prepare("UPDATE profile_notification_deliveries SET status = 'cancelled' WHERE NOT (profile_id = ? AND notification_id = ?)")
+      .run("profile-a", notification.id);
+
+    const at = new Date("2100-01-01T00:00:00.000Z");
+    const requests: Array<{ url: string; body: string }> = [];
+    const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+      requests.push({ url: String(url), body: String(init?.body ?? "") });
+      return new Response("ok", { status: 200 });
+    }) as typeof fetch;
+    const summary = await deliverPendingProfileNotifications({ at, profileId: "profile-a", fetchImpl, clock: () => at });
+    assert.deepEqual(summary, { attempted: 1, sent: 1, failed: 0 });
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].url, "http://127.0.0.1:8644/webhooks/life-assistant-reminder");
+
+    const payload = JSON.parse(requests[0].body) as {
+      event_type: string;
+      notification: { profileId: string; source: string; title: string; body: string; createdAt: string };
+    };
+    assert.equal(payload.event_type, "life_assistant.reminder");
+    assert.equal(payload.notification.profileId, "profile-a");
+    assert.equal(payload.notification.source, "weather");
+    assert.equal(payload.notification.title, snapshot.title);
+    assert.equal(payload.notification.body, snapshot.body);
+    assert.ok(payload.notification.createdAt);
+  } finally {
+    routes["profile-a"] = originalA;
+  }
+});
+
+test("阶段D：降级路径——内置 renderNotification 平台分支对残缺 payload 恒不 throw（plain 兜底契约）", () => {
+  const minimal: NotificationEnvelope = {
+    kind: "schedule.reminder",
+    identity: "stage-d:profile-a:schedule-min:occurrence-1",
+    source: "schedule",
+    scope: { type: "profile", profileId: "profile-a" },
+    headline: "minimal reminder",
+    generatedAt: "2026-08-10T00:00:00.000Z",
+    payload: {
+      title: "minimal reminder",
+      eventAt: "2026-08-10T09:30:00+08:00",
+      timezone: "Asia/Shanghai",
+      reminderMinutes: 0,
+    },
+  };
+  const targets: NotificationRenderTarget[] = ["plain", "qq-markdown", "feishu-markdown", "wechat-markdown"];
+  for (const target of targets) {
+    const rendered = renderNotification(minimal, target);
+    assert.equal(typeof rendered.title, "string");
+    assert.equal(typeof rendered.body, "string");
+    assert.ok(rendered.title.length > 0, `${target} title 不得为空`);
+    assert.ok(rendered.body.length > 0, `${target} body 不得为空`);
+  }
+  // 未知/非法 target 恒回落 plain（未知平台兜底）。
+  assert.deepEqual(renderNotification(minimal, "unknown-platform" as any), renderNotification(minimal, "plain"));
+});
+
+test("阶段D：降级路径——注入 renderer 抛错保持抛出语义（D5-A），不产生部分落库/投递", async () => {
+  const routes = (configModule.config as { profilePushRoutes: Record<string, StageDRoute> }).profilePushRoutes;
+  const originalA = routes["profile-a"];
+  const originalB = routes["profile-b"];
+  routes["profile-a"] = { ...originalA, renderTarget: "qq-markdown" };
+  routes["profile-b"] = { ...originalB };
+  try {
+    // 现有实现语义（决策 D5-A）：兜底只保证默认 renderNotification 的平台分支
+    // （try/catch → plain）；注入的 renderer 是显式测试/扩展接缝，保持抛出语义不变，
+    // 因此 publishNotification 整体 reject，且 fan-out 原子失败（不写半截落库/投递）。
+    await assert.rejects(
+      () => publishNotification(stageDWeatherEnvelope("stage-d:degrade:renderer:1", { type: "global" }), {
+        renderer: () => { throw new Error("boom"); },
+      }),
+      /boom/,
+    );
+    const rows = db.prepare("SELECT COUNT(*) AS count FROM profile_notifications WHERE dedupe_key = ?")
+      .get("weather:stage-d:degrade:renderer:1") as { count: number };
+    assert.equal(rows.count, 0);
+    const deliveries = db.prepare(`
+      SELECT COUNT(*) AS count FROM profile_notification_deliveries d
+      JOIN profile_notifications n ON n.id = d.notification_id AND n.profile_id = d.profile_id
+      WHERE n.dedupe_key = ?
+    `).get("weather:stage-d:degrade:renderer:1") as { count: number };
+    assert.equal(deliveries.count, 0);
+  } finally {
+    routes["profile-a"] = originalA;
+    routes["profile-b"] = originalB;
+  }
 });

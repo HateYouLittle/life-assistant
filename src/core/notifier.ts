@@ -92,6 +92,9 @@ export async function publishGlobal(
   bodyOrKey?: string,
   maybeDedupeKey?: string,
   legacyDedupeKeys: readonly string[] = [],
+  options: {
+    renderForProfile?: (profileId: string, shared: { title: string; body: string }) => { title: string; body: string };
+  } = {},
 ): Promise<void> {
   const hasSource = maybeDedupeKey !== undefined;
   const source = hasSource ? sourceOrTitle : "general";
@@ -100,7 +103,12 @@ export async function publishGlobal(
   const dedupeKey = hasSource ? maybeDedupeKey : bodyOrKey;
   if (dedupeKey !== undefined && suppressRetainedGlobal(dedupeKey, legacyDedupeKeys)) return;
   for (const profileId of Object.keys(config.profilePushRoutes)) {
-    await publishResolvedProfile(profileId, source, title, body, dedupeKey, legacyDedupeKeys);
+    // 每 Profile 渲染回调只替换落库快照；suppressRetainedGlobal / legacy dedupe /
+    // delivery 创建逻辑一律不变（R5）。
+    const rendered = options.renderForProfile
+      ? options.renderForProfile(profileId, { title, body })
+      : { title, body };
+    await publishResolvedProfile(profileId, source, rendered.title, rendered.body, dedupeKey, legacyDedupeKeys);
   }
 }
 

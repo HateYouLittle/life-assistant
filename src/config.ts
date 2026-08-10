@@ -1,4 +1,5 @@
 import path from "node:path";
+import type { NotificationRenderTarget } from "./core/notification.js";
 
 function nonBlankOrDefault(value: string | undefined, fallback: string): string {
   return value?.trim() || fallback;
@@ -8,6 +9,23 @@ export interface ProfilePushRoute {
   route: string;
   url: string;
   secret: string;
+  /** 平台专属渲染目标；缺省/未知值时按 plain 兜底（运行时 resolveRenderTarget 解析）。 */
+  renderTarget?: NotificationRenderTarget;
+}
+
+const VALID_RENDER_TARGETS: readonly NotificationRenderTarget[] = [
+  "plain",
+  "qq-markdown",
+  "feishu-markdown",
+  "wechat-markdown",
+];
+
+/** 解析 Profile 的渲染目标：缺省/未知值恒返回 "plain" 兜底。 */
+export function resolveRenderTarget(route?: ProfilePushRoute): NotificationRenderTarget {
+  if (route?.renderTarget && VALID_RENDER_TARGETS.includes(route.renderTarget)) {
+    return route.renderTarget;
+  }
+  return "plain";
 }
 
 function isStrongWebhookSecret(secret: string): boolean {
@@ -44,7 +62,11 @@ export function parseProfilePushRoutes(raw: string | undefined): Record<string, 
       } catch {
         continue;
       }
-      routes[profileId] = { route: route.route, url: route.url, secret: route.secret };
+      const normalized: ProfilePushRoute = { route: route.route, url: route.url, secret: route.secret };
+      if (route.renderTarget && VALID_RENDER_TARGETS.includes(route.renderTarget)) {
+        normalized.renderTarget = route.renderTarget;
+      }
+      routes[profileId] = normalized;
     }
     return routes;
   } catch {

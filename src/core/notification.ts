@@ -103,42 +103,63 @@ export type NotificationRenderTarget =
   | "plain"
   | "qq-markdown"
   | "feishu-markdown"
-  | "wechat-plain";
+  | "wechat-markdown";
 
 export type NotificationRenderer = (
   notification: NotificationEnvelope,
   target?: NotificationRenderTarget,
 ) => RenderedNotification;
 
-function renderDailyWeather(payload: DailyWeatherPayload): string {
-  const lines: string[] = [];
+// ============================================================================
+// 阶段 B：结构化块中间表示（RenderBlock[] IR）
+//
+// plain / qq-markdown / feishu-markdown / wechat-markdown 都是同一份 RenderBlock[]
+// 的确定性投影：qq/feishu/wechat 三平台统一同一套保守 markdown 渲染规则，plain 为兜底。
+// 官方原文（details 字段）一律走 raw 块：原样输出、永不被解析/转义。
+// plain 投影必须与阶段 A 黄金样例逐字节一致（硬约束）。
+// ============================================================================
+
+export type RenderBlock =
+  | { type: "line"; text: string }
+  | { type: "label"; label: string; value: string }
+  | { type: "section"; title?: string }
+  | { type: "raw"; text: string };
+
+function dailyWeatherBlocks(payload: DailyWeatherPayload): RenderBlock[] {
+  const blocks: RenderBlock[] = [];
   if (payload.current) {
     const current = payload.current;
     const facts = [`${current.weather}，${current.temperatureC}℃`];
     if (current.apparentTemperatureC !== undefined) facts.push(`体感${current.apparentTemperatureC}℃`);
     if (current.humidityPercent !== undefined) facts.push(`湿度${current.humidityPercent}%`);
-    lines.push(`当前：${facts.join("，")}`);
+    blocks.push({ type: "label", label: "当前", value: facts.join("，") });
   }
   if (payload.today) {
     const today = payload.today;
-    lines.push(`今日：${today.minTemperatureC}～${today.maxTemperatureC}℃，${today.weather}`);
+    blocks.push({
+      type: "label",
+      label: "今日",
+      value: `${today.minTemperatureC}～${today.maxTemperatureC}℃，${today.weather}`,
+    });
   }
   if (payload.precipitation?.probabilityPercent !== undefined) {
-    lines.push(`降水：最高概率${payload.precipitation.probabilityPercent}%`);
+    blocks.push({ type: "label", label: "降水", value: `最高概率${payload.precipitation.probabilityPercent}%` });
   } else if (payload.precipitation?.amountMm !== undefined) {
-    lines.push(`降水：预计${payload.precipitation.amountMm}mm`);
+    blocks.push({ type: "label", label: "降水", value: `预计${payload.precipitation.amountMm}mm` });
   }
-  if (payload.advice) lines.push(`建议：${payload.advice}`);
-  return lines.join("\n");
+  if (payload.advice) blocks.push({ type: "label", label: "建议", value: payload.advice });
+  return blocks;
 }
 
 function formatDateTime(value: string, timezone: string): string {
   return DateTime.fromISO(value, { setZone: true }).setZone(timezone).toFormat("yyyy年M月d日 HH:mm");
 }
 
-function renderOfficialAlert(notification: Extract<NotificationEnvelope, { kind: "weather.official_alert" }>): string {
+function officialAlertBlocks(
+  notification: Extract<NotificationEnvelope, { kind: "weather.official_alert" }>,
+): RenderBlock[] {
   const { payload, provenance } = notification;
-  const lines: string[] = [];
+  const blocks: RenderBlock[] = [];
   const timeParts: string[] = [];
   if (payload.issuedAt) {
     const issuedAt = formatDateTime(payload.issuedAt, payload.timezone);
@@ -151,29 +172,37 @@ function renderOfficialAlert(notification: Extract<NotificationEnvelope, { kind:
   } else if (payload.impactEndsAt) {
     timeParts.push(`影响至：${formatDateTime(payload.impactEndsAt, payload.timezone)}`);
   }
-  if (timeParts.length > 0) lines.push(`时间：${timeParts.join("；")}`);
-  if (payload.area) lines.push(`区域：${payload.area}`);
-  if (payload.risk) lines.push(`风险：${payload.risk}`);
-  if (payload.advice) lines.push(`建议：${payload.advice}`);
-  if (provenance?.publisher && provenance.provider) {
-    lines.push(`来源：${provenance.publisher}（${provenance.provider}）`);
-  } else if (provenance?.publisher || provenance?.provider) {
-    lines.push(`来源：${provenance.publisher ?? provenance.provider}`);
+  if (timeParts.length > 0) blocks.push({ type: "label", label: "时间", value: timeParts.join("；") });
+  if (payload.area) blocks.push({ type: "label", label: "区域", value: payload.area });
+  if (payload.risk) blocks.push({ type: "label", label: "风险", value: payload.risk });
+  if (payload.advice) blocks.push({ type: "label", label: "建议", value: payload.advice });
+  const publisher = provenance?.publisher;
+  const provider = provenance?.provider;
+  if (publisher && provider) {
+    blocks.push({ type: "label", label: "来源", value: `${publisher}（${provider}）` });
+  } else if (publisher) {
+    blocks.push({ type: "label", label: "来源", value: publisher });
+  } else if (provider) {
+    blocks.push({ type: "label", label: "来源", value: provider });
   }
-  if (notification.details) lines.push("", "官方原文：", notification.details);
-  return lines.join("\n");
+  if (notification.details) {
+    blocks.push({ type: "section" });
+    blocks.push({ type: "line", text: "官方原文：" });
+    blocks.push({ type: "raw", text: notification.details });
+  }
+  return blocks;
 }
 
 function formatBusinessDate(value: string): string {
   return DateTime.fromISO(value, { zone: "Asia/Shanghai" }).toFormat("yyyy年M月d日");
 }
 
-function renderOilPriceAdvance(payload: OilPriceAdvanceNoticePayload): string {
+function oilPriceAdvanceBlocks(payload: OilPriceAdvanceNoticePayload): RenderBlock[] {
   return [
-    `调整时间：${formatBusinessDate(payload.windowDate)} 24:00（北京时间）`,
-    "正式涨跌：尚未发布",
-    `提示：${payload.tip}`,
-  ].join("\n");
+    { type: "label", label: "调整时间", value: `${formatBusinessDate(payload.windowDate)} 24:00（北京时间）` },
+    { type: "label", label: "正式涨跌", value: "尚未发布" },
+    { type: "label", label: "提示", value: payload.tip },
+  ];
 }
 
 function renderChange(value: string): string {
@@ -182,32 +211,44 @@ function renderChange(value: string): string {
   return `每升上涨${value}元`;
 }
 
-function renderOilPriceResult(
+function oilPriceResultBlocks(
   notification: Extract<NotificationEnvelope, { kind: "oilprice.official_result" }>,
-): string {
+): RenderBlock[] {
   const { payload, provenance } = notification;
   const effectiveAt = `${formatBusinessDate(payload.windowDate)} 24:00`;
-  const lines = ([
+  const blocks: RenderBlock[] = ([
     ["92号汽油", payload.fuels.p92],
     ["95号汽油", payload.fuels.p95],
     ["0号柴油", payload.fuels.p0],
-  ] as const).map(([label, fuel]) => `${label}：${fuel.current}${payload.unit}，${renderChange(fuel.change)}`);
-  lines.push(`生效时间：${effectiveAt}（北京时间）`);
-  lines.push(`地区：${payload.province}`);
+  ] as const).map(([label, fuel]) => ({
+    type: "label",
+    label,
+    value: `${fuel.current}${payload.unit}，${renderChange(fuel.change)}`,
+  } as const));
+  blocks.push({ type: "label", label: "生效时间", value: `${effectiveAt}（北京时间）` });
+  blocks.push({ type: "label", label: "地区", value: payload.province });
   const provider = provenance?.provider?.trim();
   const sourceIncludesProvider = provider
     ? payload.source.toLocaleLowerCase().includes(provider.toLocaleLowerCase())
     : false;
-  lines.push(`来源：${payload.source}${provider && !sourceIncludesProvider ? `（${provider}）` : ""}`);
-  return lines.join("\n");
+  blocks.push({
+    type: "label",
+    label: "来源",
+    value: `${payload.source}${provider && !sourceIncludesProvider ? `（${provider}）` : ""}`,
+  });
+  return blocks;
 }
 
-function renderScheduleReminder(payload: ScheduleReminderPayload): string {
+function scheduleReminderBlocks(payload: ScheduleReminderPayload): RenderBlock[] {
   if (!payload.target || !payload.occurrenceAt || !payload.targetAt || !payload.generatedAt) {
     const localEvent = DateTime.fromISO(payload.eventAt, { setZone: true })
       .setZone(payload.timezone)
       .toFormat("yyyy-LL-dd HH:mm");
-    return `${payload.title}\n时间：${localEvent}\n提醒：提前 ${payload.reminderMinutes} 分钟`;
+    return [
+      { type: "line", text: payload.title },
+      { type: "label", label: "时间", value: localEvent },
+      { type: "label", label: "提醒", value: `提前 ${payload.reminderMinutes} 分钟` },
+    ];
   }
   const targetAt = DateTime.fromISO(payload.targetAt, { setZone: true }).setZone(payload.timezone);
   const generatedAt = DateTime.fromISO(payload.generatedAt, { setZone: true }).setZone(payload.timezone);
@@ -245,21 +286,93 @@ function renderScheduleReminder(payload: ScheduleReminderPayload): string {
     relative = `已逾期 ${Math.floor(-differenceMs / (24 * 60 * 60 * 1000))} 天`;
   }
   const timeLabel = payload.target === "deadline" ? "截止时间" : "发生时间";
-  const lines = [firstLine, `${timeLabel}：${displayTime}`, `相对：${relative}`];
-  if (payload.note) lines.push(`备注：${payload.note}`);
-  return lines.join("\n");
+  const blocks: RenderBlock[] = [
+    { type: "line", text: firstLine },
+    { type: "label", label: timeLabel, value: displayTime },
+    { type: "label", label: "相对", value: relative },
+  ];
+  if (payload.note) blocks.push({ type: "label", label: "备注", value: payload.note });
+  return blocks;
+}
+
+function renderBlocks(notification: NotificationEnvelope): RenderBlock[] {
+  if (notification.kind === "weather.daily_brief") return dailyWeatherBlocks(notification.payload);
+  if (notification.kind === "weather.official_alert") return officialAlertBlocks(notification);
+  if (notification.kind === "oilprice.advance_notice") return oilPriceAdvanceBlocks(notification.payload);
+  if (notification.kind === "oilprice.official_result") return oilPriceResultBlocks(notification);
+  return scheduleReminderBlocks(notification.payload);
+}
+
+// ---------------------------------------------------------------------------
+// plain 投影：与阶段 A 黄金样例逐字节一致（join("\n") 语义，section → 空行）。
+// ---------------------------------------------------------------------------
+
+function blockToPlain(block: RenderBlock): string {
+  switch (block.type) {
+    case "line":
+      return block.text;
+    case "label":
+      return `${block.label}：${block.value}`;
+    case "section":
+      return "";
+    case "raw":
+      return block.text;
+  }
+}
+
+function renderPlainBlocks(blocks: RenderBlock[]): string {
+  return blocks.map(blockToPlain).join("\n");
 }
 
 function renderPlainNotification(notification: NotificationEnvelope): RenderedNotification {
-  let body: string;
-  if (notification.kind === "weather.daily_brief") body = renderDailyWeather(notification.payload);
-  else if (notification.kind === "weather.official_alert") body = renderOfficialAlert(notification);
-  else if (notification.kind === "oilprice.advance_notice") body = renderOilPriceAdvance(notification.payload);
-  else if (notification.kind === "oilprice.official_result") body = renderOilPriceResult(notification);
-  else body = renderScheduleReminder(notification.payload);
   return {
     title: notification.headline,
-    body,
+    body: renderPlainBlocks(renderBlocks(notification)),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// markdown 投影：qq-markdown / feishu-markdown / wechat-markdown 三平台统一同一套保守渲染规则（D6）。
+//   - 标题 → `# headline`（放进 title）；
+//   - label 块 → `**标签**：值`；
+//   - 块间空行（\n\n）；
+//   - raw 块原样输出，不解析不转义（D7）；
+//   - 省略与 headline 完全相同的首行（D2）。
+// 禁止表格/列表/emoji/引用。
+// ---------------------------------------------------------------------------
+
+function blockToMarkdown(block: RenderBlock): string {
+  switch (block.type) {
+    case "line":
+      return block.text;
+    case "label":
+      return `**${block.label}**：${block.value}`;
+    case "section":
+      return "";
+    case "raw":
+      return block.text;
+  }
+}
+
+function renderMarkdownBlocks(blocks: RenderBlock[], headline: string): string {
+  const parts: string[] = [];
+  let isFirst = true;
+  for (const block of blocks) {
+    if (isFirst && block.type === "line" && block.text === headline) {
+      isFirst = false;
+      continue;
+    }
+    isFirst = false;
+    if (block.type === "section") continue;
+    parts.push(blockToMarkdown(block));
+  }
+  return parts.join("\n\n");
+}
+
+function renderMarkdownNotification(notification: NotificationEnvelope): RenderedNotification {
+  return {
+    title: `# ${notification.headline}`,
+    body: renderMarkdownBlocks(renderBlocks(notification), notification.headline),
   };
 }
 
@@ -267,7 +380,14 @@ export function renderNotification(
   notification: NotificationEnvelope,
   target: NotificationRenderTarget = "plain",
 ): RenderedNotification {
-  // Platform-specific renderers are intentionally deferred; every target currently uses the stable plain snapshot.
-  void target;
+  if (target === "qq-markdown" || target === "feishu-markdown" || target === "wechat-markdown") {
+    try {
+      return renderMarkdownNotification(notification);
+    } catch {
+      // 平台分支任何异常都回退 plain 兜底，不允许 throw。
+      return renderPlainNotification(notification);
+    }
+  }
+  // plain | 未知/非法 target → plain 兜底投影。
   return renderPlainNotification(notification);
 }

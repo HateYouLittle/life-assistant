@@ -70,7 +70,7 @@ test("schedule reminder builder preserves complete Profile-scoped schedule seman
   });
 });
 
-test("new semantic schedule reminders render one stable plain representation for every target", () => {
+test("new semantic schedule reminders render stable plain or platform-specific markdown per target", () => {
   const notification = buildScheduleReminderNotification({
     item,
     occurrenceKey: "2026-08-10T01:30:00.000Z:occurrence:two-hours",
@@ -90,10 +90,22 @@ test("new semantic schedule reminders render one stable plain representation for
       "备注：提前订蛋糕",
     ].join("\n"),
   };
+  // 阶段 B：平台分支取代旧的「qq-markdown === plain」契约。
+  // markdown 投影 = `# ` 标题 + 加粗标签 + 块间空行 + 省略与 headline 相同的首行。
+  const expectedMarkdown = {
+    title: "# 生日 · 发生提醒：妈妈生日",
+    body: [
+      "**发生时间**：今天 09:30",
+      "**相对**：还有 2 小时 0 分钟",
+      "**备注**：提前订蛋糕",
+    ].join("\n\n"),
+  };
 
   assert.deepEqual(renderNotification(notification), expected);
   assert.deepEqual(renderNotification(notification, "plain"), expected);
-  assert.deepEqual(renderNotification(notification, "qq-markdown"), expected);
+  assert.deepEqual(renderNotification(notification, "wechat-markdown"), expectedMarkdown);
+  assert.deepEqual(renderNotification(notification, "qq-markdown"), expectedMarkdown);
+  assert.deepEqual(renderNotification(notification, "feishu-markdown"), expectedMarkdown);
   assert.deepEqual(
     renderNotification(notification, "future-platform" as NotificationRenderTarget),
     expected,
