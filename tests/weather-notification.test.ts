@@ -1,12 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { renderNotification } from "../src/core/notification.js";
+
 import {
+  inferredAlertNotification,
   legacyWeatherAlertDedupeKeys,
   officialAlertNotification,
   weatherAlertIdentity,
 } from "../src/modules/weather/notification.js";
-import type { OfficialWeatherAlert, WeatherAlert } from "../src/modules/weather/provider.js";
+import type { InferredWeatherRisk, OfficialWeatherAlert, WeatherAlert } from "../src/modules/weather/provider.js";
 
 function officialAlert(overrides: Partial<OfficialWeatherAlert> = {}): OfficialWeatherAlert {
   return {
@@ -105,4 +108,61 @@ test("official alert conversion uses only structured summary fields and preserve
   assert.equal(notification.payload.risk, alert.criteria);
   assert.equal(notification.payload.advice, alert.instruction);
   assert.deepEqual(notification.provenance, { provider: "和风天气", publisher: "江西省气象台" });
+});
+
+const inferredWindAlert: InferredWeatherRisk = {
+  kind: "inferred",
+  title: "萍乡大风推断提醒",
+  level: "inferred",
+  description: "未来48小时风速峰值约 19m/s（约8级），注意防风。",
+};
+
+test("inferred alert conversion keeps structured fields and a stable daily identity", () => {
+  const notification = inferredAlertNotification(inferredWindAlert, {
+    generatedAt: "2026-08-04T11:30:00.000Z",
+    timezone: "Asia/Shanghai",
+  });
+
+  assert.equal(notification.kind, "weather.inferred_alert");
+  assert.equal(notification.source, "weather");
+  assert.deepEqual(notification.scope, { type: "global" });
+  assert.equal(
+    notification.identity,
+    "inferred:%E8%90%8D%E4%B9%A1%E5%A4%A7%E9%A3%8E%E6%8E%A8%E6%96%AD%E6%8F%90%E9%86%92:2026-08-04",
+  );
+  assert.equal(notification.headline, "系统推断风险：萍乡大风推断提醒");
+  assert.equal(notification.generatedAt, "2026-08-04T11:30:00.000Z");
+  assert.deepEqual(notification.payload, {
+    title: "萍乡大风推断提醒",
+    description: "未来48小时风速峰值约 19m/s（约8级），注意防风。",
+    timezone: "Asia/Shanghai",
+  });
+});
+
+test("inferred alert plain rendering keeps the legacy body verbatim without any prefix", () => {
+  const notification = inferredAlertNotification(inferredWindAlert, {
+    generatedAt: "2026-08-04T11:30:00.000Z",
+    timezone: "Asia/Shanghai",
+  });
+
+  const rendered = renderNotification(notification, "plain");
+  assert.equal(rendered.title, "系统推断风险：萍乡大风推断提醒");
+  assert.equal(rendered.body, "未来48小时风速峰值约 19m/s（约8级），注意防风。");
+});
+
+test("inferred alert markdown rendering labels the risk and is identical across qq/feishu/wechat", () => {
+  const notification = inferredAlertNotification(inferredWindAlert, {
+    generatedAt: "2026-08-04T11:30:00.000Z",
+    timezone: "Asia/Shanghai",
+  });
+
+  const qq = renderNotification(notification, "qq-markdown");
+  assert.equal(qq.title, "# 系统推断风险：萍乡大风推断提醒");
+  assert.equal(qq.body, "**风险**：未来48小时风速峰值约 19m/s（约8级），注意防风。");
+  assert.deepEqual(renderNotification(notification, "feishu-markdown"), qq);
+  assert.deepEqual(renderNotification(notification, "wechat-markdown"), qq);
+  assert.deepEqual(renderNotification(notification, "plain"), {
+    title: "系统推断风险：萍乡大风推断提醒",
+    body: "未来48小时风速峰值约 19m/s（约8级），注意防风。",
+  });
 });

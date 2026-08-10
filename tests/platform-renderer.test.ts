@@ -6,8 +6,11 @@ import {
   type NotificationEnvelope,
   type NotificationRenderTarget,
 } from "../src/core/notification.js";
-import { officialAlertNotification } from "../src/modules/weather/notification.js";
-import type { OfficialWeatherAlert } from "../src/modules/weather/provider.js";
+import {
+  inferredAlertNotification,
+  officialAlertNotification,
+} from "../src/modules/weather/notification.js";
+import type { InferredWeatherRisk, OfficialWeatherAlert } from "../src/modules/weather/provider.js";
 import {
   advanceNoticeNotification,
   officialResultNotification,
@@ -180,6 +183,38 @@ const goldenCases: GoldenCase[] = [
         "风险：发生雷电灾害事故的可能性较大。",
         "来源：江西省气象台（和风天气）",
       ].join("\n"),
+    },
+  },
+  {
+    name: "weather.inferred_alert：大风推断（builder 构造）",
+    notification: inferredAlertNotification(
+      {
+        kind: "inferred",
+        title: "萍乡大风推断提醒",
+        level: "inferred",
+        description: "未来48小时风速峰值约 19m/s（约8级），注意防风。",
+      },
+      { generatedAt: "2026-08-04T11:30:00.000Z", timezone: "Asia/Shanghai" },
+    ),
+    expected: {
+      title: "系统推断风险：萍乡大风推断提醒",
+      body: "未来48小时风速峰值约 19m/s（约8级），注意防风。",
+    },
+  },
+  {
+    name: "weather.inferred_alert：强降雨推断（builder 构造）",
+    notification: inferredAlertNotification(
+      {
+        kind: "inferred",
+        title: "萍乡强降雨推断提醒",
+        level: "inferred",
+        description: "未来48小时小时降水峰值约 32mm，可能达暴雨量级，注意出行安全。",
+      },
+      { generatedAt: "2026-08-05T03:00:00.000Z", timezone: "Asia/Shanghai" },
+    ),
+    expected: {
+      title: "系统推断风险：萍乡强降雨推断提醒",
+      body: "未来48小时小时降水峰值约 32mm，可能达暴雨量级，注意出行安全。",
     },
   },
   {
@@ -389,7 +424,7 @@ for (const sample of goldenCases) {
   });
 }
 
-test("plain 黄金锁：样例表覆盖全部 5 种 kind，且每种至少 2 个代表性 envelope", () => {
+test("plain 黄金锁：样例表覆盖全部 6 种 kind，且每种至少 2 个代表性 envelope", () => {
   const counts = new Map<string, number>();
   for (const sample of goldenCases) {
     counts.set(sample.notification.kind, (counts.get(sample.notification.kind) ?? 0) + 1);
@@ -397,6 +432,7 @@ test("plain 黄金锁：样例表覆盖全部 5 种 kind，且每种至少 2 个
   const kinds = [
     "weather.daily_brief",
     "weather.official_alert",
+    "weather.inferred_alert",
     "oilprice.advance_notice",
     "oilprice.official_result",
     "schedule.reminder",
@@ -459,6 +495,10 @@ function officialAlertFullSample(): GoldenCase {
 
 function scheduleReminderFullSample(): GoldenCase {
   return goldenCases.find((c) => c.name.startsWith("schedule.reminder：完整字段·发生提醒"))!;
+}
+
+function inferredAlertFullSample(): GoldenCase {
+  return goldenCases.find((c) => c.name.startsWith("weather.inferred_alert：大风推断"))!;
 }
 
 test("平台分支：weather.daily_brief 在 qq/feishu/wechat 下标签加粗、数值单位与顺序与 plain 一致", () => {
@@ -531,8 +571,33 @@ test("平台分支：schedule.reminder 在 qq/feishu/wechat 下省略与 headlin
   assert.deepEqual(renderNotification(sample.notification, "unknown-platform" as any), plain);
 });
 
+test("平台分支：weather.inferred_alert plain 逐字保留旧版 body，markdown 三平台统一加粗风险标签", () => {
+  const sample = inferredAlertFullSample();
+  const plain = renderNotification(sample.notification, "plain");
+  assert.deepEqual(plain, sample.expected);
+  assert.deepEqual(renderNotification(sample.notification, "unknown-platform" as any), plain);
+
+  const qq = renderNotification(sample.notification, "qq-markdown");
+  assert.equal(qq.title, "# 系统推断风险：萍乡大风推断提醒");
+  assert.equal(qq.body, "**风险**：未来48小时风速峰值约 19m/s（约8级），注意防风。");
+  assert.deepEqual(renderNotification(sample.notification, "feishu-markdown"), qq);
+  assert.deepEqual(renderNotification(sample.notification, "wechat-markdown"), qq);
+
+  const other = goldenCases.find((c) => c.name.startsWith("weather.inferred_alert：强降雨推断"))!;
+  const otherQq = renderNotification(other.notification, "qq-markdown");
+  assert.equal(otherQq.body, "**风险**：未来48小时小时降水峰值约 32mm，可能达暴雨量级，注意出行安全。");
+  for (const target of MARKDOWN_TARGETS) {
+    assert.deepEqual(renderNotification(other.notification, target), otherQq);
+  }
+});
+
 test("平台分支：qq/feishu/wechat 三平台 markdown 完全同集（# + 加粗 + 空行）", () => {
-  const samples = [dailyBriefFullSample(), officialAlertFullSample(), scheduleReminderFullSample()];
+  const samples = [
+    dailyBriefFullSample(),
+    officialAlertFullSample(),
+    inferredAlertFullSample(),
+    scheduleReminderFullSample(),
+  ];
   const [baselineTarget, ...restTargets] = MARKDOWN_TARGETS;
   for (const sample of samples) {
     const baseline = renderNotification(sample.notification, baselineTarget);

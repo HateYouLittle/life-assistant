@@ -16,7 +16,7 @@ import {
   type ForecastDay,
   type WeatherAlert,
 } from "./provider.js";
-import { legacyWeatherAlertDedupeKeys, officialAlertNotification } from "./notification.js";
+import { inferredAlertNotification, legacyWeatherAlertDedupeKeys, officialAlertNotification } from "./notification.js";
 
 export interface DailyWeatherBriefOptions {
   at?: Date;
@@ -132,15 +132,11 @@ export async function runWeatherAlertsCheck(options: WeatherAlertsCheckOptions =
   for (const alert of alerts) {
     const legacyDedupeKeys = legacyWeatherAlertDedupeKeys(alert, at);
     if (alert.kind === "inferred") {
-      const localDate = DateTime.fromJSDate(at).setZone(timezone).toISODate();
-      if (!localDate) throw new Error(`invalid weather alert timezone: ${timezone}`);
-      await publish(
-        "weather",
-        `系统推断风险：${alert.title}`,
-        alert.description,
-        `weather:inferred:${encodeURIComponent(alert.title)}:${localDate}`,
-        legacyDedupeKeys,
-      );
+      const notification = inferredAlertNotification(alert, {
+        generatedAt: at.toISOString(),
+        timezone,
+      });
+      await publishNotification(notification, { publishGlobal: publish }, legacyDedupeKeys);
       continue;
     }
     let notification: ReturnType<typeof officialAlertNotification>;

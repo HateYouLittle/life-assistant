@@ -1,7 +1,13 @@
+import { DateTime } from "luxon";
 import type { NotificationEnvelope } from "../../core/notification.js";
-import type { OfficialWeatherAlert, WeatherAlert } from "./provider.js";
+import type { InferredWeatherRisk, OfficialWeatherAlert, WeatherAlert } from "./provider.js";
 
 export interface OfficialAlertNotificationOptions {
+  generatedAt: string;
+  timezone: string;
+}
+
+export interface InferredAlertNotificationOptions {
   generatedAt: string;
   timezone: string;
 }
@@ -55,5 +61,28 @@ export function officialAlertNotification(
       advice: alert.instruction,
     },
     details: alert.description,
+  };
+}
+
+export function inferredAlertNotification(
+  alert: InferredWeatherRisk,
+  options: InferredAlertNotificationOptions,
+): Extract<NotificationEnvelope, { kind: "weather.inferred_alert" }> {
+  const localDate = DateTime.fromISO(options.generatedAt, { setZone: true })
+    .setZone(options.timezone)
+    .toISODate();
+  if (!localDate) throw new Error(`invalid inferred alert timezone: ${options.timezone}`);
+  return {
+    kind: "weather.inferred_alert",
+    identity: `inferred:${encodeURIComponent(alert.title)}:${localDate}`,
+    source: "weather",
+    scope: { type: "global" },
+    headline: `系统推断风险：${alert.title}`,
+    generatedAt: options.generatedAt,
+    payload: {
+      title: alert.title,
+      description: alert.description,
+      timezone: options.timezone,
+    },
   };
 }

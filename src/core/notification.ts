@@ -41,6 +41,12 @@ export interface OfficialWeatherAlertPayload {
   advice?: string;
 }
 
+export interface WeatherInferredAlertPayload {
+  title: string;
+  description: string;
+  timezone: string;
+}
+
 export interface OilPriceAdvanceNoticePayload {
   windowDate: string;
   effectiveAt: string;
@@ -89,6 +95,7 @@ interface NotificationCore {
 export type NotificationEnvelope = NotificationCore & (
   | { kind: "weather.daily_brief"; payload: DailyWeatherPayload }
   | { kind: "weather.official_alert"; payload: OfficialWeatherAlertPayload }
+  | { kind: "weather.inferred_alert"; payload: WeatherInferredAlertPayload }
   | { kind: "oilprice.advance_notice"; payload: OilPriceAdvanceNoticePayload }
   | { kind: "oilprice.official_result"; payload: OilPriceOfficialResultPayload }
   | { kind: "schedule.reminder"; payload: ScheduleReminderPayload }
@@ -121,7 +128,7 @@ export type NotificationRenderer = (
 
 export type RenderBlock =
   | { type: "line"; text: string }
-  | { type: "label"; label: string; value: string }
+  | { type: "label"; label: string; value: string; plainNoPrefix?: boolean }
   | { type: "section"; title?: string }
   | { type: "raw"; text: string };
 
@@ -191,6 +198,10 @@ function officialAlertBlocks(
     blocks.push({ type: "raw", text: notification.details });
   }
   return blocks;
+}
+
+function inferredAlertBlocks(payload: WeatherInferredAlertPayload): RenderBlock[] {
+  return [{ type: "label", label: "风险", value: payload.description, plainNoPrefix: true }];
 }
 
 function formatBusinessDate(value: string): string {
@@ -298,6 +309,7 @@ function scheduleReminderBlocks(payload: ScheduleReminderPayload): RenderBlock[]
 function renderBlocks(notification: NotificationEnvelope): RenderBlock[] {
   if (notification.kind === "weather.daily_brief") return dailyWeatherBlocks(notification.payload);
   if (notification.kind === "weather.official_alert") return officialAlertBlocks(notification);
+  if (notification.kind === "weather.inferred_alert") return inferredAlertBlocks(notification.payload);
   if (notification.kind === "oilprice.advance_notice") return oilPriceAdvanceBlocks(notification.payload);
   if (notification.kind === "oilprice.official_result") return oilPriceResultBlocks(notification);
   return scheduleReminderBlocks(notification.payload);
@@ -312,7 +324,7 @@ function blockToPlain(block: RenderBlock): string {
     case "line":
       return block.text;
     case "label":
-      return `${block.label}：${block.value}`;
+      return block.plainNoPrefix ? block.value : `${block.label}：${block.value}`;
     case "section":
       return "";
     case "raw":
