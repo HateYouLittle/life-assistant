@@ -3,7 +3,7 @@ import fs from "node:fs";
 import test from "node:test";
 
 import { config } from "../src/config.js";
-import { fetchAlerts, fetchForecast } from "../src/modules/weather/provider.js";
+import { WMO, fetchAlerts, fetchForecast } from "../src/modules/weather/provider.js";
 
 test("QWeather forecast maps daily precip as millimeter amount", async (t) => {
   const originalKey = config.qweatherKey;
@@ -101,4 +101,54 @@ test("QWeather official alerts preserve every reliable structured field and the 
       "当前预警数据可能存在延迟或信息过时，以官方数据发布为准。",
     ],
   }]);
+});
+
+const WMO_COMMON_CODES = [0, 1, 2, 3, 45, 48, 51, 53, 55, 56, 57, 61, 63, 65, 66, 67, 71, 73, 75, 77, 80, 81, 82, 85, 86, 95, 96, 99];
+
+const WMO_PREVIOUSLY_MISSING: Record<number, string> = {
+  53: "毛毛雨",
+  55: "密集毛毛雨",
+  56: "冻毛毛雨（轻微）",
+  57: "冻毛毛雨（密集）",
+  66: "冻雨（轻微）",
+  67: "冻雨（密集）",
+  77: "雪粒",
+  85: "阵雪（轻微）",
+  86: "阵雪（强烈）",
+};
+
+test("WMO mapping covers all common weather codes without raw code fallback", () => {
+  for (const code of WMO_COMMON_CODES) {
+    const label = WMO[code];
+    assert.ok(label, `WMO[${code}] must have a Chinese label`);
+    assert.doesNotMatch(label, /^code \d+$/, `WMO[${code}] must not fall back to "code N"`);
+  }
+  for (const [code, label] of Object.entries(WMO_PREVIOUSLY_MISSING)) {
+    assert.equal(WMO[Number(code)], label);
+  }
+});
+
+test("Open-Meteo forecast maps WMO weather code 55 to 密集毛毛雨", async (t) => {
+  const originalKey = config.qweatherKey;
+  const originalFetch = globalThis.fetch;
+  config.qweatherKey = "";
+  globalThis.fetch = (async (input) => {
+    assert.match(String(input), /daily=weather_code/);
+    return Response.json({
+      daily: {
+        time: ["2026-08-11"],
+        temperature_2m_max: [28.6],
+        temperature_2m_min: [25.3],
+        weather_code: [55],
+        precipitation_probability_max: [80],
+      },
+    });
+  }) as typeof fetch;
+  t.after(() => {
+    config.qweatherKey = originalKey;
+    globalThis.fetch = originalFetch;
+  });
+
+  const [today] = await fetchForecast(27.62, 113.85, 1);
+  assert.equal(today.weatherText, "密集毛毛雨");
 });
