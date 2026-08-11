@@ -64,6 +64,12 @@ Hermes 将 MCP 工具注册为 `mcp_life_assistant_<tool>`，点号转换为下�
 - 当前每个 Profile 只有一个主动目标；用户要求多平台同时投递时，说明当前不支持，不要伪造配置。
 - 切换后用对应 Profile 的 `hermes webhook list` 和临时日程做端到端验证。
 
+## 通知平台渲染
+
+- `PROFILE_PUSH_ROUTES_JSON` 每个 Profile 条目可配置可选 `renderTarget`：`"plain"`（纯文本，缺省兜底）、`"qq-markdown"`、`"feishu-markdown"`、`"wechat-markdown"`；缺省或未知值一律按 `"plain"` 处理。
+- 通知快照在生成时按该 Profile 的 `renderTarget` 渲染并落库，之后不重渲染；修改配置只影响之后新生成的通知，已落库的旧快照不会自动重渲染。
+- QQ / 飞书 / 微信共用同一套 markdown 投影，plain 是缺省与兜底；平台渲染异常不会导致通知发送失败。
+
 ## 已封存能力
 
 快递追踪未注册到运行时。不要调用或声称存在相关工具；建议用户使用电商平台或快递公司的官方渠道。

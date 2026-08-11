@@ -128,6 +128,18 @@ Profile outbox -> stable loopback webhook route -> --deliver <platform>
 
 secret 只来自环境变量或权限受限的配置文件，不得打印到日志、粘贴到聊天或提交 Git。
 
+### 平台渲染
+
+`PROFILE_PUSH_ROUTES_JSON` 每个 Profile 条目可带可选字段 `renderTarget`，指定该 Profile 主动通知的平台渲染目标，取值为 `"plain"` / `"qq-markdown"` / `"feishu-markdown"` / `"wechat-markdown"` 四种；缺省或未知值一律回退 `"plain"`（`resolveRenderTarget` 在运行时解析，`parseProfilePushRoutes` 只保留合法取值）。
+
+渲染统一走「阶段 B」结构化块中间表示（`RenderBlock[]` IR）：plain 与三个 markdown 平台都是同一份 `RenderBlock[]` 的确定性投影，不是各平台各写一套模板。markdown 快照形态为：title 为 `# <headline>`，body 由 markdown 块组成（`**标签**：值`、块间 `\n\n` 分段等）；官方原文（details 字段）走 raw 块原样输出，不解析不转义。`renderNotification` 中 qq/feishu/wechat 走同一套保守 markdown 投影，任何异常都回退 plain 兜底、不允许 throw；plain 或未知/非法 target 也走 plain 投影。
+
+每 Profile 渲染通过 `publishGlobal` 的第 6 参 `renderForProfile(profileId, {title, body})` 回调实现：该回调只替换每个 Profile 的落库快照，suppressRetainedGlobal / legacy dedupe / delivery 创建逻辑一律不变；既有 5 参调用不受影响。通知快照在生成时按该 Profile 的 renderTarget 渲染并落库，之后不重渲染；因此 renderTarget 只影响配置变更之后新生成的通知，已落库的旧快照不会自动重渲染。
+
+天气推断预警已信封化为 `weather.inferred_alert`（builder `inferredAlertNotification()`），经 `publishNotification`（publishGlobal 路径）按 Profile fan-out；identity 为 `inferred:<title>:<date>`，与 source 前缀组合成 dedupe key `weather:inferred:<title>:<date>`，与旧路径 dedupe 兼容（旧 legacy dedupe keys 保留）。plain 下 description 原样输出；markdown（qq/feishu/wechat 同集）下 label 块为 `**风险**` 加粗前缀。
+
+天气 Open-Meteo 兜底的 WMO 天气码映射表（`WMO: Record<number, string>`）已补齐 53/55/56/57/66/67/77/85/86 等缺失码（如 55 = 密集毛毛雨），映射后不再出现原始 `code N` 回退；未知码仍保留 `code N` 兜底。天气 provider：QWeather 首选、Open-Meteo 兜底。
+
 ## 7. 数据源
 
 | 能力 | 首选 | 兜底 |

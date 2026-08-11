@@ -173,6 +173,8 @@ Hermes route URL 必须使用上面显式保存的同一个 `<gateway-port>`，�
 }
 ```
 
+`renderTarget` 是每个 Profile 条目的可选字段，指定该 Profile 主动通知的平台渲染目标：`"plain"`（纯文本，缺省兜底）、`"qq-markdown"`、`"feishu-markdown"`、`"wechat-markdown"`。缺省或未知值一律按 `"plain"` 处理。详见下文「平台渲染」。
+
 替换占位符、压缩成单行后写入 `.env`。整个 JSON 值必须用单引号包裹，才能同时被 `source .env` 和 systemd `EnvironmentFile` 正确读取：
 
 ```bash
@@ -274,6 +276,25 @@ hermes -p "<profile>" webhook subscribe "<route-name>" \
 ```
 
 这种切换通常无需修改 `PROFILE_PUSH_ROUTES_JSON`、SQLite 或 scheduler，也无需重启 Gateway。只有平台凭据或静态平台配置变化时才可能需要重启对应 Gateway；route 名、URL 或 secret 变化时，必须同步更新 `PROFILE_PUSH_ROUTES_JSON` 并重启 scheduler。
+
+## 平台渲染
+
+每个 Profile 可通过 `PROFILE_PUSH_ROUTES_JSON` 条目中的可选字段 `renderTarget` 指定主动通知的平台渲染目标，取值为 `"plain"`（纯文本，缺省兜底）、`"qq-markdown"`、`"feishu-markdown"`、`"wechat-markdown"`；缺省或未知值一律按 `"plain"` 处理。
+
+```json
+{
+  "<profile>": {
+    "route": "life-assistant-<profile>",
+    "url": "http://127.0.0.1:<gateway-port>/webhooks/life-assistant-<profile>",
+    "secret": "<64-hex-secret>",
+    "renderTarget": "qq-markdown"
+  }
+}
+```
+
+- 四种目标都从同一份 `RenderBlock[]` 中间表示投影：QQ / 飞书 / 微信共用同一套保守 markdown 规则，plain 是缺省与兜底。markdown 快照 title 为 `# <headline>`，body 为 `**标签**：值`、块间 `\n\n` 分段的 markdown 块。
+- 通知快照在生成时按该 Profile 的 `renderTarget` 渲染并落库，之后不重渲染；因此 `renderTarget` 只影响配置变更之后新生成的通知，已落库的旧快照不会自动升级为 markdown。
+- 平台 markdown 分支任何渲染异常都回退 plain 兜底，不会导致通知发送失败。
 
 ## 工具一览
 
