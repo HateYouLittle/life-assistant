@@ -36,7 +36,10 @@ const configModule = await import("../src/config.js");
 const parseProfilePushRoutes = (configModule as Record<string, unknown>).parseProfilePushRoutes as (
   raw?: string,
 ) => Record<string, { route: string; url: string; secret: string }>;
-const { createSchedule, listSchedules, getSchedule, updateSchedule, deleteSchedule, hydrateRow } = await import(
+const {
+  createSchedule, listSchedules, getSchedule, updateSchedule, deleteSchedule, hydrateRow,
+  logHydrationError, hydrationErrorLogSize,
+} = await import(
   "../src/modules/schedule/service.js",
 );
 const notifierModule = await import("../src/core/notifier.js");
@@ -2172,11 +2175,15 @@ test("an unexpected findOccurrence failure is logged and does not clear nextRunA
     const original = console.error;
     console.error = (...args: unknown[]) => { errors.push(args.map(String).join(" ")); };
     try {
-      const hydrated = hydrateRow(raw, () => {
+      const failing = () => {
         throw new Error("unexpected findOccurrence failure");
-      });
+      };
+      const hydrated = hydrateRow(raw, failing);
       assert.equal(hydrated.nextRunAt, String(raw.next_run_at), "nextRunAt 保留");
       assert.equal(hydrated.nextOccurrenceSolar, undefined, "派生展示值丢弃");
+      // P3-1：同一行窗口内重复失败只记一次完整日志（去重生效）
+      hydrateRow(raw, failing);
+      assert.equal(errors.length, 1, "窗口内同一行只记一次日志");
     } finally {
       console.error = original;
     }
@@ -2216,5 +2223,63 @@ test("corrupt numeric columns fall back to safe defaults instead of NaN", () => 
     assert.equal(lunar.lunarDay, undefined);
   } finally {
     db.prepare("DELETE FROM schedules WHERE profile_id = ? AND id LIKE 'numeric-bad-%'").run(a.id);
+  }
+});
+
+test("updating a schedule with a dirty legacy version does not conflict", () => {
+  // P2-1：updateSchedule 的乐观锁 WHERE 必须与 hydration 归一化口径一致——
+  // version=0 的脏行归一为 1 后，写回比较用原始列值，不得误报冲突。
+  const a = requireProfileContext("profile-a");
+  const item = createSchedule(a, {
+    title: "dirty version",
+    calendar: "solar",
+    date: "2099-01-02",
+    time: "09:00",
+    timezone: "Asia/Shanghai",
+  });
+  try {
+    db.prepare("UPDATE schedules SET version = 0 WHERE profile_id = ? AND id = ?").run(a.id, item.id);
+    const updated = updateSchedule(a, item.id, { title: "dirty version renamed" });
+    assert.equal(updated.title, "dirty version renamed");
+  } finally {
+    db.prepare("DELETE FROM schedules WHERE profile_id = ? AND id = ?").run(a.id, item.id);
+  }
+});
+
+test("hydration errors are logged once per row within the dedup window", () => {
+  // P3-1：同一 profileId/id 在 5 分钟窗口内只记一次完整日志；窗口外恢复记录；
+  // 不同行互不抑制。用注入的假时钟使窗口可控。
+  const errors: string[] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => { errors.push(args.map(String).join(" ")); };
+  try {
+    const base = 1_000;
+    logHydrationError("profile-a", "dedup-id", new Error("boom"), base);
+    logHydrationError("profile-a", "dedup-id", new Error("boom"), base + 4 * 60 * 1000); // 窗口内 → 抑制
+    logHydrationError("profile-a", "other-id", new Error("other"), base);               // 不同行 → 记录
+    assert.equal(errors.length, 2);
+    logHydrationError("profile-a", "dedup-id", new Error("boom"), base + 5 * 60 * 1000 + 1); // 窗口外 → 恢复
+    assert.equal(errors.length, 3);
+  } finally {
+    console.error = original;
+  }
+});
+
+test("hydration error log bookkeeping cleans up expired entries", () => {
+  // P3-1：Map 无泄漏——容量达到阈值时清扫过期条目（用已过期时间戳批量填充后验证回收）
+  const errors: string[] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => { errors.push(args.map(String).join(" ")); };
+  try {
+    const expiredBase = Date.now() - 10 * 60 * 1000;
+    for (let index = 0; index < 300; index += 1) {
+      logHydrationError("profile-a", `bulk-${index}`, new Error("bulk"), expiredBase);
+    }
+    assert.ok(hydrationErrorLogSize() >= 300, "批量条目应已登记");
+    logHydrationError("profile-a", "fresh-entry", new Error("fresh"), Date.now());
+    // 清扫后仅剩未过期条目（此前其他测试的零星条目 + 本测试的 fresh-entry）
+    assert.ok(hydrationErrorLogSize() <= 10, "过期条目应被清扫");
+  } finally {
+    console.error = original;
   }
 });

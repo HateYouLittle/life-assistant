@@ -291,3 +291,35 @@ test("a corrupt deadline_offset_minutes does not poison or disable the schedule"
     status: "active",
   });
 });
+
+test("dirty legacy version values are normalized instead of stale-skipping reminders", async () => {
+  // P2-1：version=0/-1/1.5 的脏行经归一化后与 hydration 口径一致，
+  // 不得被判 stale snapshot 而静默丢提醒
+  for (const [label, dirtyVersion] of [["zero", 0], ["negative", -1], ["fraction", 1.5]] as const) {
+    db.prepare("UPDATE schedules SET enabled = 0").run();
+    const item = createSchedule(profile, {
+      title: `version ${label}`,
+      calendar: "solar",
+      date: "2099-05-01",
+      time: "09:00",
+      timezone: "Asia/Shanghai",
+      recurrence: "daily",
+      reminders: [{ id: "start", minutesBefore: 0 }],
+    });
+    db.prepare("UPDATE schedules SET version = ?, next_run_at = ? WHERE profile_id = ? AND id = ?")
+      .run(dirtyVersion, "2099-05-01T01:00:00.000Z", profile.id, item.id);
+
+    await runDueSchedules(new Date("2099-05-01T01:01:00.000Z"));
+    assert.deepEqual(notices(item.id).map((row) => row.dedupe_key), [
+      `schedule:${profile.id}:${item.id}:2099-05-01T01:00:00.000Z:occurrence:start`,
+    ], `version=${dirtyVersion} 的脏行应正常发布提醒`);
+    const scheduleRow = db.prepare(`
+      SELECT next_run_at, enabled, status FROM schedules WHERE profile_id = ? AND id = ?
+    `).get(profile.id, item.id) as Record<string, unknown>;
+    assert.deepEqual({ ...scheduleRow }, {
+      next_run_at: "2099-05-02T01:00:00.000Z",
+      enabled: 1,
+      status: "active",
+    }, `version=${dirtyVersion} 的脏行应正常推进`);
+  }
+});

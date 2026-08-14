@@ -10,7 +10,7 @@ import { deliverPendingProfileNotifications, notify, publishProfile, type Delive
 import { notifyModule } from "./core/notify-module.js";
 import { ok, type AssistantModule } from "./core/registry.js";
 import { buildScheduleReminderNotification } from "./modules/schedule/notification.js";
-import { calculateNextRun, deadlineForOccurrence, hydrateRow, nextReminderTiming } from "./modules/schedule/service.js";
+import { calculateNextRun, deadlineForOccurrence, hydrateRow, nextReminderTiming, normalizeVersion } from "./modules/schedule/service.js";
 import type { ScheduleItem } from "./modules/schedule/types.js";
 
 export { notifyModule };
@@ -122,10 +122,12 @@ async function processDue(item: ScheduleItem, at: DateTime<true>): Promise<void>
   const db = getDatabase();
   // 发布前重读版本：若 MCP 工具已并发修改（版本推进），放弃陈旧快照，
   // 下个 tick 会用新版本重新评估，避免按过期内容发布提醒。
+  // P2-1：比较用与 hydration 相同的归一化口径（normalizeVersion），
+  // 脏行 version=0/-1/1.5 归一为 1 后与 item.version 一致，不再被永久判 stale。
   const fresh = db.prepare(
     "SELECT version FROM schedules WHERE profile_id = ? AND id = ?",
   ).get(item.profileId, item.id) as { version: number } | undefined;
-  if (!fresh || fresh.version !== item.version) {
+  if (!fresh || normalizeVersion(fresh.version) !== item.version) {
     console.warn(
       `[schedule] skipped stale snapshot ${item.profileId}/${item.id} ` +
         `(db version ${fresh?.version ?? "missing"} != snapshot version ${item.version})`,
@@ -177,14 +179,17 @@ async function processDue(item: ScheduleItem, at: DateTime<true>): Promise<void>
   }
 
   const nextRun = calculateNextIncompleteRun(item, at.plus({ milliseconds: 1 }) as DateTime<true>);
-  const updated = db.prepare("UPDATE schedules SET next_run_at = ?, enabled = ?, status = ?, version = version + 1, updated_at = ? WHERE profile_id = ? AND id = ? AND version = ?").run(
+  // P2-1：写回用归一化后的版本（脏行 version=0 → 2，自愈），WHERE 用原始列值防并发冲突。
+  const nextVersion = normalizeVersion(fresh.version) + 1;
+  const updated = db.prepare("UPDATE schedules SET next_run_at = ?, enabled = ?, status = ?, version = ?, updated_at = ? WHERE profile_id = ? AND id = ? AND version = ?").run(
     nextRun?.toISO() ?? null,
     nextRun ? 1 : 0,
     nextRun ? item.status : "completed",
+    nextVersion,
     isoNow(),
     item.profileId,
     item.id,
-    item.version,
+    fresh.version,
   ) as { changes: number };
   if (updated.changes !== 1) {
     console.warn(

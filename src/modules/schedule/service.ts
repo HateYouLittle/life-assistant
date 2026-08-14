@@ -491,6 +491,39 @@ function finiteIntOrUndefined(value: unknown, min: number, max: number): number 
   return Number.isInteger(parsed) && parsed >= min && parsed <= max ? parsed : undefined;
 }
 
+/** 版本归一化（P2-1）：hydration 与 scheduler 乐观锁共用同一口径。 */
+export function normalizeVersion(value: unknown): number {
+  return finiteIntOrUndefined(value, 1, Number.MAX_SAFE_INTEGER) ?? 1;
+}
+
+// ---------------------------------------------------------------------------
+// P3-1：hydration 行级错误日志去重。同一 profileId/id 在窗口内只记一次完整日志，
+// 窗口外首次错误仍完整记录；Map 在容量阈值时清扫过期条目，防无界增长。
+// ---------------------------------------------------------------------------
+const HYDRATION_LOG_WINDOW_MS = 5 * 60 * 1000;
+const HYDRATION_LOG_MAX_ENTRIES = 256;
+const hydrationErrorLastLoggedAt = new Map<string, number>();
+
+export function logHydrationError(profileId: string, scheduleId: string, error: unknown, now = Date.now()): void {
+  const key = `${profileId}:${scheduleId}`;
+  const lastLoggedAt = hydrationErrorLastLoggedAt.get(key);
+  if (lastLoggedAt !== undefined && now - lastLoggedAt < HYDRATION_LOG_WINDOW_MS) return;
+  if (hydrationErrorLastLoggedAt.size >= HYDRATION_LOG_MAX_ENTRIES) {
+    for (const [entryKey, loggedAt] of hydrationErrorLastLoggedAt) {
+      if (now - loggedAt >= HYDRATION_LOG_WINDOW_MS) hydrationErrorLastLoggedAt.delete(entryKey);
+    }
+  }
+  hydrationErrorLastLoggedAt.set(key, now);
+  console.error(
+    `[schedule] hydration failed to derive next occurrence for ${profileId}/${scheduleId}: ` +
+    `${error instanceof Error ? error.message : String(error)}`,
+  );
+}
+
+export function hydrationErrorLogSize(): number {
+  return hydrationErrorLastLoggedAt.size;
+}
+
 function rowToItem(
   row: Record<string, unknown>,
   findImpl: typeof findOccurrence = findOccurrence,
@@ -548,7 +581,7 @@ function rowToItem(
     deadlineOffsetMinutes: finiteIntOrUndefined(row.deadline_offset_minutes, 0, 60 * 24 * 365),
     enabled: Boolean(row.enabled),
     nextRunAt: row.next_run_at == null ? undefined : String(row.next_run_at),
-    version: finiteIntOrUndefined(row.version, 1, Number.MAX_SAFE_INTEGER) ?? 1,
+    version: normalizeVersion(row.version),
     createdAt: String(row.created_at),
     updatedAt: String(row.updated_at),
   };
@@ -567,10 +600,7 @@ function rowToItem(
       const next = findImpl(item, triggerAt, true);
       item.nextOccurrenceSolar = next?.toISO() ?? undefined;
     } catch (error) {
-      console.error(
-        `[schedule] hydration failed to derive next occurrence for ${item.profileId}/${item.id}: ` +
-        `${error instanceof Error ? error.message : String(error)}`,
-      );
+      logHydrationError(item.profileId, item.id, error);
       item.nextOccurrenceSolar = undefined;
     }
   }
@@ -671,6 +701,12 @@ export function getSchedule(value: ProfileContext | string, id: string): Schedul
 export function updateSchedule(value: ProfileContext | string, id: string, changes: Partial<ScheduleInput>): ScheduleItem {
   const profile = context(value);
   const current = getSchedule(profile, id);
+  // P2-1：乐观锁 WHERE 用 DB 原始列值（hydration 的归一化只用于比较口径），
+  // 脏行（version=0/-1/1.5）不再因归一化不一致而误冲突；写回统一用归一化后的值。
+  const rawVersionRow = getDatabase().prepare(
+    "SELECT version FROM schedules WHERE profile_id = ? AND id = ?",
+  ).get(profile.id, id) as { version: number } | undefined;
+  const rawVersion = rawVersionRow?.version ?? current.version;
   const { recurrence: recurrenceChange, ...restChanges } = changes;
   // P2-12：recurrence 为 plain object 时与现有规则深合并（部分更新）；
   // 为字符串枚举（如 "daily"）时整体替换频率规则。
@@ -722,7 +758,7 @@ export function updateSchedule(value: ProfileContext | string, id: string, chang
   `).run(
     next.type, next.title, next.note ?? null, next.priority, next.status, next.calendar, next.date ?? null, next.lunarMonth ?? null, next.lunarDay ?? null,
     next.recurrence.leapMonthPolicy ?? null, next.time, next.allDay ? 1 : 0, next.timezone, JSON.stringify(next.recurrence), JSON.stringify(next.reminders), next.deadlineAt ?? null, next.deadlineOffsetMinutes ?? null, next.enabled ? 1 : 0,
-    next.nextRunAt ?? null, next.version, next.updatedAt, profile.id, id, current.version,
+    next.nextRunAt ?? null, next.version, next.updatedAt, profile.id, id, rawVersion,
   ) as { changes: number };
   if (!result.changes) throw new Error("schedule update conflict");
   return next;
