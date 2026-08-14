@@ -35,9 +35,26 @@ export function nextWindow(now = new Date()): AdjustmentWindow | null {
       return {
         date,
         effectiveAt,
-        hoursUntil: (effective.toMillis() - now.getTime()) / 3600_000,
+        // 保留 1 位小数，避免浮点误差导致展示为 182.99999999999997
+        hoursUntil: Math.round(((effective.toMillis() - now.getTime()) / 3600_000) * 10) / 10,
       };
     }
   }
   return null;
+}
+
+/**
+ * 计算某个窗口日与静态表最近窗口的偏差天数。
+ * Provider 的 windowDate 是"最近一次已生效的窗口"，因此必须与表中的最近窗口对比
+ * （而不是下一个窗口），否则正常数据每天都会误告警。
+ */
+export function nearestWindowDeviationDays(date: string): number | null {
+  const parsed = DateTime.fromISO(date, { zone: BUSINESS_TIMEZONE });
+  if (!parsed.isValid) return null;
+  let minDays: number | null = null;
+  for (const entry of ADJUSTMENT_WINDOWS_2026) {
+    const deviation = Math.abs(parsed.diff(DateTime.fromISO(entry, { zone: BUSINESS_TIMEZONE }), "days").days);
+    if (minDays === null || deviation < minDays) minDays = deviation;
+  }
+  return minDays;
 }

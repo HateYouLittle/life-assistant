@@ -21,17 +21,17 @@ const recurrenceSchema = z.union([
   z.object({
     frequency: z.enum(["once", "daily", "weekly", "monthly", "yearly"]).optional(),
     interval: z.number().int().min(1).optional(),
-    byWeekday: z.array(z.string()).optional(),
+    byWeekday: z.array(z.enum(["SU", "MO", "TU", "WE", "TH", "FR", "SA"])).optional(),
     byMonthDay: z.number().int().min(1).max(31).optional(),
-    until: z.string().optional(),
+    until: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "until must be YYYY-MM-DD").optional(),
     count: z.number().int().min(1).optional(),
   }),
 ]);
 
 const commonFields = {
   type: z.enum(["todo", "birthday", "anniversary"]).optional(),
-  title: z.string().min(1),
-  note: z.string().optional(),
+  title: z.string().min(1).max(200),
+  note: z.string().max(2000).optional(),
   priority: z.enum(["low", "normal", "high"]).optional(),
   status: z.enum(["active", "completed", "archived"]).optional(),
   calendar: z.enum(["solar", "lunar"]).default("solar"),
@@ -52,8 +52,8 @@ const commonFields = {
 
 const updateFields = {
   type: z.enum(["todo", "birthday", "anniversary"]).optional(),
-  title: z.string().min(1).optional(),
-  note: z.string().optional(),
+  title: z.string().min(1).max(200).optional(),
+  note: z.string().max(2000).optional(),
   priority: z.enum(["low", "normal", "high"]).optional(),
   status: z.enum(["active", "completed", "archived"]).optional(),
   calendar: z.enum(["solar", "lunar"]).optional(),

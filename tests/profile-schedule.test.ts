@@ -342,10 +342,11 @@ test("the deterministic daily brief publishes once per local date through every 
   await runDailyWeatherBrief({ ...options, at: new Date("2026-08-03T00:00:00.000Z") });
   await runDailyWeatherBrief({ ...options, at: new Date("2026-08-03T10:00:00.000Z") });
 
+  // 天气模块已改为按城市区分 daily-brief 键（weather:daily-brief:{city}:{localDate}）。
   const sameDay = db.prepare(`
     SELECT profile_id, title, body FROM profile_notifications
     WHERE dedupe_key = ? ORDER BY profile_id
-  `).all("weather:daily-brief:2026-08-03") as Array<Record<string, unknown>>;
+  `).all("weather:daily-brief:北京:2026-08-03") as Array<Record<string, unknown>>;
   assert.equal(sameDay.length, 2);
   assert.deepEqual(sameDay.map((row) => row.profile_id), ["profile-a", "profile-b"]);
   assert.equal(sameDay[0].title, "北京今天阵雨，24～32℃，注意带伞");
@@ -431,7 +432,8 @@ test("the daily brief survives a forecast provider failure", async () => {
     source: "weather",
     title: "上海当前晴，30℃",
     body: "当前：晴，30℃，体感33℃，湿度70%",
-    dedupeKey: "weather:daily-brief:2026-08-05",
+    // 天气模块的 daily-brief 键已按城市区分（weather:daily-brief:{city}:{localDate}）。
+    dedupeKey: "weather:daily-brief:上海:2026-08-05",
   }]);
 });
 
@@ -465,7 +467,8 @@ test("the daily brief leaves its dedupe key free when current weather fails and 
 
   await runDailyWeatherBrief(options);
   assert.equal(published.length, 1);
-  assert.equal(published[0].dedupeKey, "weather:daily-brief:2026-08-06");
+  // 天气模块的 daily-brief 键已按城市区分（weather:daily-brief:{city}:{localDate}）。
+  assert.equal(published[0].dedupeKey, "weather:daily-brief:广州:2026-08-06");
   assert.match(published[0].body, /当前：多云，31℃/);
 });
 
@@ -1891,5 +1894,40 @@ test("阶段D：降级路径——注入 renderer 抛错保持抛出语义（D5-
   } finally {
     routes["profile-a"] = originalA;
     routes["profile-b"] = originalB;
+  }
+});
+
+test("hydration tolerates malformed recurrence_json and reminders_json without throwing", () => {
+  const a = requireProfileContext("profile-a");
+  const stamp = "2099-01-01T00:00:00.000Z";
+  const insert = (id: string, recurrenceJson: string, remindersJson: string) => {
+    db.prepare(`
+      INSERT INTO schedules(profile_id, id, type, title, priority, status, calendar, time, all_day, timezone, recurrence_json, reminders_json, enabled, version, created_at, updated_at)
+      VALUES(?, ?, 'todo', ?, 'normal', 'active', 'solar', '09:00', 1, 'Asia/Shanghai', ?, ?, 0, 1, ?, ?)
+    `).run(a.id, id, `hydration ${id}`, recurrenceJson, remindersJson, stamp, stamp);
+  };
+  try {
+    insert("hydrate-null-recurrence", "null", "[{\"minutesBefore\":30,\"id\":\"r1\"}]");
+    insert("hydrate-null-reminders", "{\"frequency\":\"daily\",\"interval\":1,\"calendar\":\"solar\"}", "null");
+    insert("hydrate-empty-reminders", "{\"frequency\":\"daily\",\"interval\":1,\"calendar\":\"solar\"}", "[]");
+    insert("hydrate-bad-shape", "{\"frequency\":\"hourly\",\"interval\":0,\"calendar\":\"solar\"}", "[{\"minutesBefore\":\"x\"},7,null]");
+
+    // recurrence_json='null'：回退 {frequency:"once", interval:1, calendar}，提醒逐条归一化。
+    const nullRecurrence = getSchedule(a, "hydrate-null-recurrence");
+    assert.deepEqual(nullRecurrence.recurrence, { frequency: "once", interval: 1, calendar: "solar" });
+    assert.deepEqual(nullRecurrence.reminders, [{ id: "r1", minutesBefore: 30, target: "occurrence" }]);
+    // reminders_json='null'：回退默认提醒。
+    assert.deepEqual(getSchedule(a, "hydrate-null-reminders").reminders, [
+      { id: "reminder-1", minutesBefore: 0, target: "occurrence" },
+    ]);
+    // reminders_json='[]'：合法空数组，保持空提醒集合。
+    assert.deepEqual(getSchedule(a, "hydrate-empty-reminders").reminders, []);
+    // frequency 非法/interval 非法 → 整体回退；reminder 非对象项被过滤、非法字段归零。
+    const badShape = getSchedule(a, "hydrate-bad-shape");
+    assert.deepEqual(badShape.recurrence, { frequency: "once", interval: 1, calendar: "solar" });
+    assert.deepEqual(badShape.reminders, [{ id: "reminder-1", minutesBefore: 0, target: "occurrence" }]);
+    assert.doesNotThrow(() => listSchedules(a));
+  } finally {
+    db.prepare("DELETE FROM schedules WHERE profile_id = ? AND id LIKE 'hydrate-%'").run(a.id);
   }
 });

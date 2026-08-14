@@ -75,6 +75,8 @@ interface JobDef {
 2. code-defined module job：需要运行时天气、油价或其他实时数据的固定任务，由 scheduler 执行并通过标准通知接口发布。
 3. planned automation：通用自然语言动态信息推送。当前尚未实现；规划设计为 SQLite 配置、白名单 action、scheduler 无 LLM 执行。
 
+循环日程在提醒窗口内创建或更新时，只要目标时刻（occurrence 或 deadline）仍在未来，错过窗口的触发时刻会立即在下一次扫描补发（与一次性日程的补发语义一致）。
+
 ## 4. Outbox 与投递语义
 
 Profile notification 与对应 delivery 在同一个 SQLite 事务中创建。SQLite 启用 WAL、foreign keys、busy timeout；delivery 外键绑定 `(profile_id, notification_id)`，避免跨 Profile 引用。claim token、过期 claim 接管和完成时 fencing 用于降低并发 worker 重复完成的风险。
@@ -98,7 +100,7 @@ Profile notification 与对应 delivery 在同一个 SQLite 事务中创建。SQ
 
 Webhook 成功后，delivery 标记为 `sent`，并在同一事务中写入 `profile_notification_reads`，因此后续 `notify.pull` 不会重复返回。若用户先通过 `notify.pull` 读取通知，系统写入 read 并取消仍处于 `pending`、`failed` 或 `fallback` 的未发送 delivery，避免稍后重复推送。
 
-route 缺失或变化时，旧的未完成 delivery 会转为 `fallback`；已 sent/read 的通知不会因 route 漂移重新入队。旧直连通知环境变量和 stdout fan-out 均不在当前投递路径中。
+route 缺失或变化时，旧的未完成 delivery 会转为 `fallback`；同名 route 恢复后，因 route 配置漂移进入 `fallback` 且未被 `notify.pull` 读取的行会重新入队投递，而 transport 失败或幂等窗口超期进入 `fallback` 的行保持终态，避免重复投递。已 sent/read 的通知不会因 route 漂移重新入队。旧直连通知环境变量和 stdout fan-out 均不在当前投递路径中。
 
 ## 5. 确定性每日生活简报
 
@@ -109,7 +111,7 @@ job 并发读取当前天气、当日预报和可选油价：
 - 当前天气或预报单项失败时，使用另一个天气结果继续生成；
 - 两个天气结果都不可用时，本轮失败，不发送空简报；
 - 油价未配置、失败或为不可用占位值时省略油价；
-- 使用 `weather:daily-brief:<本地日期>` 作为 dedupe key；
+- 使用 `weather:daily-brief:<城市>:<本地日期>` 作为 dedupe key，同日更换已保存位置后新城市简报不会被旧键吞掉；
 - 内容由 Provider 数据确定性拼装，不调用 OpenAI 或其他 LLM。
 
 迁移旧部署时，外部 Hermes 07:00 LLM cron 可能与内置简报并存。应先端到端验证新简报，再暂停或删除旧 cron；它不属于本仓库管理范围，不能把一次部署动作写成系统持续状态。

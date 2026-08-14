@@ -98,7 +98,8 @@ export async function runDailyWeatherBrief(options: DailyWeatherBriefOptions = {
   };
   const notification: NotificationEnvelope = {
     kind: "weather.daily_brief",
-    identity: `daily-brief:${localDate}`,
+    // 同日换城市不再被旧键吞掉：dedupeKey 形如 weather:daily-brief:{city}:{localDate}
+    identity: `daily-brief:${location.city}:${localDate}`,
     source: "weather",
     scope: { type: "global" },
     headline: dailyHeadline(location.city, currentValue, today),
@@ -132,11 +133,16 @@ export async function runWeatherAlertsCheck(options: WeatherAlertsCheckOptions =
   for (const alert of alerts) {
     const legacyDedupeKeys = legacyWeatherAlertDedupeKeys(alert, at);
     if (alert.kind === "inferred") {
-      const notification = inferredAlertNotification(alert, {
-        generatedAt: at.toISOString(),
-        timezone,
-      });
-      await publishNotification(notification, { publishGlobal: publish }, legacyDedupeKeys);
+      try {
+        const notification = inferredAlertNotification(alert, {
+          generatedAt: at.toISOString(),
+          timezone,
+        });
+        await publishNotification(notification, { publishGlobal: publish }, legacyDedupeKeys);
+      } catch (error) {
+        // 与 official 分支一致：单条推断告警失败不影响其余告警
+        console.error(`[weather] inferred alert omitted: ${(error as Error).message}`);
+      }
       continue;
     }
     let notification: ReturnType<typeof officialAlertNotification>;
@@ -207,10 +213,10 @@ const weatherModule: AssistantModule = {
     {
       name: "forecast",
       description: "查询未来 N 天天气预报。默认查询已保存位置；也可传 city 查询任意城市（如 朔城区/北京），临时查询不改变已保存位置。",
-      schema: { days: z.number().min(1).max(7).default(3).describe("预报天数 1-7"), city: z.string().optional().describe("城市名（可选），如 朔城区/北京；不传则查已保存位置") },
+      schema: { days: z.number().int().min(1).max(7).default(3).describe("预报天数 1-7"), city: z.string().optional().describe("城市名（可选），如 朔城区/北京；不传则查已保存位置") },
       handler: async (args) => {
         try {
-          const { days, city } = z.object({ days: z.number().min(1).max(7).default(3), city: z.string().optional() }).parse(args ?? {});
+          const { days, city } = z.object({ days: z.number().int().min(1).max(7).default(3), city: z.string().optional() }).parse(args ?? {});
           const loc = await resolveLocation(city);
           return ok({ city: loc.city, forecast: await fetchForecast(loc.lat, loc.lon, days, loc.city) });
         } catch (e) {

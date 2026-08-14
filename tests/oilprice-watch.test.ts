@@ -77,6 +77,7 @@ function memoryRepository(initial?: OilPriceState): OilPriceStateRepository & { 
 }
 
 const baselineState: OilPriceState = {
+  schemaVersion: 1,
   initialized: true,
   province: "江西",
   unit: "元/升",
@@ -216,6 +217,7 @@ test("an all-zero window quietly advances the baseline after 48 hours without ba
   assert.equal(outcome, "baseline");
   assert.deepEqual(calls, []);
   assert.deepEqual(repository.value, {
+    schemaVersion: 1,
     initialized: true,
     province: "江西",
     unit: "元/升",
@@ -244,6 +246,7 @@ test("a complete late result quietly advances the baseline so the next window ca
   assert.equal(lateOutcome, "baseline");
   assert.deepEqual(calls, []);
   assert.deepEqual(repository.value, {
+    schemaVersion: 1,
     initialized: true,
     province: "江西",
     unit: "元/升",
@@ -363,4 +366,99 @@ test("the watch passes the detected province to the oil-price provider", async (
   });
 
   assert.deepEqual(fetched, { city: "朔城区", province: "山西省" });
+});
+
+test("after the window table is exhausted the watch keeps observing without throwing or advancing", async () => {
+  // 2027 年已超出 2026 窗口表：不发 advance 通知、不抛错，油价观测链路继续正常跑
+  const repository = memoryRepository();
+  const calls: string[] = [];
+  let fetched = false;
+  await runOilPriceWatch({
+    at: new Date("2027-01-05T01:00:00.000Z"),
+    getLocation: () => ({ city: "萍乡" }),
+    fetchPrice: async () => {
+      fetched = true;
+      return tianObservation();
+    },
+    repository,
+    publish: async (_source, _title, _body, dedupeKey) => { calls.push(dedupeKey); },
+  });
+
+  assert.equal(fetched, true);
+  assert.deepEqual(calls, []);
+  assert.equal(repository.value?.province, "江西");
+  assert.equal(repository.value?.schemaVersion, 1);
+});
+
+test("a corrupted persisted state is rebuilt as a baseline instead of failing daily", async () => {
+  // 旧格式/损坏 state（缺 schemaVersion、缺 p0 燃料）：校验失败后按不存在处理并重建 baseline
+  const repository = memoryRepository({
+    initialized: true,
+    province: "江西",
+    unit: "元/升",
+    provider: "TianAPI",
+    fuels: { p92: "7.93", p95: "8.51" } as Record<"p92" | "p95" | "p0", string>,
+    observedAt: "2026-08-07T09:00:00+08:00",
+  } as unknown as OilPriceState);
+  const errors: string[] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => { errors.push(args.map(String).join(" ")); };
+  try {
+    const outcome = await observeOilPrice(tianObservation(), {
+      observedAt: new Date("2026-08-08T01:00:00.000Z"),
+      repository,
+      publish: async () => {},
+    });
+    assert.equal(outcome, "baseline");
+    assert.equal(repository.value?.schemaVersion, 1);
+    assert.equal(repository.value?.observedAt, "2026-08-08T09:00:00+08:00");
+    assert.deepEqual(repository.value?.fuels, { p92: "7.93", p95: "8.51", p0: "7.69" });
+  } finally {
+    console.error = original;
+  }
+  assert.ok(errors.some((line) => line.includes("invalid persisted state; rebuilding baseline")));
+});
+
+test("a provider window date deviating from the static table warns but still observes", async () => {
+  // 观测窗口日与静态表最近窗口（2026-07-31）偏差超过 1 天：只 console.error 告警，不失败
+  const repository = memoryRepository();
+  const errors: string[] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => { errors.push(args.map(String).join(" ")); };
+  try {
+    const outcome = await observeOilPrice(
+      tianObservation({ windowDate: "2026-07-25", providerEffectiveDate: "2026-07-26" }),
+      {
+        observedAt: new Date("2026-08-07T01:00:00.000Z"),
+        repository,
+        publish: async () => {},
+      },
+    );
+    assert.equal(outcome, "baseline");
+  } finally {
+    console.error = original;
+  }
+  assert.ok(errors.some((line) => line.includes("provider window date deviates from static table")));
+});
+
+test("a provider window date within one day of the nearest table window stays silent", async () => {
+  // ±1 天容差：与静态表最近窗口相差 1 天的观测不应触发告警（last_adjusted 语义歧义）
+  const repository = memoryRepository();
+  const errors: string[] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => { errors.push(args.map(String).join(" ")); };
+  try {
+    const outcome = await observeOilPrice(
+      tianObservation({ windowDate: "2026-08-01", providerEffectiveDate: "2026-08-02" }),
+      {
+        observedAt: new Date("2026-08-07T01:00:00.000Z"),
+        repository,
+        publish: async () => {},
+      },
+    );
+    assert.equal(outcome, "baseline");
+  } finally {
+    console.error = original;
+  }
+  assert.equal(errors.length, 0);
 });

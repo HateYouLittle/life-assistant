@@ -72,7 +72,8 @@ test("TianAPI market validates prices and changes using exact cents", async () =
   const invalidCases = [
     { field: "price", value: "7.931", message: /p92\.price.*decimal/ },
     { field: "previous_price", value: "NaN", message: /p92\.previous_price.*decimal/ },
-    { field: "price_change", value: 0.54, message: /p92.*difference/ },
+    // 校验放宽为 ±1 分：0.54 相对 0.55 仅差 1 分会被接受，0.53 差 2 分仍拒绝
+    { field: "price_change", value: 0.53, message: /p92.*difference/ },
     { field: "price", value: 0, message: /p92\.price.*positive/ },
   ] as const;
 
@@ -114,7 +115,8 @@ test("TianAPI transport errors do not expose request URL query secrets", async (
       },
     }),
     (error: Error) => {
-      assert.equal(error.message, "TianAPI oil-price request failed");
+      // 传输层错误被内层 catch 转为固定文案，外层再附前缀；仍不暴露 URL 与密钥
+      assert.equal(error.message, "TianAPI oil-price failed: TianAPI oil-price request failed");
       assert.doesNotMatch(error.message, /fixture-secret-key/);
       assert.doesNotMatch(error.message, /\?key=/);
       return true;
@@ -222,5 +224,75 @@ test("an unconfigured oil-price provider fails explicitly", async () => {
   await assert.rejects(
     fetchOilPrice("萍乡", { tianapiKey: "", juheKey: "", httpJson: async () => ({}) }),
     /oil-price provider is not configured/,
+  );
+});
+
+test("city-to-province normalization covers the expanded prefecture map", () => {
+  const cases: Array<[string, string]> = [
+    ["徐州", "江苏"], ["常州", "江苏"], ["南通", "江苏"], ["扬州", "江苏"], ["盐城", "江苏"],
+    ["镇江", "江苏"], ["泰州", "江苏"], ["宿迁", "江苏"], ["淮安", "江苏"], ["连云港", "江苏"],
+    ["绍兴", "浙江"], ["嘉兴", "浙江"], ["金华", "浙江"], ["台州", "浙江"], ["湖州", "浙江"],
+    ["中山", "广东"], ["惠州", "广东"], ["江门", "广东"], ["汕头", "广东"],
+    ["绵阳", "四川"], ["德阳", "四川"], ["宜宾", "四川"], ["泸州", "四川"],
+    ["洛阳", "河南"], ["开封", "河南"], ["南阳", "河南"],
+    ["唐山", "河北"], ["保定", "河北"], ["邯郸", "河北"],
+    ["烟台", "山东"], ["潍坊", "山东"], ["临沂", "山东"],
+    ["泉州", "福建"], ["漳州", "福建"],
+    ["襄阳", "湖北"], ["宜昌", "湖北"],
+    ["株洲", "湖南"], ["湘潭", "湖南"],
+    ["芜湖", "安徽"], ["马鞍山", "安徽"],
+    ["桂林", "广西"], ["柳州", "广西"],
+    ["遵义", "贵州"], ["大理", "云南"], ["三亚", "海南"], ["包头", "内蒙古"],
+    ["香港", "香港"], ["澳门", "澳门"], ["台湾", "台湾"],
+  ];
+  for (const [city, province] of cases) {
+    assert.equal(provinceOf(city), province, `provinceOf(${city})`);
+  }
+  // 后缀剥离逻辑保持可用：新加入的省份名同样支持"省/市"后缀
+  assert.equal(provinceOf("香港特别行政区"), "香港");
+  assert.equal(provinceOf("台湾省"), "台湾");
+  assert.equal(provinceOf("徐州市"), "江苏");
+});
+
+test("TianAPI accepts a one-cent deviation between price difference and price_change", async () => {
+  const fixture = structuredClone(marketFixture);
+  fixture.result.p92.price_change = 0.54; // 7.93 - 7.38 = 0.55，允许 ±1 分偏差
+  const result = await fetchOilPrice("萍乡", {
+    tianapiKey: "fixture-key",
+    juheKey: "",
+    httpJson: async () => fixture,
+  });
+  assert.equal(result.fuels.p92.change, "0.54");
+});
+
+test("a JUHE fallback failure reports the captured TianAPI error", async () => {
+  await assert.rejects(
+    fetchOilPrice("萍乡", {
+      tianapiKey: "fixture-key",
+      juheKey: "fallback-key",
+      httpJson: async (url) => {
+        if (url.includes("tianapi")) throw new Error("fixture TianAPI failure");
+        return { reason: "KEY ERROR", error_code: 10001 };
+      },
+    }),
+    /JUHE oil-price query failed: 10001 KEY ERROR \(TianAPI: TianAPI oil-price request failed\)/,
+  );
+});
+
+test("an unknown province hints at location.detect in the not-configured error", async () => {
+  await assert.rejects(
+    fetchOilPrice("未知地名", { tianapiKey: "", juheKey: "", httpJson: async () => ({}) }),
+    /oil-price provider is not configured.*location\.detect/s,
+  );
+});
+
+test("an unknown province hints at location.detect when JUHE has no coverage", async () => {
+  await assert.rejects(
+    fetchOilPrice("未知地名", {
+      tianapiKey: "",
+      juheKey: "fallback-key",
+      httpJson: async () => structuredClone(juheFixture),
+    }),
+    /does not cover 未知地名.*location\.detect/s,
   );
 });

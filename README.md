@@ -39,7 +39,7 @@ Hermes Profile -> stdio MCP -> 查询工具 / Profile 私有日程
 
 ## 安装
 
-要求 Node.js >= 22.5 和已安装的 Hermes CLI。
+要求 Node.js >= 22.13（`node:sqlite` 从该版本起无需 `--experimental-sqlite` flag）和已安装的 Hermes CLI。
 
 ```bash
 npm install
@@ -200,7 +200,7 @@ set +a
 npm run start:scheduler
 ```
 
-生产环境推荐由 systemd 托管。先确认 Node >= 22.5，并取得实际 Node 可执行文件的绝对路径：
+生产环境推荐由 systemd 托管。先确认 Node >= 22.13（`node:sqlite` 免 flag 的最低版本），并取得实际 Node 可执行文件的绝对路径：
 
 ```bash
 node --version

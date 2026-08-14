@@ -4,6 +4,7 @@ import { DateTime } from "luxon";
 import { Lunar, LunarYear } from "lunar-javascript";
 import { getDatabase } from "../../core/database.js";
 import { requireProfileContext, type ProfileContext } from "../../core/profile.js";
+import { config } from "../../config.js";
 import type {
   CalendarType,
   Frequency,
@@ -20,8 +21,9 @@ import type {
 } from "./types.js";
 
 const { RRule } = rrulePkg as unknown as { RRule: any };
-const DEFAULT_ZONE = "Asia/Shanghai";
+const DEFAULT_ZONE = config.timezone;
 const DEFAULT_TIME = "09:00";
+const VALID_FREQUENCIES = ["once", "daily", "weekly", "monthly", "yearly"];
 const VALID_PROFILE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 type ValidDateTime = DateTime<true>;
 
@@ -41,6 +43,59 @@ function parseJson<T>(value: unknown, fallback: T): T {
   } catch {
     return fallback;
   }
+}
+
+/** hydration 兜底：recurrence_json 形状/取值非法时回退安全默认，避免下游崩溃（P1-07）。 */
+function sanitizeRecurrence(raw: unknown, calendar: CalendarType): RecurrenceRule {
+  const fallback: RecurrenceRule = { frequency: "once", interval: 1, calendar };
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return fallback;
+  const candidate = raw as Record<string, unknown>;
+  if (typeof candidate.frequency !== "string" || !VALID_FREQUENCIES.includes(candidate.frequency as Frequency)) {
+    return fallback;
+  }
+  const interval = candidate.interval;
+  // 可选字段一律做类型/取值强制，非法即丢弃，杜绝损坏行再次进入 RRule/luxon 崩溃路径
+  const until = typeof candidate.until === "string" && /^\d{4}-\d{2}-\d{2}$/.test(candidate.until)
+    ? candidate.until
+    : undefined;
+  const count = Number.isInteger(candidate.count) && (candidate.count as number) >= 1
+    ? candidate.count as number
+    : undefined;
+  const byMonthDay = Number.isInteger(candidate.byMonthDay)
+    && (candidate.byMonthDay as number) >= 1
+    && (candidate.byMonthDay as number) <= 31
+    ? candidate.byMonthDay as number
+    : undefined;
+  const byWeekday = Array.isArray(candidate.byWeekday)
+    ? candidate.byWeekday.filter((day): day is string =>
+      typeof day === "string" && ["SU", "MO", "TU", "WE", "TH", "FR", "SA"].includes(day))
+    : undefined;
+  return {
+    frequency: candidate.frequency as Frequency,
+    interval: Number.isInteger(interval) && (interval as number) >= 1 ? (interval as number) : 1,
+    ...(byWeekday && byWeekday.length > 0 ? { byWeekday } : {}),
+    ...(byMonthDay !== undefined ? { byMonthDay } : {}),
+    ...(until !== undefined ? { until } : {}),
+    ...(count !== undefined ? { count } : {}),
+    calendar,
+  };
+}
+
+/** hydration 兜底：reminders_json 非数组时给默认提醒；数组内逐条过滤非对象项并归一化（P1-07）。 */
+function sanitizeReminders(raw: unknown): ReminderInput[] {
+  if (!Array.isArray(raw)) return [{ minutesBefore: 0, id: "reminder-1", target: "occurrence" }];
+  return raw
+    .filter((entry): entry is Record<string, unknown> =>
+      typeof entry === "object" && entry !== null && !Array.isArray(entry))
+    .map((entry, index) => ({
+      id: typeof entry.id === "string" && entry.id ? entry.id : `reminder-${index + 1}`,
+      minutesBefore: Number.isInteger(entry.minutesBefore)
+        && (entry.minutesBefore as number) >= 0
+        && (entry.minutesBefore as number) <= 60 * 24 * 365
+        ? entry.minutesBefore as number
+        : 0,
+      target: entry.target === "deadline" ? "deadline" : "occurrence",
+    }));
 }
 
 function assertDate(value: string | undefined, field: string): void {
@@ -93,6 +148,10 @@ function normalizeRecurrence(input: ScheduleInput, calendar: CalendarType, type:
   const frequency = (raw.frequency ?? (type === "birthday" || type === "anniversary" || calendar === "lunar" ? "yearly" : "once")) as Frequency;
   if (!["once", "daily", "weekly", "monthly", "yearly"].includes(frequency)) throw new Error("unsupported recurrence frequency");
   if (calendar === "lunar" && frequency !== "yearly") throw new Error("lunar schedules currently support yearly recurrence only");
+  // P2-11：count 与 until 互斥，避免 RRule 语义歧义。
+  if (raw.count !== undefined && raw.until !== undefined) {
+    throw new Error("count and until are mutually exclusive");
+  }
   const policy = input.leapMonthPolicy ?? (input.isLeapMonth ? "leap" : "normal");
   return {
     frequency,
@@ -113,11 +172,15 @@ function normalizeReminders(value: ReminderInput[] | undefined): ReminderInput[]
       throw new Error("reminder minutesBefore must be an integer between 0 and 525600");
     }
   }
-  return reminders.map((reminder, index) => ({
+  const normalized = reminders.map((reminder, index) => ({
     id: reminder.id ?? `reminder-${index + 1}`,
     minutesBefore: reminder.minutesBefore,
     target: reminder.target ?? "occurrence",
   }));
+  // P2-10：提醒 id 必须唯一，dedupe 键依赖 id 区分同一 occurrence 的不同提醒。
+  const ids = normalized.map((reminder) => reminder.id);
+  if (new Set(ids).size !== ids.length) throw new Error("reminder ids must be unique");
+  return normalized;
 }
 
 function normalizeDeadline(
@@ -329,29 +392,55 @@ export function calculateNextRun(item: ScheduleItem, from: ValidDateTime = DateT
   return candidates[0] ?? null;
 }
 
+/**
+ * recurring 日程在创建/更新时刻的初始触发集合（P1-09 窗口内补发）。
+ * 与 nextReminderTiming 不同：只要求目标时刻（occurrence 或 deadline 的 targetAt）
+ * 仍在 from 之后，允许 triggerAt 落在过去，使 nextRunAt <= now 时下一分钟
+ * scheduler tick 立即补发窗口内被静默跳过的提醒；schedule_occurrences 的
+ * occurrence_key 去重保证 at-least-once 不重复。
+ * 搜索窗口 = from - targetOffset（target 相对 occurrence 的偏移：
+ * occurrence 提醒为 0，deadline 提醒为 deadlineOffsetMinutes），
+ * 首个满足 targetAt >= from 的 occurrence 即目标。
+ */
+function initialCatchUpTriggers(item: ScheduleItem, from: ValidDateTime): ValidDateTime[] {
+  const triggers = item.reminders.flatMap((reminder) => {
+    const target = reminder.target ?? "occurrence";
+    const targetOffset = target === "deadline" && item.deadlineOffsetMinutes !== undefined
+      ? item.deadlineOffsetMinutes
+      : 0;
+    const occurrenceAt = findOccurrence(
+      item,
+      from.minus({ minutes: targetOffset }) as ValidDateTime,
+      true,
+    );
+    if (!occurrenceAt) return [];
+    const timing = reminderTiming(item, occurrenceAt, reminder);
+    return timing && timing.targetAt.toMillis() >= from.toMillis() ? [timing.triggerAt] : [];
+  });
+  return triggers.sort((a, b) => a.toMillis() - b.toMillis());
+}
+
 function calculateInitialNextRun(
   item: ScheduleItem,
   occurrence: ValidDateTime | null,
   from: ValidDateTime,
 ): ValidDateTime | null {
-  if (item.recurrence.frequency !== "once" || !occurrence) {
-    return calculateNextRun(item, from, true);
+  // once：单一 occurrence 的全部 trigger 恒返回（即使事件已过），保持既有行为。
+  if (item.recurrence.frequency === "once") {
+    if (!occurrence) return null;
+    const triggers = item.reminders
+      .map((reminder) => reminderTiming(item, occurrence, reminder)?.triggerAt)
+      .filter((trigger): trigger is ValidDateTime => trigger !== undefined)
+      .sort((a, b) => a.toMillis() - b.toMillis());
+    return triggers[0] ?? null;
   }
-  const triggers = item.reminders
-    .map((reminder) => reminderTiming(item, occurrence, reminder)?.triggerAt)
-    .filter((trigger): trigger is ValidDateTime => trigger !== undefined)
-    .sort((a, b) => a.toMillis() - b.toMillis());
-  return triggers[0] ?? null;
+  // recurring：允许窗口内补发，见 initialCatchUpTriggers。
+  return initialCatchUpTriggers(item, from)[0] ?? null;
 }
 
 function rowToItem(row: Record<string, unknown>): ScheduleItem {
-  const recurrence = parseJson<RecurrenceRule>(row.recurrence_json, {
-    frequency: "once",
-    interval: 1,
-    calendar: String(row.calendar) as CalendarType,
-  });
-  const reminders = parseJson<ReminderInput[]>(row.reminders_json, [{ minutesBefore: 0, id: "reminder-1" }])
-    .map((reminder) => ({ ...reminder, target: reminder.target ?? "occurrence" }));
+  const recurrence = sanitizeRecurrence(parseJson(row.recurrence_json, null), String(row.calendar) as CalendarType);
+  const reminders = sanitizeReminders(parseJson(row.reminders_json, null));
   const item: ScheduleItem = {
     id: String(row.id),
     profileId: String(row.profile_id),
@@ -477,6 +566,14 @@ export function getSchedule(value: ProfileContext | string, id: string): Schedul
 export function updateSchedule(value: ProfileContext | string, id: string, changes: Partial<ScheduleInput>): ScheduleItem {
   const profile = context(value);
   const current = getSchedule(profile, id);
+  const { recurrence: recurrenceChange, ...restChanges } = changes;
+  // P2-12：recurrence 为 plain object 时与现有规则深合并（部分更新）；
+  // 为字符串枚举（如 "daily"）时整体替换频率规则。
+  const mergedRecurrence: ScheduleInput["recurrence"] = recurrenceChange === undefined
+    ? current.recurrence
+    : typeof recurrenceChange === "string"
+      ? recurrenceChange
+      : { ...current.recurrence, ...recurrenceChange };
   const merged: ScheduleInput = {
     type: current.type,
     title: current.title,
@@ -492,11 +589,11 @@ export function updateSchedule(value: ProfileContext | string, id: string, chang
     lunarDay: current.lunarDay,
     isLeapMonth: current.isLeapMonth,
     leapMonthPolicy: current.recurrence.leapMonthPolicy,
-    recurrence: current.recurrence,
+    recurrence: mergedRecurrence,
     reminders: current.reminders,
     deadlineAt: current.deadlineAt,
     deadlineOffsetMinutes: current.deadlineOffsetMinutes,
-    ...changes,
+    ...restChanges,
   };
   const normalized = normalizeInput(merged);
   const updatedAt = nowIso();

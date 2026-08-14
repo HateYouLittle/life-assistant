@@ -73,6 +73,7 @@ test("clearDeadline removes old deadline state before changing deadline modes", 
     calendar: "solar",
     date: "2099-02-01",
     time: "09:00",
+    timezone: "Asia/Shanghai",
     deadlineAt: "2099-02-01T10:00",
   });
 
@@ -92,6 +93,7 @@ test("clearDeadline removes old deadline state before changing deadline modes", 
     title: "explicitly no deadline",
     calendar: "solar",
     date: "2099-02-02",
+    timezone: "Asia/Shanghai",
     deadlineAt: "2099-02-02T10:00",
     clearDeadline: true,
   });
@@ -106,6 +108,7 @@ test("clearDeadline rejects schedules whose reminders still target the deadline"
     title: "deadline reminder must be adjusted first",
     calendar: "solar",
     date: "2099-02-03",
+    timezone: "Asia/Shanghai",
     deadlineAt: "2099-02-03T10:00",
     reminders: [{ id: "due", minutesBefore: 0, target: "deadline" }],
   });
@@ -149,6 +152,31 @@ test("deadline validation rejects unsupported combinations before persistence", 
     date: "2099-01-01",
     reminders: [{ minutesBefore: 0, target: "deadline" }],
   }), /deadline target requires a deadline/);
+});
+
+test("duplicate reminder ids are rejected before persistence", () => {
+  const profile = requireProfileContext("deadline-profile");
+  assert.throws(() => scheduleService.createSchedule(profile, {
+    title: "duplicate reminder ids",
+    calendar: "solar",
+    date: "2099-02-05",
+    timezone: "Asia/Shanghai",
+    reminders: [
+      { id: "same", minutesBefore: 0 },
+      { id: "same", minutesBefore: 10 },
+    ],
+  }), /reminder ids must be unique/);
+});
+
+test("recurrence count and until are mutually exclusive", () => {
+  const profile = requireProfileContext("deadline-profile");
+  assert.throws(() => scheduleService.createSchedule(profile, {
+    title: "count with until",
+    calendar: "solar",
+    date: "2099-02-06",
+    timezone: "Asia/Shanghai",
+    recurrence: { frequency: "daily", count: 3, until: "2099-03-01" },
+  }), /count and until are mutually exclusive/);
 });
 
 test("absolute deadlines use the item timezone and cannot precede the occurrence", () => {

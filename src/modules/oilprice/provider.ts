@@ -45,13 +45,30 @@ const CITY_TO_PROVINCE: Record<string, string> = {
   鹰潭: "江西",
   北京: "北京", 上海: "上海", 天津: "天津", 重庆: "重庆",
   广州: "广东", 深圳: "广东", 东莞: "广东", 佛山: "广东", 珠海: "广东",
-  杭州: "浙江", 宁波: "浙江", 温州: "浙江", 南京: "江苏", 苏州: "江苏",
-  无锡: "江苏", 武汉: "湖北", 长沙: "湖南", 成都: "四川", 郑州: "河南",
-  济南: "山东", 青岛: "山东", 福州: "福建", 厦门: "福建", 西安: "陕西",
-  昆明: "云南", 贵阳: "贵州", 合肥: "安徽", 石家庄: "河北", 太原: "山西",
+  中山: "广东", 惠州: "广东", 江门: "广东", 汕头: "广东",
+  杭州: "浙江", 宁波: "浙江", 温州: "浙江", 绍兴: "浙江", 嘉兴: "浙江",
+  金华: "浙江", 台州: "浙江", 湖州: "浙江",
+  南京: "江苏", 苏州: "江苏", 无锡: "江苏", 徐州: "江苏", 常州: "江苏",
+  南通: "江苏", 扬州: "江苏", 盐城: "江苏", 镇江: "江苏", 泰州: "江苏",
+  宿迁: "江苏", 淮安: "江苏", 连云港: "江苏",
+  武汉: "湖北", 襄阳: "湖北", 宜昌: "湖北",
+  长沙: "湖南", 株洲: "湖南", 湘潭: "湖南",
+  成都: "四川", 绵阳: "四川", 德阳: "四川", 宜宾: "四川", 泸州: "四川",
+  郑州: "河南", 洛阳: "河南", 开封: "河南", 南阳: "河南",
+  济南: "山东", 青岛: "山东", 烟台: "山东", 潍坊: "山东", 临沂: "山东",
+  福州: "福建", 厦门: "福建", 泉州: "福建", 漳州: "福建",
+  西安: "陕西",
+  昆明: "云南", 大理: "云南",
+  贵阳: "贵州", 遵义: "贵州",
+  合肥: "安徽", 芜湖: "安徽", 马鞍山: "安徽",
+  石家庄: "河北", 唐山: "河北", 保定: "河北", 邯郸: "河北",
+  太原: "山西",
   沈阳: "辽宁", 大连: "辽宁", 长春: "吉林", 哈尔滨: "黑龙江", 兰州: "甘肃",
   银川: "宁夏", 西宁: "青海", 拉萨: "西藏", 乌鲁木齐: "新疆",
-  呼和浩特: "内蒙古", 南宁: "广西", 海口: "海南",
+  呼和浩特: "内蒙古", 包头: "内蒙古",
+  南宁: "广西", 桂林: "广西", 柳州: "广西",
+  海口: "海南", 三亚: "海南",
+  香港: "香港", 澳门: "澳门", 台湾: "台湾",
 };
 
 /** Normalize a saved city/district name to the province names used by both providers. */
@@ -108,8 +125,10 @@ function adjustmentFuel(value: unknown, key: FuelKey): AdjustmentFuelPrice {
   const current = decimalCents(raw.price, `${key}.price`, true);
   const previous = decimalCents(raw.previous_price, `${key}.previous_price`, true);
   const change = decimalCents(raw.price_change, `${key}.price_change`, false);
-  if (current.cents - previous.cents !== change.cents) {
-    throw new Error(`${key} exact cents difference does not match price_change`);
+  // 精确到分校验放宽 ±1 分：部分数据源四舍五入口径不同，允许 1 分偏差
+  const delta = (current.cents - previous.cents) - change.cents;
+  if (delta > 1n || delta < -1n) {
+    throw new Error(`${key} cents difference does not match price_change within one cent`);
   }
   return { current: current.text, previous: previous.text, change: change.text };
 }
@@ -119,6 +138,10 @@ function currentFuel(value: unknown, field: string): CurrentFuelPrice {
 }
 
 type HttpJson = (url: string) => Promise<unknown>;
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
 
 export interface FetchOilPriceOptions {
   province?: string;
@@ -132,7 +155,10 @@ export async function fetchOilPrice(city: string, options: FetchOilPriceOptions 
   const juheKey = options.juheKey ?? config.juheKey;
   const httpJson = options.httpJson ?? defaultHttpJson as HttpJson;
   const province = options.province === undefined ? provinceOf(city) : provinceOf(options.province);
+  // 省名未知时的排查提示：先用 location.detect 解析并随位置保存 province
+  const provinceHint = province ? "" : "；省名未知，请用 location.detect 解析所在省并随位置保存 province";
 
+  let tianError: unknown;
   if (tianapiKey && province) {
     try {
       let response: Record<string, unknown>;
@@ -143,7 +169,7 @@ export async function fetchOilPrice(city: string, options: FetchOilPriceOptions 
       } catch {
         throw new Error("TianAPI oil-price request failed");
       }
-      if (response.code !== 200) throw new Error(String(response.msg ?? `TianAPI returned code=${response.code}`));
+      if (Number(response.code) !== 200) throw new Error(String(response.msg ?? `TianAPI returned code=${response.code}`));
       if (!response.result || typeof response.result !== "object") throw new Error("TianAPI market result is missing");
       const result = response.result as Record<string, unknown>;
       const providerEffective = providerDate(result.last_adjusted, "last_adjusted");
@@ -168,7 +194,9 @@ export async function fetchOilPrice(city: string, options: FetchOilPriceOptions 
         },
       };
     } catch (error) {
-      if (!juheKey) throw error;
+      // 捕获 Tian 错误；无 JUHE 兜底时直接抛出，否则保留给 JUHE 失败信息追加
+      if (!juheKey) throw new Error(`TianAPI oil-price failed: ${errorMessage(error)}`);
+      tianError = error;
     }
   }
 
@@ -179,19 +207,23 @@ export async function fetchOilPrice(city: string, options: FetchOilPriceOptions 
         `https://apis.juhe.cn/gnyj/query?key=${encodeURIComponent(juheKey)}`,
       ) as Record<string, unknown>;
     } catch {
-      throw new Error("JUHE oil-price request failed");
+      throw new Error(`JUHE oil-price request failed${tianError ? ` (TianAPI: ${errorMessage(tianError)})` : ""}`);
     }
     const succeeded = response.error_code === 0;
     if (!succeeded || !Array.isArray(response.result)) {
       const code = response.error_code ?? response.resultcode ?? "missing result";
-      throw new Error(`JUHE oil-price query failed: ${String(code)} ${String(response.reason ?? "")}`.trim());
+      throw new Error(
+        `JUHE oil-price query failed: ${String(code)} ${String(response.reason ?? "")}${tianError ? ` (TianAPI: ${errorMessage(tianError)})` : ""}`.trim(),
+      );
     }
     const hit = response.result.find((item) => {
       if (!item || typeof item !== "object") return false;
       const candidate = (item as Record<string, unknown>).city;
       return typeof candidate === "string" && (candidate === province || candidate === city.trim());
     }) as Record<string, unknown> | undefined;
-    if (!hit || typeof hit.city !== "string") throw new Error(`oil-price provider does not cover ${province ?? city}`);
+    if (!hit || typeof hit.city !== "string") {
+      throw new Error(`oil-price provider does not cover ${province ?? city}${provinceHint}`);
+    }
     return {
       adjustmentEvidence: false,
       province: hit.city,
@@ -206,5 +238,5 @@ export async function fetchOilPrice(city: string, options: FetchOilPriceOptions 
     };
   }
 
-  throw new Error("oil-price provider is not configured; set TIANAPI_KEY or JUHE_KEY");
+  throw new Error(`oil-price provider is not configured; set TIANAPI_KEY or JUHE_KEY${provinceHint}`);
 }

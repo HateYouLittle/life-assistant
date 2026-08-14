@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { DateTime } from "luxon";
 
 const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "life-assistant-scheduler-deadline-"));
 process.env.DATA_DIR = dataDir;
@@ -223,4 +224,32 @@ test("retry after occurrence persistence failure reuses notification dedupe", as
     SELECT COUNT(*) AS count FROM schedule_occurrences
     WHERE profile_id = ? AND schedule_id = ?
   `).get(profile.id, item.id) as { count: number }).count, 1);
+});
+
+test("recurring schedules created inside the reminder window catch up the missed trigger", async () => {
+  db.prepare("UPDATE schedules SET enabled = 0").run();
+  // 事件时间取"当前 +45 分钟"：提前 60 分钟的触发时刻已过，但目标时刻仍在未来 →
+  // nextRunAt 应回拨到过去的触发时刻，由下一分钟 scheduler tick 立即补发。
+  const nowUtc = DateTime.utc();
+  const eventTime = nowUtc.setZone("Asia/Shanghai").plus({ minutes: 45 }).startOf("minute");
+  const item = createSchedule(profile, {
+    title: "window catch-up",
+    calendar: "solar",
+    date: eventTime.toFormat("yyyy-MM-dd"),
+    time: eventTime.toFormat("HH:mm"),
+    timezone: "Asia/Shanghai",
+    recurrence: "daily",
+    reminders: [{ id: "early", minutesBefore: 60 }],
+  });
+  const expectedTrigger = eventTime.minus({ minutes: 60 }).toUTC();
+  assert.ok(item.nextRunAt, "窗口内创建必须产生 nextRunAt");
+  const nextRun = DateTime.fromISO(item.nextRunAt!, { zone: "utc" });
+  assert.equal(nextRun.toISO(), expectedTrigger.toISO(), "nextRunAt 应为已过的触发时刻（当天提前 60 分钟）");
+  assert.ok(nextRun.toMillis() <= DateTime.utc().toMillis(), "nextRunAt 必须落在过去以便下一 tick 补发");
+
+  // 下一 tick 立即补发窗口内提醒（schedule_occurrences 去重保证不重复）。
+  await runDueSchedules(new Date());
+  const rows = notices(item.id);
+  assert.equal(rows.length, 1);
+  assert.match(String(rows[0].dedupe_key), /:occurrence:early$/);
 });

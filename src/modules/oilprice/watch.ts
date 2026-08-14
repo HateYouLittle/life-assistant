@@ -10,7 +10,7 @@ import {
   type FuelKey,
   type OilPriceObservation,
 } from "./provider.js";
-import { nextWindow } from "./schedule.js";
+import { nearestWindowDeviationDays, nextWindow } from "./schedule.js";
 
 const BUSINESS_TIMEZONE = "Asia/Shanghai";
 const FUEL_KEYS: FuelKey[] = ["p92", "p95", "p0"];
@@ -24,6 +24,7 @@ type GlobalPublisher = (
 ) => Promise<void>;
 
 export interface OilPriceState {
+  schemaVersion: 1;
   initialized: true;
   province: string;
   unit: "元/升";
@@ -69,6 +70,32 @@ function currentFuels(observation: OilPriceObservation): Record<FuelKey, string>
   return result;
 }
 
+/**
+ * 校验持久化 state 的形状：schemaVersion 1、必填字符串字段、油价为两位小数正价格、
+ * 可选字段为 string 或缺失。用于识别损坏/旧格式的持久化数据，避免每日 TypeError 死循环。
+ */
+export function isValidOilPriceState(state: unknown): state is OilPriceState {
+  if (!state || typeof state !== "object") return false;
+  const candidate = state as Record<string, unknown>;
+  if (candidate.schemaVersion !== 1) return false;
+  if (candidate.initialized !== true) return false;
+  if (typeof candidate.province !== "string") return false;
+  if (candidate.unit !== "元/升") return false;
+  if (typeof candidate.provider !== "string") return false;
+  if (typeof candidate.observedAt !== "string") return false;
+  const fuels = candidate.fuels;
+  if (!fuels || typeof fuels !== "object") return false;
+  for (const key of FUEL_KEYS) {
+    const price = (fuels as Record<string, unknown>)[key];
+    if (typeof price !== "string" || !/^\d+\.\d{2}$/.test(price)) return false;
+  }
+  for (const field of ["providerEffectiveDate", "windowDate", "lastProcessedWindow"] as const) {
+    const value = candidate[field];
+    if (value !== undefined && typeof value !== "string") return false;
+  }
+  return true;
+}
+
 function cents(value: string): bigint | undefined {
   if (!/^-?\d+\.\d{2}$/.test(value)) return undefined;
   const negative = value.startsWith("-");
@@ -107,6 +134,7 @@ function baseline(observation: OilPriceObservation, at: Date, lastProcessedWindo
   const fuels = currentFuels(observation);
   if (!fuels) return undefined;
   const state: OilPriceState = {
+    schemaVersion: 1,
     initialized: true,
     province: observation.province,
     unit: observation.unit,
@@ -132,8 +160,24 @@ export async function observeOilPrice(
     publish?: GlobalPublisher;
   },
 ): Promise<OilPriceObservationOutcome> {
+  // 与静态窗口表交叉校验：Provider 的 windowDate 应贴近表中最近窗口（±1 天容差），
+  // 偏差过大只告警不失败（覆盖 last_adjusted 语义歧义与表漂移两类风险）。
+  if (observation.adjustmentEvidence && observation.windowDate) {
+    const deviation = nearestWindowDeviationDays(observation.windowDate);
+    if (deviation !== null && deviation > 1) {
+      console.error(
+        `[oilprice] provider window date deviates from static table by ${Math.round(deviation)}d: observed ${observation.windowDate}`,
+      );
+    }
+  }
+
   const repository = options.repository ?? oilPriceStateRepository;
-  const state = repository.get(observation.province);
+  let state = repository.get(observation.province);
+  if (state && !isValidOilPriceState(state)) {
+    // 损坏或旧格式的持久化 state：记录错误后按不存在处理，重建 baseline，避免每日 TypeError 死循环
+    console.error("[oilprice] invalid persisted state; rebuilding baseline");
+    state = undefined;
+  }
   if (!state) {
     const initial = baseline(observation, options.observedAt);
     if (!initial) return "retry";
@@ -201,7 +245,12 @@ export async function runOilPriceWatch(options: OilPriceWatchOptions = {}): Prom
   const publish = options.publish ?? publishGlobal;
   const errors: unknown[] = [];
   const window = nextWindow(at);
-  if (window && window.hoursUntil < 40) {
+  if (!window) {
+    // 窗口表已用尽：仅关闭 advance 通知，油价观测与正式结果链路继续正常跑
+    console.error(
+      "[oilprice] adjustment window table exhausted; advance notices disabled — update ADJUSTMENT_WINDOWS in src/modules/oilprice/schedule.ts",
+    );
+  } else if (window.hoursUntil < 40) {
     try {
       await publishNotification(advanceNoticeNotification({
         windowDate: window.date,

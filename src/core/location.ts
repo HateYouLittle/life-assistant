@@ -16,10 +16,10 @@ export interface Location {
 const KEY = "location:current";
 
 export const locationSetSchema = z.object({
-  city: z.string(),
+  city: z.string().min(1).max(64),
   province: z.string().optional(),
-  lat: z.number(),
-  lon: z.number(),
+  lat: z.number().min(-90).max(90),
+  lon: z.number().min(-180).max(180),
 });
 
 /** 获取已确认位置；未确认返回 null */
@@ -82,7 +82,14 @@ const locationModule: AssistantModule = {
               `https://${config.qweatherApiHost}/geo/v2/city/lookup?location=${encodeURIComponent(city)}&key=${config.qweatherKey}`,
             );
             const hit = geo.location?.[0];
-            if (hit) return ok({ city: hit.name, province: hit.adm1, lat: Number(hit.lat), lon: Number(hit.lon) });
+            if (hit) {
+              const lat = Number(hit.lat);
+              const lon = Number(hit.lon);
+              // 坐标非有限数或越界则跳过该命中，继续走 Open-Meteo 兜底
+              if (Number.isFinite(lat) && Number.isFinite(lon) && lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180) {
+                return ok({ city: hit.name, province: hit.adm1, lat, lon });
+              }
+            }
           } catch { /* 和风失败则走 Open-Meteo */ }
         }
         const r = await httpJson<{
@@ -92,7 +99,13 @@ const locationModule: AssistantModule = {
         );
         const hit = r.results?.[0];
         if (!hit) return fail(`未找到城市：${city}`);
-        return ok({ city: hit.name, province: hit.admin1, lat: hit.latitude, lon: hit.longitude });
+        const lat = hit.latitude;
+        const lon = hit.longitude;
+        // 坐标非有限数或越界 → 该城市不可用，返回 fail
+        if (!Number.isFinite(lat) || !Number.isFinite(lon) || lat < -90 || lat > 90 || lon < -180 || lon > 180) {
+          return fail(`城市坐标无效：${city}`);
+        }
+        return ok({ city: hit.name, province: hit.admin1, lat, lon });
       },
     },
     {

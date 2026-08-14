@@ -119,8 +119,20 @@ function dueRows(at: Date, cursor?: DueCursor): Record<string, unknown>[] {
 
 async function processDue(item: ScheduleItem, at: DateTime<true>): Promise<void> {
   if (!item.nextRunAt) return;
-  const triggerAt = DateTime.fromISO(item.nextRunAt, { zone: "utc" }).toUTC() as DateTime<true>;
   const db = getDatabase();
+  // 发布前重读版本：若 MCP 工具已并发修改（版本推进），放弃陈旧快照，
+  // 下个 tick 会用新版本重新评估，避免按过期内容发布提醒。
+  const fresh = db.prepare(
+    "SELECT version FROM schedules WHERE profile_id = ? AND id = ?",
+  ).get(item.profileId, item.id) as { version: number } | undefined;
+  if (!fresh || fresh.version !== item.version) {
+    console.warn(
+      `[schedule] skipped stale snapshot ${item.profileId}/${item.id} ` +
+        `(db version ${fresh?.version ?? "missing"} != snapshot version ${item.version})`,
+    );
+    return;
+  }
+  const triggerAt = DateTime.fromISO(item.nextRunAt, { zone: "utc" }).toUTC() as DateTime<true>;
   const reminders = item.reminders.length ? item.reminders : [{ id: "reminder-1", minutesBefore: 0 }];
   for (let index = 0; index < reminders.length; index += 1) {
     const reminder = reminders[index];
@@ -165,7 +177,7 @@ async function processDue(item: ScheduleItem, at: DateTime<true>): Promise<void>
   }
 
   const nextRun = calculateNextIncompleteRun(item, at.plus({ milliseconds: 1 }) as DateTime<true>);
-  db.prepare("UPDATE schedules SET next_run_at = ?, enabled = ?, status = ?, version = version + 1, updated_at = ? WHERE profile_id = ? AND id = ? AND version = ?").run(
+  const updated = db.prepare("UPDATE schedules SET next_run_at = ?, enabled = ?, status = ?, version = version + 1, updated_at = ? WHERE profile_id = ? AND id = ? AND version = ?").run(
     nextRun?.toISO() ?? null,
     nextRun ? 1 : 0,
     nextRun ? item.status : "completed",
@@ -173,7 +185,13 @@ async function processDue(item: ScheduleItem, at: DateTime<true>): Promise<void>
     item.profileId,
     item.id,
     item.version,
-  );
+  ) as { changes: number };
+  if (updated.changes !== 1) {
+    console.warn(
+      `[schedule] version conflict updating ${item.profileId}/${item.id}: ` +
+        "a concurrent update won; a stale notification may have been published and will not repeat",
+    );
+  }
 }
 
 export async function runDueSchedules(at = new Date()): Promise<void> {
@@ -276,14 +294,22 @@ export function startScheduler(): SchedulerHandle {
       console.log(`[scheduler] registered ${module.name}.${job.name} cron="${job.cron}"`);
     }
   }
+  let tickRunning = false;
   tasks.push(cron.schedule("* * * * *", async () => {
-    await runFenced(async () => {
-      try {
-        await runSchedulerTick();
-      } catch (error) {
-        console.error("[job schedule.tick] failed:", error);
-      }
-    });
+    // 投递最坏 100×10s，比 tick 周期长；跳过重叠 tick 避免故障期负载放大。
+    if (tickRunning) return;
+    tickRunning = true;
+    try {
+      await runFenced(async () => {
+        try {
+          await runSchedulerTick();
+        } catch (error) {
+          console.error("[job schedule.tick] failed:", error);
+        }
+      });
+    } finally {
+      tickRunning = false;
+    }
   }));
   console.log(`[scheduler] started, ${tasks.length} jobs from ${getModules().length} modules.`);
   return {
@@ -295,6 +321,11 @@ export function startScheduler(): SchedulerHandle {
 
 async function main(): Promise<void> {
   const handle = startScheduler();
+  if (!handle.started) {
+    console.error("[scheduler] lease not acquired: another scheduler owns this DATA_DIR; exiting (retry after lease TTL).");
+    process.exitCode = 1;
+    return;
+  }
   const shutdown = (): void => {
     handle.stop();
     process.exitCode = 0;

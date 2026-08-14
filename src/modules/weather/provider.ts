@@ -119,9 +119,14 @@ export async function fetchCurrent(lat: number, lon: number, city?: string): Pro
   if (config.qweatherKey) {
     try {
       const loc = city ? await qweatherGeo(city) : null;
-      const r = await httpJson<{ now?: { temp: string; feelsLike: string; humidity: string; windSpeed: string; text: string; icon: string } }>(
-        `https://${config.qweatherApiHost}/v7/weather/now?location=${loc?.id ?? `${lat.toFixed(2)},${lon.toFixed(2)}`}&key=${config.qweatherKey}`,
+      // 和风 v7 location 查询参数格式为 "经度,纬度"（lon,lat），与 weatheralert 路径 /current/{lat}/{lon} 相反
+      const r = await httpJson<{ code?: string; now?: { temp: string; feelsLike: string; humidity: string; windSpeed: string; text: string; icon: string } }>(
+        `https://${config.qweatherApiHost}/v7/weather/now?location=${loc?.id ?? `${lon.toFixed(2)},${lat.toFixed(2)}`}&key=${config.qweatherKey}`,
       );
+      // 和风业务错误：HTTP 200 + code 字段（如 401/402/403）→ 抛出后走 Open-Meteo 降级
+      if (typeof r.code === "string" && r.code !== "200") {
+        throw new Error(`QWeather weathernow error code ${r.code}`);
+      }
       if (r.now) {
         return {
           temperature: Number(r.now.temp),
@@ -155,16 +160,22 @@ export async function fetchForecast(lat: number, lon: number, days = 3, city?: s
     try {
       const loc = city ? await qweatherGeo(city) : null;
       const daysKey = days <= 3 ? "3d" : "7d";
-      const r = await httpJson<{ daily?: Array<{ fxDate: string; tempMax: string; tempMin: string; textDay: string; iconDay: string; precip: string }> }>(
-        `https://${config.qweatherApiHost}/v7/weather/${daysKey}?location=${loc?.id ?? `${lat.toFixed(2)},${lon.toFixed(2)}`}&key=${config.qweatherKey}`,
+      // 和风 v7 location 查询参数格式为 "经度,纬度"（lon,lat）
+      const r = await httpJson<{ code?: string; daily?: Array<{ fxDate: string; tempMax: string; tempMin: string; textDay: string; iconDay: string; precip: string }> }>(
+        `https://${config.qweatherApiHost}/v7/weather/${daysKey}?location=${loc?.id ?? `${lon.toFixed(2)},${lat.toFixed(2)}`}&key=${config.qweatherKey}`,
       );
+      // 和风业务错误：HTTP 200 + code 字段（如 401/402/403）→ 抛出后走 Open-Meteo 降级
+      if (typeof r.code === "string" && r.code !== "200") {
+        throw new Error(`QWeather weatherforecast error code ${r.code}`);
+      }
       if (r.daily) {
         return r.daily.slice(0, days).map((d) => ({
           date: d.fxDate,
           tMax: Number(d.tempMax),
           tMin: Number(d.tempMin),
           weatherText: d.textDay || (QW_TEXT[d.iconDay] ?? `code ${d.iconDay}`),
-          precipAmountMm: Number(d.precip),
+          // Number("")/Number("0")/NaN 一律折叠为 undefined，避免 "预计0mm" 噪音
+          precipAmountMm: Number(d.precip) || undefined,
         }));
       }
     } catch (e) {
@@ -195,6 +206,7 @@ export async function fetchAlerts(city: string, lat: number, lon: number): Promi
     try {
       // 新版和风实时天气预警 API：直接按经纬度查询，无需先查城市 ID
       const r = await httpJson<{
+        code?: string;
         metadata?: { attributions?: string[] };
         alerts?: Array<{
           id?: string;
@@ -214,6 +226,10 @@ export async function fetchAlerts(city: string, lat: number, lon: number): Promi
       }>(
         `https://${config.qweatherApiHost}/weatheralert/v1/current/${lat.toFixed(2)}/${lon.toFixed(2)}?key=${config.qweatherKey}`,
       );
+      // 和风业务错误：HTTP 200 + code 字段（如 401/402/403）→ 抛出后走阈值推断降级
+      if (typeof r.code === "string" && r.code !== "200") {
+        throw new Error(`QWeather weatheralert error code ${r.code}`);
+      }
       const attributions = r.metadata?.attributions ?? [];
       return (r.alerts ?? []).map((w): OfficialWeatherAlert => ({
         kind: "official",

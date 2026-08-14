@@ -21,6 +21,9 @@ export interface DeliverySummary {
 }
 
 const MAX_CONFIRMED_HTTP_ATTEMPTS = 5;
+/** route 配置漂移导致的 fallback 标记（route 恢复后可重新入队）。 */
+const ROUTE_CHANGED_ERROR = "configured webhook route changed";
+const ROUTE_MISSING_ERROR = "configured webhook route is missing or changed";
 
 function now(): string {
   return new Date().toISOString();
@@ -148,7 +151,7 @@ async function publishResolvedProfile(
       : db.prepare(
           "SELECT id FROM profile_notifications WHERE profile_id = ? AND dedupe_key = ?",
         ).get(profile.id, dedupeKey) as { id: number } | undefined;
-    const legacyId = current || dedupeKey === undefined
+    const legacyId = (current || dedupeKey === undefined)
       ? undefined
       : findLegacyDedupeId("profile_notifications", legacyDedupeKeys, profile.id);
     if (legacyId !== undefined) {
@@ -188,10 +191,10 @@ async function publishResolvedProfile(
       db.prepare(`
         UPDATE profile_notification_deliveries
         SET status = 'fallback', claim_token = NULL, claimed_at = NULL,
-            last_error = 'configured webhook route changed', updated_at = ?
+            last_error = ?, updated_at = ?
         WHERE profile_id = ? AND notification_id = ? AND route <> ?
           AND status IN ('pending', 'failed', 'fallback')
-      `).run(time, profile.id, notificationId, route.route);
+      `).run(ROUTE_CHANGED_ERROR, time, profile.id, notificationId, route.route);
       db.prepare(`
         INSERT OR IGNORE INTO profile_notification_deliveries(
           profile_id, notification_id, route, status, attempts,
@@ -241,11 +244,38 @@ export async function deliverPendingProfileNotifications(options: {
     db.prepare(`
       UPDATE profile_notification_deliveries
       SET status = 'fallback', claim_token = NULL, claimed_at = NULL,
-          last_error = 'configured webhook route is missing or changed', updated_at = ?
+          last_error = ?, updated_at = ?
       WHERE profile_id = ? AND route = ? AND (
         status IN ('pending', 'failed') OR (status = 'sending' AND claimed_at <= ?)
       )
-    `).run(dueAt, candidate.profile_id, candidate.route, staleClaimAt);
+    `).run(ROUTE_MISSING_ERROR, dueAt, candidate.profile_id, candidate.route, staleClaimAt);
+  }
+
+  // route 同名恢复后重新入队：仅限因 route 配置漂移进入 fallback、且尚未被
+  // notify.pull 读取的行。transport/幂等窗口导致的 fallback 保持终态，避免重复投递。
+  for (const [configuredProfileId, configuredRoute] of Object.entries(config.profilePushRoutes)) {
+    if (profileIdFilter && configuredProfileId !== profileIdFilter) continue;
+    db.prepare(`
+      UPDATE profile_notification_deliveries
+      SET status = 'pending', attempts = 0, request_generation = 1,
+          request_started_at = NULL, transport_failures = 0,
+          next_attempt_at = ?, last_error = NULL,
+          claim_token = NULL, claimed_at = NULL, updated_at = ?
+      WHERE profile_id = ? AND route = ? AND status = 'fallback'
+        AND last_error IN (?, ?)
+        AND NOT EXISTS (
+          SELECT 1 FROM profile_notification_reads r
+          WHERE r.profile_id = profile_notification_deliveries.profile_id
+            AND r.notification_id = profile_notification_deliveries.notification_id
+        )
+    `).run(
+      dueAt,
+      dueAt,
+      configuredProfileId,
+      configuredRoute.route,
+      ROUTE_CHANGED_ERROR,
+      ROUTE_MISSING_ERROR,
+    );
   }
 
   if (profileIdFilter) {
@@ -427,7 +457,9 @@ export async function deliverPendingProfileNotifications(options: {
 
 /** Compatibility name for existing global jobs. */
 export const notify = (title: string, body: string, dedupeKey?: string): Promise<void> =>
-  publishGlobal("general", title, body, dedupeKey);
+  dedupeKey === undefined
+    ? publishGlobal(title, body)
+    : publishGlobal("general", title, body, dedupeKey);
 
 export function pullPending(value: ProfileContext | string): Notice[] {
   const profile = asContext(value);

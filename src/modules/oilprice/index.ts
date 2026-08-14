@@ -56,7 +56,7 @@ const oilpriceModule: AssistantModule = {
       schema: {},
       handler: async () => {
         const summary = nextAdjustmentSummary();
-        if (!summary) return fail("年度窗口表未覆盖当前日期，请更新 oilprice/schedule.ts");
+        if (!summary) return fail("年度窗口表未覆盖当前日期，请更新 src/modules/oilprice/schedule.ts");
         return ok(summary);
       },
     },

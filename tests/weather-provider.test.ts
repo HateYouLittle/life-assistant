@@ -3,7 +3,8 @@ import fs from "node:fs";
 import test from "node:test";
 
 import { config } from "../src/config.js";
-import { WMO, fetchAlerts, fetchForecast } from "../src/modules/weather/provider.js";
+import { httpJson, redactUrl } from "../src/core/http.js";
+import { WMO, fetchAlerts, fetchCurrent, fetchForecast } from "../src/modules/weather/provider.js";
 
 test("QWeather forecast maps daily precip as millimeter amount", async (t) => {
   const originalKey = config.qweatherKey;
@@ -11,6 +12,8 @@ test("QWeather forecast maps daily precip as millimeter amount", async (t) => {
   config.qweatherKey = "test-key";
   globalThis.fetch = (async (input) => {
     assert.match(String(input), /\/v7\/weather\/3d\?/);
+    // 和风 v7 location 参数为 "经度,纬度"（lon,lat）
+    assert.match(String(input), /location=116\.40,39\.90/);
     return Response.json({
       daily: [{
         fxDate: "2026-08-03",
@@ -34,6 +37,152 @@ test("QWeather forecast maps daily precip as millimeter amount", async (t) => {
     weatherText: "中雨",
     precipAmountMm: 12.7,
   }]);
+});
+
+test("QWeather current passes lon,lat order and maps now fields", async (t) => {
+  const originalKey = config.qweatherKey;
+  const originalFetch = globalThis.fetch;
+  config.qweatherKey = "test-key";
+  globalThis.fetch = (async (input) => {
+    assert.match(String(input), /\/v7\/weather\/now\?location=116\.40,39\.90/);
+    return Response.json({
+      now: { temp: "31", feelsLike: "33", humidity: "60", windSpeed: "12", text: "多云", icon: "101" },
+    });
+  }) as typeof fetch;
+  t.after(() => {
+    config.qweatherKey = originalKey;
+    globalThis.fetch = originalFetch;
+  });
+
+  assert.deepEqual(await fetchCurrent(39.9, 116.4), {
+    temperature: 31,
+    apparent: 33,
+    humidity: 60,
+    windSpeed: 12,
+    windSpeedUnit: "km/h",
+    weatherText: "多云",
+  });
+});
+
+test("QWeather forecast drops zero precip amount instead of emitting 0mm", async (t) => {
+  const originalKey = config.qweatherKey;
+  const originalFetch = globalThis.fetch;
+  config.qweatherKey = "test-key";
+  globalThis.fetch = (async (input) => {
+    assert.match(String(input), /\/v7\/weather\/3d\?/);
+    return Response.json({
+      daily: [{
+        fxDate: "2026-08-03",
+        tempMax: "31",
+        tempMin: "24",
+        textDay: "晴",
+        iconDay: "100",
+        precip: "0",
+      }],
+    });
+  }) as typeof fetch;
+  t.after(() => {
+    config.qweatherKey = originalKey;
+    globalThis.fetch = originalFetch;
+  });
+
+  assert.deepEqual(await fetchForecast(39.9, 116.4, 1), [{
+    date: "2026-08-03",
+    tMax: 31,
+    tMin: 24,
+    weatherText: "晴",
+    precipAmountMm: undefined,
+  }]);
+});
+
+test("QWeather forecast business error code falls back to Open-Meteo", async (t) => {
+  const originalKey = config.qweatherKey;
+  const originalFetch = globalThis.fetch;
+  config.qweatherKey = "test-key";
+  let calls = 0;
+  globalThis.fetch = (async (input) => {
+    calls += 1;
+    const url = String(input);
+    if (url.includes("/v7/weather/3d")) return Response.json({ code: "401" });
+    assert.match(url, /api\.open-meteo\.com/);
+    return Response.json({
+      daily: {
+        time: ["2026-08-03"],
+        temperature_2m_max: [30],
+        temperature_2m_min: [23],
+        weather_code: [80],
+        precipitation_probability_max: [65],
+      },
+    });
+  }) as typeof fetch;
+  t.after(() => {
+    config.qweatherKey = originalKey;
+    globalThis.fetch = originalFetch;
+  });
+
+  assert.deepEqual(await fetchForecast(39.9, 116.4, 1), [{
+    date: "2026-08-03",
+    tMax: 30,
+    tMin: 23,
+    weatherText: "阵雨",
+    precipProb: 65,
+  }]);
+  assert.equal(calls, 2);
+});
+
+test("QWeather alerts business error code falls back to threshold inference", async (t) => {
+  const originalKey = config.qweatherKey;
+  const originalFetch = globalThis.fetch;
+  config.qweatherKey = "test-key";
+  let calls = 0;
+  globalThis.fetch = (async (input) => {
+    calls += 1;
+    const url = String(input);
+    if (url.includes("/weatheralert/v1/current/")) return Response.json({ code: "403" });
+    assert.match(url, /api\.open-meteo\.com/);
+    return Response.json({
+      hourly: {
+        temperature_2m: [20, 21, 22],
+        precipitation: [0, 0, 0],
+        wind_speed_10m: [5, 6, 7],
+      },
+    });
+  }) as typeof fetch;
+  t.after(() => {
+    config.qweatherKey = originalKey;
+    globalThis.fetch = originalFetch;
+  });
+
+  // 未达任何推断阈值 → 空数组；两次调用证明已降级
+  assert.deepEqual(await fetchAlerts("北京", 39.9, 116.4), []);
+  assert.equal(calls, 2);
+});
+
+test("redactUrl strips query parameters while keeping origin and pathname", () => {
+  assert.equal(
+    redactUrl("https://devapi.qweather.com/v7/weather/now?location=116.40,39.90&key=super-secret"),
+    "https://devapi.qweather.com/v7/weather/now?(redacted)",
+  );
+  assert.equal(redactUrl("https://api.open-meteo.com/v1/forecast?latitude=39.9"), "https://api.open-meteo.com/v1/forecast?(redacted)");
+  assert.equal(redactUrl("https://example.com/path"), "https://example.com/path");
+  assert.equal(redactUrl("not-a-url"), "not-a-url");
+});
+
+test("httpJson HTTP error message never leaks the query string", async (t) => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => Response.json({}, { status: 500 })) as typeof fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  await assert.rejects(
+    () => httpJson("https://devapi.qweather.com/v7/weather/now?key=super-secret"),
+    (err: Error) => {
+      assert.equal(err.message, "HTTP 500 for https://devapi.qweather.com/v7/weather/now?(redacted)");
+      assert.ok(!err.message.includes("super-secret"), "error message must not contain the API key");
+      return true;
+    },
+  );
 });
 
 test("Open-Meteo forecast maps daily precipitation maximum as probability percent", async (t) => {
