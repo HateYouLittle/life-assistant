@@ -253,3 +253,41 @@ test("recurring schedules created inside the reminder window catch up the missed
   assert.equal(rows.length, 1);
   assert.match(String(rows[0].dedupe_key), /:occurrence:early$/);
 });
+
+test("a corrupt deadline_offset_minutes does not poison or disable the schedule", async () => {
+  db.prepare("UPDATE schedules SET enabled = 0").run();
+  const item = createSchedule(profile, {
+    title: "corrupt offset",
+    calendar: "solar",
+    date: "2099-05-01",
+    time: "09:00",
+    timezone: "Asia/Shanghai",
+    recurrence: "daily",
+    deadlineOffsetMinutes: 120,
+    reminders: [
+      { id: "start", minutesBefore: 60, target: "occurrence" },
+      { id: "due", minutesBefore: 30, target: "deadline" },
+    ],
+  });
+  // 损坏 deadline_offset_minutes，并把 next_run_at 拨到 r-start 的触发时刻
+  // （2099-05-01 08:00+08:00 = 00:00Z）。
+  db.prepare(`
+    UPDATE schedules SET deadline_offset_minutes = 'abc', next_run_at = ?
+    WHERE profile_id = ? AND id = ?
+  `).run("2099-05-01T00:00:00.000Z", profile.id, item.id);
+
+  // 修复前：NaN 位移 → RRule.after(Invalid Date) 抛错 → 整个 tick 失败、next_run_at 不推进；
+  // 修复后：deadline 提醒因无有效来源被干净跳过，occurrence 提醒正常触发，日程推进且保持 active。
+  await runDueSchedules(new Date("2099-05-01T00:01:00.000Z"));
+  assert.deepEqual(notices(item.id).map((row) => row.dedupe_key), [
+    `schedule:${profile.id}:${item.id}:2099-05-01T01:00:00.000Z:occurrence:start`,
+  ]);
+  const scheduleRow = db.prepare(`
+    SELECT next_run_at, enabled, status FROM schedules WHERE profile_id = ? AND id = ?
+  `).get(profile.id, item.id) as Record<string, unknown>;
+  assert.deepEqual({ ...scheduleRow }, {
+    next_run_at: "2099-05-02T00:00:00.000Z",
+    enabled: 1,
+    status: "active",
+  });
+});

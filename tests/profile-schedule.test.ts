@@ -36,7 +36,7 @@ const configModule = await import("../src/config.js");
 const parseProfilePushRoutes = (configModule as Record<string, unknown>).parseProfilePushRoutes as (
   raw?: string,
 ) => Record<string, { route: string; url: string; secret: string }>;
-const { createSchedule, listSchedules, getSchedule, updateSchedule, deleteSchedule } = await import(
+const { createSchedule, listSchedules, getSchedule, updateSchedule, deleteSchedule, hydrateRow } = await import(
   "../src/modules/schedule/service.js",
 );
 const notifierModule = await import("../src/core/notifier.js");
@@ -2144,8 +2144,77 @@ test("hydration tolerates corrupt scalar columns without poisoning reads", () =>
     );
     assert.equal(getSchedule(a, "scalar-bad-date").date, undefined);
     assert.equal(getSchedule(a, "scalar-bad-time").time, "09:00");
-    assert.equal(getSchedule(a, "scalar-bad-nextrun").nextRunAt, undefined);
+    const badNextRun = getSchedule(a, "scalar-bad-nextrun");
+    assert.equal(badNextRun.nextRunAt, undefined);
+    assert.equal(badNextRun.nextOccurrenceSolar, undefined);
   } finally {
     db.prepare("DELETE FROM schedules WHERE profile_id = ? AND id LIKE 'scalar-%'").run(a.id);
+  }
+});
+
+test("an unexpected findOccurrence failure is logged and does not clear nextRunAt", () => {
+  // P3-2：fromUtc（输入合法性）与 findOccurrence（逻辑推导）分离——
+  // 后者的非预期异常必须有日志、且不清空 nextRunAt（不让日程静默停调度）。
+  const a = requireProfileContext("profile-a");
+  const item = createSchedule(a, {
+    title: "derive boom",
+    calendar: "solar",
+    date: "2099-01-02",
+    time: "09:00",
+    timezone: "Asia/Shanghai",
+    recurrence: "daily",
+  });
+  try {
+    const raw = db.prepare("SELECT * FROM schedules WHERE profile_id = ? AND id = ?")
+      .get(a.id, item.id) as Record<string, unknown>;
+    assert.ok(raw.next_run_at, "fixture must have a non-null next_run_at");
+    const errors: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => { errors.push(args.map(String).join(" ")); };
+    try {
+      const hydrated = hydrateRow(raw, () => {
+        throw new Error("unexpected findOccurrence failure");
+      });
+      assert.equal(hydrated.nextRunAt, String(raw.next_run_at), "nextRunAt 保留");
+      assert.equal(hydrated.nextOccurrenceSolar, undefined, "派生展示值丢弃");
+    } finally {
+      console.error = original;
+    }
+    assert.ok(
+      errors.some((line) => line.includes("unexpected findOccurrence failure")),
+      "非预期异常必须记录日志",
+    );
+  } finally {
+    db.prepare("DELETE FROM schedules WHERE profile_id = ? AND id = ?").run(a.id, item.id);
+  }
+});
+
+test("corrupt numeric columns fall back to safe defaults instead of NaN", () => {
+  // P3-3：lunar_month/lunar_day/deadline_offset_minutes/version 损坏（NaN/越界/非整数）
+  // 时按默认值兜底，不让 NaN 位移导致日程静默停用或提醒丢失。
+  const a = requireProfileContext("profile-a");
+  const stamp = "2099-01-01T00:00:00.000Z";
+  db.prepare(`
+    INSERT INTO schedules(profile_id, id, type, title, priority, status, calendar, date, time, all_day, timezone, recurrence_json, reminders_json, deadline_offset_minutes, enabled, next_run_at, version, created_at, updated_at)
+    VALUES(?, 'numeric-bad-offset', 'todo', 'numeric offset', 'normal', 'active', 'solar', '2099-01-02', '09:00', 1, 'Asia/Shanghai',
+      '{"frequency":"daily","interval":1,"calendar":"solar"}',
+      '[{"minutesBefore":0,"id":"reminder-1","target":"occurrence"}]', 'abc', 1, '2099-01-03T00:00:00.000Z', 'abc', ?, ?)
+  `).run(a.id, stamp, stamp);
+  db.prepare(`
+    INSERT INTO schedules(profile_id, id, type, title, priority, status, calendar, date, lunar_month, lunar_day, leap_month_policy, time, all_day, timezone, recurrence_json, reminders_json, enabled, version, created_at, updated_at)
+    VALUES(?, 'numeric-bad-lunar', 'anniversary', 'numeric lunar', 'normal', 'active', 'lunar', NULL, 'abc', 'abc', 'normal', '09:00', 1, 'Asia/Shanghai',
+      '{"frequency":"yearly","interval":1,"calendar":"lunar"}',
+      '[{"minutesBefore":0,"id":"reminder-1","target":"occurrence"}]', 0, 1, ?, ?)
+  `).run(a.id, stamp, stamp);
+  try {
+    assert.doesNotThrow(() => listSchedules(a));
+    const offset = getSchedule(a, "numeric-bad-offset");
+    assert.equal(offset.deadlineOffsetMinutes, undefined);
+    assert.equal(offset.version, 1);
+    const lunar = getSchedule(a, "numeric-bad-lunar");
+    assert.equal(lunar.lunarMonth, undefined);
+    assert.equal(lunar.lunarDay, undefined);
+  } finally {
+    db.prepare("DELETE FROM schedules WHERE profile_id = ? AND id LIKE 'numeric-bad-%'").run(a.id);
   }
 });

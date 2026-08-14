@@ -484,7 +484,17 @@ function isValidTimezone(zone: string): boolean {
   }
 }
 
-function rowToItem(row: Record<string, unknown>): ScheduleItem {
+/** 数值列 hydration 校验（P3-3）：非整数/NaN/越界一律 undefined，由调用方按语义兜底。 */
+function finiteIntOrUndefined(value: unknown, min: number, max: number): number | undefined {
+  if (value === null || value === undefined) return undefined;
+  const parsed = typeof value === "number" ? value : Number(value);
+  return Number.isInteger(parsed) && parsed >= min && parsed <= max ? parsed : undefined;
+}
+
+function rowToItem(
+  row: Record<string, unknown>,
+  findImpl: typeof findOccurrence = findOccurrence,
+): ScheduleItem {
   const recurrence = sanitizeRecurrence(parseJson(row.recurrence_json, null), String(row.calendar) as CalendarType);
   // leap_month_policy 列是闰月策略的权威存储：即使 recurrence_json 漂移/缺失也以列值为准，
   // 避免农历闰月日程在读取侧被按普通月计算（二次审查 P0）。
@@ -528,28 +538,40 @@ function rowToItem(row: Record<string, unknown>): ScheduleItem {
     time,
     allDay: Boolean(row.all_day),
     timezone,
-    lunarMonth: row.lunar_month == null ? undefined : Number(row.lunar_month),
-    lunarDay: row.lunar_day == null ? undefined : Number(row.lunar_day),
+    // P3-3：数值列损坏（NaN/越界/非整数）按默认值兜底，避免 NaN 位移静默停用日程
+    lunarMonth: finiteIntOrUndefined(row.lunar_month, 1, 12),
+    lunarDay: finiteIntOrUndefined(row.lunar_day, 1, 30),
     isLeapMonth: row.leap_month_policy === "leap",
     recurrence,
     reminders,
     deadlineAt: row.deadline_at == null ? undefined : String(row.deadline_at),
-    deadlineOffsetMinutes: row.deadline_offset_minutes == null ? undefined : Number(row.deadline_offset_minutes),
+    deadlineOffsetMinutes: finiteIntOrUndefined(row.deadline_offset_minutes, 0, 60 * 24 * 365),
     enabled: Boolean(row.enabled),
     nextRunAt: row.next_run_at == null ? undefined : String(row.next_run_at),
-    version: Number(row.version ?? 1),
+    version: finiteIntOrUndefined(row.version, 1, Number.MAX_SAFE_INTEGER) ?? 1,
     createdAt: String(row.created_at),
     updatedAt: String(row.updated_at),
   };
-  // 派生值（nextOccurrenceSolar / nextRunAt 合法性）单独容错：损坏时丢弃派生值，
-  // 行本身仍可读，不向上抛错。
+  // P3-2：fromUtc（输入合法性）与 findOccurrence（逻辑推导）分离——
+  // 非法 next_run_at 清空 next-run 派生值（行仍可读）；findOccurrence 的非预期异常
+  // 必须记录日志暴露问题，只丢弃派生展示值，不清空 nextRunAt（不让日程静默停调度）。
   if (item.nextRunAt !== undefined) {
+    let triggerAt: ValidDateTime;
     try {
-      const next = findOccurrence(item, fromUtc(item.nextRunAt), true);
-      item.nextOccurrenceSolar = next?.toISO() ?? undefined;
+      triggerAt = fromUtc(item.nextRunAt);
     } catch {
-      item.nextOccurrenceSolar = undefined;
       item.nextRunAt = undefined;
+      return item;
+    }
+    try {
+      const next = findImpl(item, triggerAt, true);
+      item.nextOccurrenceSolar = next?.toISO() ?? undefined;
+    } catch (error) {
+      console.error(
+        `[schedule] hydration failed to derive next occurrence for ${item.profileId}/${item.id}: ` +
+        `${error instanceof Error ? error.message : String(error)}`,
+      );
+      item.nextOccurrenceSolar = undefined;
     }
   }
   return item;
@@ -636,7 +658,7 @@ export function listSchedules(value: ProfileContext | string, options: ScheduleL
   if (options.to) { clauses.push("COALESCE(next_run_at, '0000-01-01T00:00:00.000Z') <= ?"); values.push(options.to); }
   const limit = Math.min(Math.max(options.upcoming ?? 100, 1), 500);
   const rows = getDatabase().prepare(`SELECT * FROM schedules WHERE ${clauses.join(" AND ")} ORDER BY COALESCE(next_run_at, '9999-12-31T23:59:59.999Z'), created_at LIMIT ${limit}`).all(...values as any[]) as Record<string, unknown>[];
-  return rows.map(rowToItem);
+  return rows.map((row) => rowToItem(row));
 }
 
 export function getSchedule(value: ProfileContext | string, id: string): ScheduleItem {
@@ -729,8 +751,11 @@ export function completeSchedule(value: ProfileContext | string, id: string, occ
   return item;
 }
 
-export function hydrateRow(row: Record<string, unknown>): ScheduleItem {
-  return rowToItem(row);
+export function hydrateRow(
+  row: Record<string, unknown>,
+  findImpl: typeof findOccurrence = findOccurrence,
+): ScheduleItem {
+  return rowToItem(row, findImpl);
 }
 
 export function nextEventAfter(item: ScheduleItem, event: ValidDateTime): ValidDateTime | null {
