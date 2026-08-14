@@ -128,7 +128,7 @@
 | P2-1 | P2 | hydration 把越界/非整数 `version` 统一归为 1（service.ts:551），但 scheduler 用 DB 原始 `fresh.version` 与 `item.version` 严格比较（scheduler.ts:125-133）并按 item.version 更新（180-188）→ `version=0` 等脏行永远判为 stale snapshot：不发布、不推进，提醒持续丢失；`updateSchedule` 版本冲突。正常 version≥1 不受影响 | schedule/service.ts:551 vs scheduler.ts:125-133,180-188 | done（共享 normalizeVersion 口径：scheduler 比较归一化值、WHERE 用原始列值、写回归一化值自愈；updateSchedule WHERE 同样用原始列值） |
 | P3-1 | P3 | `findOccurrence` 若持续抛错，hydration 每 tick 记日志（service.ts:570-573）+ scheduler 捕获抛回（204-209）+ tick 失败再记（306-307）→ 同一行双日志刷屏。不产生重复提醒（occurrences/通知去重仍在），但持久 bug 下运营噪声大 | schedule/service.ts:570-573, scheduler.ts:204-209,306-307 | done（logHydrationError 5 分钟窗口去重，Map 容量阈值清扫过期条目；scheduler tick 级日志保留） |
 
-### 第五轮审查新发现（2026-08-14，待 DSH 修）
+### 第五轮审查新发现（2026-08-14，已全部修复）
 
 | # | 级别 | 问题 | 位置 | 状态 |
 |---|---|---|---|---|
