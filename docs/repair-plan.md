@@ -121,11 +121,18 @@
 | P3-2 | N4 派生值 try/catch 边界偏宽：同时包住 `fromUtc` 与 `findOccurrence`，后者未来出现真逻辑 bug 会被静默吞掉，日程不触发且无日志 | schedule/service.ts:546-553 | done（fromUtc 与 findOccurrence 分离；findOccurrence 非预期异常 console.error 并保留 nextRunAt；hydrateRow 增加可注入 findImpl 供测试） |
 | P3-3 | N4 只校验四标量列：`lunar_month`/`lunar_day`/`deadline_offset_minutes`/`version` 仍直接 `Number(...)`，NaN 可致 `nextReminderTiming` 返回 null → 日程静默停用、提醒丢失 | schedule/service.ts:531-540,399-400 | done（finiteIntOrUndefined 校验整数/范围，非法按默认值兜底） |
 
+### 第四轮审查新发现（2026-08-14，待 DSH 修）
+
+| # | 级别 | 问题 | 位置 | 状态 |
+|---|---|---|---|---|
+| P2-1 | P2 | hydration 把越界/非整数 `version` 统一归为 1（service.ts:551），但 scheduler 用 DB 原始 `fresh.version` 与 `item.version` 严格比较（scheduler.ts:125-133）并按 item.version 更新（180-188）→ `version=0` 等脏行永远判为 stale snapshot：不发布、不推进，提醒持续丢失；`updateSchedule` 版本冲突。正常 version≥1 不受影响 | schedule/service.ts:551 vs scheduler.ts:125-133,180-188 | done（共享 normalizeVersion 口径：scheduler 比较归一化值、WHERE 用原始列值、写回归一化值自愈；updateSchedule WHERE 同样用原始列值） |
+| P3-1 | P3 | `findOccurrence` 若持续抛错，hydration 每 tick 记日志（service.ts:570-573）+ scheduler 捕获抛回（204-209）+ tick 失败再记（306-307）→ 同一行双日志刷屏。不产生重复提醒（occurrences/通知去重仍在），但持久 bug 下运营噪声大 | schedule/service.ts:570-573, scheduler.ts:204-209,306-307 | done（logHydrationError 5 分钟窗口去重，Map 容量阈值清扫过期条目；scheduler tick 级日志保留） |
+
 ## 验证命令
 
 ```bash
 npm run build                        # 必须零错误
-npm test                             # 全量，必须全绿（当前 214/214）
+npm test                             # 全量，必须全绿（当前 218/218）
 node --import tsx/esm --test tests/notification-publisher.test.ts tests/scheduler-notification-contract.test.ts
 node --import tsx/esm --test tests/weather-provider.test.ts tests/weather-notification.test.ts tests/location.test.ts
 node --import tsx/esm --test tests/oilprice-*.test.ts
@@ -134,6 +141,17 @@ node --import tsx/esm --test tests/schedule-*.test.ts tests/profile-schedule.tes
 
 ## 进度日志（新条目加在最上面）
 
+- 2026-08-14 P2-1/P3-1 修复完成（按 ~/artifacts/documents/life-assistant/dsh-fix-prompt-p5.md，
+  TDD 先红后绿）：P2-1 共享 normalizeVersion 口径（scheduler 比较归一化值、WHERE 原始列值、
+  写回归一化值自愈；updateSchedule 同样处理）；P3-1 logHydrationError 5 分钟窗口去重 +
+  Map 容量阈值清扫过期条目。新增 4 个回归测试（profile-schedule ×3 +
+  schedule-scheduler-deadline ×1），npm run build 零错误、npm test 218/218 全绿。
+  代码提交 `3076579`。
+- 2026-08-14 第四轮复审（Codex CLI）完成：P3-2/P3-3 核心修复真实落地（try/catch
+  分离、finiteIntOrUndefined、findImpl 注入默认兼容、回归测试非假绿、文档自洽）；
+  无 P0/P1。新发现 1 P2 + 1 P3（见「第四轮审查新发现」表）：version 归一化口径
+  未闭环 → version=0 脏行永久 stale、提醒持续丢失；hydration 错误日志刷屏。
+  待 DeepSeek Harness 修复。独立验证：214/214、build 零错误、diff-check 干净。
 - 2026-08-14 P3-2/P3-3 收尾硬化完成（按 ~/artifacts/documents/life-assistant/dsh-fix-prompt-p3.md，
   TDD 先红后绿）：P3-2 fromUtc 与 findOccurrence 分离，后者非预期异常 console.error
   且保留 nextRunAt（hydrateRow 增加可选 findImpl 注入点）；P3-3 四数值列
