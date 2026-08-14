@@ -8,6 +8,7 @@ import test from "node:test";
 import { DateTime } from "luxon";
 import { Lunar, Solar } from "lunar-javascript";
 import type { WeatherAlert } from "../src/modules/weather/provider.js";
+import type { LeapMonthPolicy } from "../src/modules/schedule/types.js";
 import type { NotificationEnvelope, NotificationRenderTarget } from "../src/core/notification.js";
 
 const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "life-assistant-test-"));
@@ -2056,4 +2057,95 @@ test("the daily brief reuses the legacy same-day key so an upgrade-day run does 
     assert.equal(rows[0].dedupe_key, "weather:daily-brief:北京:2026-08-09");
     assert.equal(Number(rows[0].count), 1);
   })();
+});
+
+test("hydration re-ids entries that collide with auto-generated reminder ids", () => {
+  // N1：自动生成的位置 id 也必须占位去重集合，否则 [{无id},{id:"reminder-1"}]
+  // hydration 后得到两条 "reminder-1"，第二条被 occurrence key 静默折叠。
+  const a = requireProfileContext("profile-a");
+  const stamp = "2099-01-01T00:00:00.000Z";
+  db.prepare(`
+    INSERT INTO schedules(profile_id, id, type, title, priority, status, calendar, date, time, all_day, timezone, recurrence_json, reminders_json, enabled, version, created_at, updated_at)
+    VALUES(?, 'legacy-dup-autogen', 'todo', 'dup autogen', 'normal', 'active', 'solar', '2099-01-02', '09:00', 1, 'Asia/Shanghai',
+      '{"frequency":"daily","interval":1,"calendar":"solar"}',
+      '[{"minutesBefore":0},{"id":"reminder-1","minutesBefore":10}]', 0, 1, ?, ?)
+  `).run(a.id, stamp, stamp);
+  try {
+    const item = getSchedule(a, "legacy-dup-autogen");
+    assert.equal(item.reminders.length, 2);
+    assert.equal(new Set(item.reminders.map((reminder) => reminder.id)).size, 2);
+  } finally {
+    db.prepare("DELETE FROM schedules WHERE profile_id = ? AND id = ?").run(a.id, "legacy-dup-autogen");
+  }
+});
+
+test("creating a lunar schedule with unimplemented leap policies is rejected", () => {
+  // N3/D1-A：both/prefer-leap 未实现，输入路径明确拒绝，不保留一个不会正确执行的策略
+  const a = requireProfileContext("profile-a");
+  for (const policy of ["both", "prefer-leap"]) {
+    assert.throws(() => createSchedule(a, {
+      title: `policy ${policy}`,
+      calendar: "lunar",
+      lunarMonth: 2,
+      lunarDay: 10,
+      timezone: "Asia/Shanghai",
+      leapMonthPolicy: policy as unknown as LeapMonthPolicy,
+    }), /leapMonthPolicy/);
+  }
+});
+
+test("hydration normalizes unimplemented leap policies to normal", () => {
+  // N3/D1-A：legacy 行的 both/prefer-leap 读取侧归一为 normal（与 solarForLunar
+  // 现行为一致），不再保留未实现策略
+  const a = requireProfileContext("profile-a");
+  const stamp = "2099-01-01T00:00:00.000Z";
+  db.prepare(`
+    INSERT INTO schedules(profile_id, id, type, title, priority, status, calendar, date, lunar_month, lunar_day, leap_month_policy, time, all_day, timezone, recurrence_json, reminders_json, enabled, version, created_at, updated_at)
+    VALUES(?, 'legacy-leap-both', 'anniversary', 'leap both', 'normal', 'active', 'lunar', NULL, 2, 10, 'both', '09:00', 1, 'Asia/Shanghai',
+      '{"frequency":"yearly","interval":1,"calendar":"lunar","leapMonthPolicy":"both"}',
+      '[{"minutesBefore":0,"id":"reminder-1","target":"occurrence"}]', 0, 1, ?, ?)
+  `).run(a.id, stamp, stamp);
+  try {
+    const item = getSchedule(a, "legacy-leap-both");
+    assert.equal(item.recurrence.leapMonthPolicy, "normal");
+  } finally {
+    db.prepare("DELETE FROM schedules WHERE profile_id = ? AND id = ?").run(a.id, "legacy-leap-both");
+  }
+});
+
+test("hydration tolerates corrupt scalar columns without poisoning reads", () => {
+  // N4/D2-A：timezone/date/time/next_run_at 标量列损坏时按默认值兜底，
+  // 不让单行毒化 listSchedules/getSchedule
+  const a = requireProfileContext("profile-a");
+  const stamp = "2099-01-01T00:00:00.000Z";
+  const insert = (id: string, overrides: { date?: string; time?: string; timezone?: string; nextRunAt?: string }) => {
+    db.prepare(`
+      INSERT INTO schedules(profile_id, id, type, title, priority, status, calendar, date, time, all_day, timezone, recurrence_json, reminders_json, enabled, next_run_at, version, created_at, updated_at)
+      VALUES(?, ?, 'todo', ?, 'normal', 'active', 'solar', ?, ?, 1, ?, '{"frequency":"daily","interval":1,"calendar":"solar"}', '[{"minutesBefore":0,"id":"reminder-1","target":"occurrence"}]', 1, ?, 1, ?, ?)
+    `).run(
+      a.id, id, `scalar ${id}`,
+      overrides.date ?? "2099-01-02",
+      overrides.time ?? "09:00",
+      overrides.timezone ?? "Asia/Shanghai",
+      overrides.nextRunAt ?? "2099-01-03T00:00:00.000Z",
+      stamp, stamp,
+    );
+  };
+  try {
+    insert("scalar-bad-timezone", { timezone: "Mars/Olympus" });
+    insert("scalar-bad-date", { date: "2026-02-30" });
+    insert("scalar-bad-time", { time: "99:99" });
+    insert("scalar-bad-nextrun", { nextRunAt: "not-a-date" });
+
+    assert.doesNotThrow(() => listSchedules(a));
+    assert.equal(
+      getSchedule(a, "scalar-bad-timezone").timezone,
+      (configModule.config as { timezone: string }).timezone,
+    );
+    assert.equal(getSchedule(a, "scalar-bad-date").date, undefined);
+    assert.equal(getSchedule(a, "scalar-bad-time").time, "09:00");
+    assert.equal(getSchedule(a, "scalar-bad-nextrun").nextRunAt, undefined);
+  } finally {
+    db.prepare("DELETE FROM schedules WHERE profile_id = ? AND id LIKE 'scalar-%'").run(a.id);
+  }
 });

@@ -92,10 +92,37 @@ const QW_ALERT_LEVEL: Record<string, string> = {
 const GEO_CACHE_PREFIX = "qweather:geo:";
 const GEO_CACHE_TTL_MS = 7 * 24 * 3600 * 1000;
 
+interface GeoCacheEntry {
+  id: string;
+  lat: number;
+  lon: number;
+  ts: number;
+}
+
+/** 坐标校验（有限数且 ±90/±180 范围内），写入与读取共用同一口径（N2）。 */
+function isValidCoordinatePair(lat: unknown, lon: unknown): boolean {
+  return typeof lat === "number" && Number.isFinite(lat) && lat >= -90 && lat <= 90
+    && typeof lon === "number" && Number.isFinite(lon) && lon >= -180 && lon <= 180;
+}
+
+function isValidGeoCacheEntry(raw: unknown): raw is GeoCacheEntry {
+  if (!raw || typeof raw !== "object") return false;
+  const candidate = raw as Record<string, unknown>;
+  return typeof candidate.id === "string" && candidate.id.length > 0
+    && isValidCoordinatePair(candidate.lat, candidate.lon)
+    && typeof candidate.ts === "number" && Number.isFinite(candidate.ts);
+}
+
 function cachedGeo(city: string): { id: string; lat: number; lon: number } | null {
   try {
-    const raw = store.get<{ id: string; lat: number; lon: number; ts: number }>(GEO_CACHE_PREFIX + city);
-    if (raw && Date.now() - raw.ts < GEO_CACHE_TTL_MS) return raw;
+    const key = GEO_CACHE_PREFIX + city;
+    const raw = store.get<GeoCacheEntry>(key);
+    if (!isValidGeoCacheEntry(raw)) {
+      // N2：升级前写入的脏缓存（空 id/非有限或越界坐标）立即清除并强制重新查询
+      if (raw !== undefined) store.del(key);
+      return null;
+    }
+    if (Date.now() - raw.ts < GEO_CACHE_TTL_MS) return { id: raw.id, lat: raw.lat, lon: raw.lon };
   } catch { /* 忽略缓存读取错误 */ }
   return null;
 }
@@ -111,8 +138,8 @@ export async function qweatherGeo(city: string): Promise<{ id: string; lat: numb
   if (!hit || typeof hit.id !== "string" || !hit.id) throw new Error(`和风天气未找到城市：${city}`);
   const lat = Number(hit.lat);
   const lon = Number(hit.lon);
-  // 坐标非有限数或越界：拒绝并避免把垃圾坐标写入 7 天缓存
-  if (!Number.isFinite(lat) || !Number.isFinite(lon) || lat < -90 || lat > 90 || lon < -180 || lon > 180) {
+  // 坐标非有限数或越界：拒绝并避免把垃圾坐标写入 7 天缓存（与缓存读取侧同一口径）
+  if (!isValidCoordinatePair(lat, lon)) {
     throw new Error(`和风天气返回无效坐标：${city}`);
   }
   const result = { id: hit.id, lat, lon };

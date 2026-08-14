@@ -75,9 +75,10 @@ function sanitizeRecurrence(raw: unknown, calendar: CalendarType): RecurrenceRul
     ? candidate.byWeekday.filter((day): day is string =>
       typeof day === "string" && ["SU", "MO", "TU", "WE", "TH", "FR", "SA"].includes(day))
     : undefined;
-  const leapMonthPolicy = typeof candidate.leapMonthPolicy === "string"
-    && ["normal", "leap", "both", "prefer-leap"].includes(candidate.leapMonthPolicy)
-    ? candidate.leapMonthPolicy as LeapMonthPolicy
+  const leapMonthPolicy = calendar === "lunar" && typeof candidate.leapMonthPolicy === "string"
+    // N3/D1-A：both/prefer-leap 未实现，读取侧归一为 normal（与 solarForLunar 现行为一致），
+    // 不保留一个不会正确执行的策略；非法取值同样回退 normal。
+    ? (candidate.leapMonthPolicy === "leap" ? "leap" : "normal")
     : undefined;
   return {
     frequency: candidate.frequency as Frequency,
@@ -100,9 +101,17 @@ function sanitizeReminders(raw: unknown): ReminderInput[] {
       typeof entry === "object" && entry !== null && !Array.isArray(entry))
     .map((entry, index) => {
       const rawId = typeof entry.id === "string" && entry.id ? entry.id : undefined;
-      // 旧行可能含重复 id（输入路径已拒绝，此处兜底）：重复时回退为位置 id，避免同键静默吞提醒
-      const id = rawId && !seen.has(rawId) ? rawId : `reminder-${index + 1}`;
-      if (rawId) seen.add(rawId);
+      // 旧行可能含重复 id（输入路径已拒绝，此处兜底）：重复时回退为位置 id。
+      // 自动生成的位置 id 同样占位去重集合（N1），避免与后续显式 id 撞车被静默折叠。
+      let id = rawId ?? `reminder-${index + 1}`;
+      if (seen.has(id)) {
+        let suffix = index + 1;
+        do {
+          id = `reminder-${suffix}`;
+          suffix += 1;
+        } while (seen.has(id));
+      }
+      seen.add(id);
       return {
         id,
         minutesBefore: Number.isInteger(entry.minutesBefore)
@@ -170,6 +179,11 @@ function normalizeRecurrence(input: ScheduleInput, calendar: CalendarType, type:
     throw new Error("count and until are mutually exclusive");
   }
   const policy = input.leapMonthPolicy ?? (input.isLeapMonth ? "leap" : "normal");
+  // N3/D1-A：both/prefer-leap 未实现，输入路径明确拒绝（MCP schema 已只开放 normal/leap，
+  // 此处兜底直接调用 service 的路径）
+  if (calendar === "lunar" && policy !== "normal" && policy !== "leap") {
+    throw new Error("leapMonthPolicy must be 'normal' or 'leap'");
+  }
   return {
     frequency,
     interval: Math.max(1, Number(raw.interval ?? 1)),
@@ -455,6 +469,21 @@ function calculateInitialNextRun(
   return initialCatchUpTriggers(item, from)[0] ?? null;
 }
 
+/** 标量列校验助手（N4/D2-A）：非法时按默认值兜底，不让单行毒化整个查询。 */
+function isValidTimeString(value: string): boolean {
+  if (!/^\d{2}:\d{2}$/.test(value)) return false;
+  const [hour, minute] = value.split(":").map(Number);
+  return hour <= 23 && minute <= 59;
+}
+
+function isValidTimezone(zone: string): boolean {
+  try {
+    return DateTime.fromISO("2020-01-01T00:00:00", { zone }).isValid;
+  } catch {
+    return false;
+  }
+}
+
 function rowToItem(row: Record<string, unknown>): ScheduleItem {
   const recurrence = sanitizeRecurrence(parseJson(row.recurrence_json, null), String(row.calendar) as CalendarType);
   // leap_month_policy 列是闰月策略的权威存储：即使 recurrence_json 漂移/缺失也以列值为准，
@@ -462,9 +491,30 @@ function rowToItem(row: Record<string, unknown>): ScheduleItem {
   const rowLeapPolicy = row.leap_month_policy;
   if (typeof rowLeapPolicy === "string"
     && ["normal", "leap", "both", "prefer-leap"].includes(rowLeapPolicy)) {
-    recurrence.leapMonthPolicy = rowLeapPolicy as LeapMonthPolicy;
+    // N3/D1-A：列值是权威存储；both/prefer-leap 归一为 normal
+    recurrence.leapMonthPolicy = rowLeapPolicy === "leap" ? "leap" : "normal";
   }
   const reminders = sanitizeReminders(parseJson(row.reminders_json, null));
+
+  // N4/D2-A：标量列校验与兜底。timezone/date/time/calendar 损坏时按默认值处理；
+  // date+time+timezone 的组合日历合法性（如 2026-02-30）同样兜底为无日期。
+  const rawDate = row.date == null ? undefined : String(row.date);
+  const rawTime = String(row.time ?? DEFAULT_TIME);
+  const rawTimezone = String(row.timezone ?? DEFAULT_ZONE);
+  const time = isValidTimeString(rawTime) ? rawTime : DEFAULT_TIME;
+  const timezone = isValidTimezone(rawTimezone)
+    ? rawTimezone
+    : (isValidTimezone(DEFAULT_ZONE) ? DEFAULT_ZONE : "Asia/Shanghai");
+  let date = rawDate !== undefined && /^\d{4}-\d{2}-\d{2}$/.test(rawDate) ? rawDate : undefined;
+  if (date !== undefined) {
+    try {
+      localDate(date, time, timezone);
+    } catch {
+      date = undefined;
+    }
+  }
+  const calendar: CalendarType = row.calendar === "lunar" ? "lunar" : "solar";
+
   const item: ScheduleItem = {
     id: String(row.id),
     profileId: String(row.profile_id),
@@ -473,11 +523,11 @@ function rowToItem(row: Record<string, unknown>): ScheduleItem {
     note: row.note == null ? undefined : String(row.note),
     priority: String(row.priority ?? "normal") as Priority,
     status: String(row.status ?? "active") as ScheduleStatus,
-    calendar: String(row.calendar) as CalendarType,
-    date: row.date == null ? undefined : String(row.date),
-    time: String(row.time ?? DEFAULT_TIME),
+    calendar,
+    date,
+    time,
     allDay: Boolean(row.all_day),
-    timezone: String(row.timezone ?? DEFAULT_ZONE),
+    timezone,
     lunarMonth: row.lunar_month == null ? undefined : Number(row.lunar_month),
     lunarDay: row.lunar_day == null ? undefined : Number(row.lunar_day),
     isLeapMonth: row.leap_month_policy === "leap",
@@ -491,8 +541,17 @@ function rowToItem(row: Record<string, unknown>): ScheduleItem {
     createdAt: String(row.created_at),
     updatedAt: String(row.updated_at),
   };
-  const next = item.nextRunAt ? findOccurrence(item, fromUtc(item.nextRunAt), true) : null;
-  if (next) item.nextOccurrenceSolar = next.toISO() ?? undefined;
+  // 派生值（nextOccurrenceSolar / nextRunAt 合法性）单独容错：损坏时丢弃派生值，
+  // 行本身仍可读，不向上抛错。
+  if (item.nextRunAt !== undefined) {
+    try {
+      const next = findOccurrence(item, fromUtc(item.nextRunAt), true);
+      item.nextOccurrenceSolar = next?.toISO() ?? undefined;
+    } catch {
+      item.nextOccurrenceSolar = undefined;
+      item.nextRunAt = undefined;
+    }
+  }
   return item;
 }
 

@@ -99,11 +99,23 @@
 接受并记录（不改）：redactUrl 对非 URL 输入原样返回（当前无调用方）；catch-up 滞后无上限
 （targetAt 仍在未来即补发是有意语义）；stale-snapshot 跳过日志可能刷屏（并发持续时）。
 
+## 三次审查（Codex CLI 独立对抗性复审）
+
+`dba9d96` 全部落地后，用 Codex CLI（独立第三方审查员）做只读静态复审：先读本文档，
+再逐项核对修复代码落点，并寻找回归/遗漏。发现 3 P2 + 1 P3，待 DeepSeek Harness 修复。
+
+| 级别 | 问题 | 位置 | 状态 |
+|---|---|---|---|
+| P2 | sanitizeReminders 自动生成的 `reminder-N` id 未加入去重集合：旧脏数据可造出两条同 id 提醒，第二条被 occurrence key 去重静默折叠丢失 | schedule/service.ts:102-105 | done（N1：生成 id 占位去重集合，冲突时递增回退） |
+| P2 | cachedGeo 只校验新写入、不校验旧缓存：升级前已写入的脏坐标（越界/NaN）7 天内读取时原样返回，继续毒化天气链路 | weather/provider.ts:95-106 | done（N2：读取侧与新写入同一校验口径，非法缓存立即清除并重新查询，同时剥离返回的 ts 元数据） |
+| P2 | P1-07 hydration 防护只覆盖 JSON 字段：timezone/date/time/calendar 标量列损坏的旧行仍会让 listSchedules/getSchedule 整体抛错（poison 行未完全关闭） | schedule/service.ts:480-496,130-134 | done（N4/D2-A：标量列校验兜底 + 派生值 try/catch） |
+| P3 | leapMonthPolicy `both`/`prefer-leap` 被类型与 sanitize 保留但 solarForLunar 未实现语义（仅 leap 特殊处理）；正常入口 schema 只开放 normal/leap 暂不受影响，建议入口拒绝或后续版本实现 | schedule/service.ts:278-287 | done（N3/D1-A：类型收窄为 normal/leap，输入路径拒绝，legacy 读取归一为 normal） |
+
 ## 验证命令
 
 ```bash
 npm run build                        # 必须零错误
-npm test                             # 全量，必须全绿（当前 204/204）
+npm test                             # 全量，必须全绿（当前 211/211）
 node --import tsx/esm --test tests/notification-publisher.test.ts tests/scheduler-notification-contract.test.ts
 node --import tsx/esm --test tests/weather-provider.test.ts tests/weather-notification.test.ts tests/location.test.ts
 node --import tsx/esm --test tests/oilprice-*.test.ts
@@ -112,6 +124,15 @@ node --import tsx/esm --test tests/schedule-*.test.ts tests/profile-schedule.tes
 
 ## 进度日志（新条目加在最上面）
 
+- 2026-08-14 N1-N4 修复完成（按 ~/artifacts/documents/life-assistant/dsh-fix-prompt-n1n4.md，
+  TDD 先红后绿）：N1 自动 id 占位去重集合；N2 cachedGeo 读取侧校验 + 清除脏缓存 + 剥离 ts；
+  N3/D1-A 类型收窄 normal/leap、输入拒绝、hydration 归一；N4/D2-A 标量列校验兜底。
+  新增 7 个回归测试（tests/weather-geo-cache.test.ts ×3 + profile-schedule ×4），
+  npm run build 零错误、npm test 211/211 全绿。按任务红线未 commit。
+- 2026-08-14 三次审查（Codex CLI 独立对抗性复审）完成：静态只读复审全量修复项，关键
+  语义均有代码证据、总体质量高；新发现 3 P2 + 1 P3（见「三次审查」表），待
+  DeepSeek Harness 修复。独立验证：git status 干净、npm run build 零错误、
+  npm test 204/204。报告存档 ~/artifacts/documents/life-assistant/codex-adversarial-review-20260814.md。
 - 2026-08-13 二次对抗性复审（3 路 flash 代理）完成：发现 1 P0 + 4 P1 + 9 P2（见
   「二次审查」表），全部修复并补 8 个回归测试（lunar 闰月 hydration、legacy count+until
   更新、日历非法 until、重复 reminder id、daily-brief legacy 改键、±1 分端到端发布、

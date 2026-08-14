@@ -1,7 +1,7 @@
 export type ScheduleType = "todo" | "birthday" | "anniversary";
 export type CalendarType = "solar" | "lunar";
 export type Frequency = "once" | "daily" | "weekly" | "monthly" | "yearly";
-export type LeapMonthPolicy = "normal" | "leap" | "both" | "prefer-leap";
+export type LeapMonthPolicy = "normal" | "leap";
 export type ScheduleStatus = "active" | "completed" | "archived";
 export type Priority = "low" | "normal" | "high";
 export type ReminderTarget = "occurrence" | "deadline";
