@@ -103,7 +103,7 @@
 
 ```bash
 npm run build                        # 必须零错误
-npm test                             # 全量，必须全绿（当前 171/171）
+npm test                             # 全量，必须全绿（当前 204/204）
 node --import tsx/esm --test tests/notification-publisher.test.ts tests/scheduler-notification-contract.test.ts
 node --import tsx/esm --test tests/weather-provider.test.ts tests/weather-notification.test.ts tests/location.test.ts
 node --import tsx/esm --test tests/oilprice-*.test.ts
@@ -112,11 +112,12 @@ node --import tsx/esm --test tests/schedule-*.test.ts tests/profile-schedule.tes
 
 ## 进度日志（新条目加在最上面）
 
-- 2026-08-13 二次对抗性复审（3 路 flash 代理）完成：发现 1 P0 + 3 P1 + 若干 P2（见
-  「二次审查」表），全部修复并补回归测试（含 lunar 闰月 hydration、legacy count+until
+- 2026-08-13 二次对抗性复审（3 路 flash 代理）完成：发现 1 P0 + 4 P1 + 9 P2（见
+  「二次审查」表），全部修复并补 8 个回归测试（lunar 闰月 hydration、legacy count+until
   更新、日历非法 until、重复 reminder id、daily-brief legacy 改键、±1 分端到端发布、
-  无 schemaVersion 迁移、坐标边界/NaN 等 9 个新用例）。最终验证：npm run build 零错误、
-  npm test 204/204 全绿。已提交 commit `dba9d96`。
+  无 schemaVersion 迁移、坐标边界/NaN）。最终验证：npm run build 零错误、
+  npm test 204/204 全绿。代码提交 `dba9d96`（其 commit 消息写作 "3 P1"，实际为 4 P1，
+  以本文档为准），文档提交 `da62c42`。
 - 2026-08-13 全部 P1（12 项）与 P2-01..P2-22 完成：主代理修复 notifier/scheduler/package/gitignore；
   三路 flash 子代理（workflow，deepseek-v4-flash）修复 weather/oilprice/schedule 分区；
   主代理集成审查修正两处：O8 窗口交叉校验改为"最近窗口日±1 天"（消除每日误告警）、
