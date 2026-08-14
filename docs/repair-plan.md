@@ -111,11 +111,21 @@
 | P2 | P1-07 hydration 防护只覆盖 JSON 字段：timezone/date/time/calendar 标量列损坏的旧行仍会让 listSchedules/getSchedule 整体抛错（poison 行未完全关闭） | schedule/service.ts:480-496,130-134 | done（N4/D2-A：标量列校验兜底 + 派生值 try/catch） |
 | P3 | leapMonthPolicy `both`/`prefer-leap` 被类型与 sanitize 保留但 solarForLunar 未实现语义（仅 leap 特殊处理）；正常入口 schema 只开放 normal/leap 暂不受影响，建议入口拒绝或后续版本实现 | schedule/service.ts:278-287 | done（N3/D1-A：类型收窄为 normal/leap，输入路径拒绝，legacy 读取归一为 normal） |
 
+### 三次审查遗留（P3，第四轮修复前发现，待 DSH 修）
+
+修复 commit `f413779` 后第三轮复审（Codex CLI）发现 3 项 P3，不阻塞但建议收尾：
+
+| # | 问题 | 位置 | 状态 |
+|---|---|---|---|
+| P3-1 | 进度日志「按任务红线未 commit」与实际提交 `f413779` 矛盾，真相源误导 | docs/repair-plan.md 进度日志 | done（2026-08-14 主代理修正表述） |
+| P3-2 | N4 派生值 try/catch 边界偏宽：同时包住 `fromUtc` 与 `findOccurrence`，后者未来出现真逻辑 bug 会被静默吞掉，日程不触发且无日志 | schedule/service.ts:546-553 | done（fromUtc 与 findOccurrence 分离；findOccurrence 非预期异常 console.error 并保留 nextRunAt；hydrateRow 增加可注入 findImpl 供测试） |
+| P3-3 | N4 只校验四标量列：`lunar_month`/`lunar_day`/`deadline_offset_minutes`/`version` 仍直接 `Number(...)`，NaN 可致 `nextReminderTiming` 返回 null → 日程静默停用、提醒丢失 | schedule/service.ts:531-540,399-400 | done（finiteIntOrUndefined 校验整数/范围，非法按默认值兜底） |
+
 ## 验证命令
 
 ```bash
 npm run build                        # 必须零错误
-npm test                             # 全量，必须全绿（当前 211/211）
+npm test                             # 全量，必须全绿（当前 214/214）
 node --import tsx/esm --test tests/notification-publisher.test.ts tests/scheduler-notification-contract.test.ts
 node --import tsx/esm --test tests/weather-provider.test.ts tests/weather-notification.test.ts tests/location.test.ts
 node --import tsx/esm --test tests/oilprice-*.test.ts
@@ -124,11 +134,18 @@ node --import tsx/esm --test tests/schedule-*.test.ts tests/profile-schedule.tes
 
 ## 进度日志（新条目加在最上面）
 
+- 2026-08-14 P3-2/P3-3 收尾硬化完成（按 ~/artifacts/documents/life-assistant/dsh-fix-prompt-p3.md，
+  TDD 先红后绿）：P3-2 fromUtc 与 findOccurrence 分离，后者非预期异常 console.error
+  且保留 nextRunAt（hydrateRow 增加可选 findImpl 注入点）；P3-3 四数值列
+  finiteIntOrUndefined 校验兜底（lunar_month 1-12 / lunar_day 1-30 /
+  deadline_offset_minutes 0-525600 / version ≥1 缺省 1）。新增 3 个回归测试
+  （profile-schedule ×2 + schedule-scheduler-deadline ×1），npm run build 零错误、
+  npm test 214/214 全绿。代码提交 `d571a60`。
 - 2026-08-14 N1-N4 修复完成（按 ~/artifacts/documents/life-assistant/dsh-fix-prompt-n1n4.md，
   TDD 先红后绿）：N1 自动 id 占位去重集合；N2 cachedGeo 读取侧校验 + 清除脏缓存 + 剥离 ts；
   N3/D1-A 类型收窄 normal/leap、输入拒绝、hydration 归一；N4/D2-A 标量列校验兜底。
   新增 7 个回归测试（tests/weather-geo-cache.test.ts ×3 + profile-schedule ×4），
-  npm run build 零错误、npm test 211/211 全绿。按任务红线未 commit。
+  npm run build 零错误、npm test 211/211 全绿。已提交 `f413779`。
 - 2026-08-14 三次审查（Codex CLI 独立对抗性复审）完成：静态只读复审全量修复项，关键
   语义均有代码证据、总体质量高；新发现 3 P2 + 1 P3（见「三次审查」表），待
   DeepSeek Harness 修复。独立验证：git status 干净、npm run build 零错误、
