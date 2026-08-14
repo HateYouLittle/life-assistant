@@ -25,15 +25,27 @@ export const locationSetSchema = z.object({
 /** 获取已确认位置；未确认返回 null */
 export function currentLocation(): Location | null {
   const saved = store.get<Location>(KEY);
-  if (saved) return saved;
+  if (saved) {
+    // 旧 schema 允许脏数据（空 city、越界/Infinity 坐标）：读取侧校验，
+    // 非法则视为未确认，走重新确认流程，避免天气/油价链路持续失败
+    const parsed = locationSetSchema.safeParse(saved);
+    if (parsed.success) {
+      return { ...parsed.data, source: saved.source, confirmedAt: saved.confirmedAt };
+    }
+    return null;
+  }
   if (config.location.city && config.location.lat !== undefined && config.location.lon !== undefined) {
-    return {
-      city: config.location.city,
-      lat: config.location.lat,
-      lon: config.location.lon,
-      source: "env",
-      confirmedAt: new Date().toISOString(),
-    };
+    const { lat, lon } = config.location;
+    // env 预置坐标同样校验有限性与范围，非法视为未配置
+    if (Number.isFinite(lat) && Number.isFinite(lon) && lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180) {
+      return {
+        city: config.location.city,
+        lat,
+        lon,
+        source: "env",
+        confirmedAt: new Date().toISOString(),
+      };
+    }
   }
   return null;
 }

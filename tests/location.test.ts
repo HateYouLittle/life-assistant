@@ -22,3 +22,16 @@ test("location.set rejects empty city, overlong city, and out-of-range coordinat
   assert.throws(() => locationSetSchema.parse({ city: "北京", lat: 39.32, lon: 180.5 }));
   assert.throws(() => locationSetSchema.parse({ city: "北京", lat: 39.32, lon: -180.5 }));
 });
+
+test("location.set accepts boundary coordinates and rejects NaN/Infinity", () => {
+  assert.deepEqual(
+    locationSetSchema.parse({ city: "北京", lat: 90, lon: 180 }),
+    { city: "北京", lat: 90, lon: 180 },
+  );
+  assert.deepEqual(
+    locationSetSchema.parse({ city: "北京", lat: -90, lon: -180 }),
+    { city: "北京", lat: -90, lon: -180 },
+  );
+  assert.throws(() => locationSetSchema.parse({ city: "北京", lat: Number.NaN, lon: 112.43 }));
+  assert.throws(() => locationSetSchema.parse({ city: "北京", lat: 39.32, lon: Number.POSITIVE_INFINITY }));
+});

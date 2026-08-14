@@ -253,11 +253,13 @@ export async function deliverPendingProfileNotifications(options: {
 
   // route 同名恢复后重新入队：仅限因 route 配置漂移进入 fallback、且尚未被
   // notify.pull 读取的行。transport/幂等窗口导致的 fallback 保持终态，避免重复投递。
+  // 注意：带 profileIdFilter 的调用只恢复目标 profile，其余 profile 由全局 tick 恢复。
   for (const [configuredProfileId, configuredRoute] of Object.entries(config.profilePushRoutes)) {
     if (profileIdFilter && configuredProfileId !== profileIdFilter) continue;
     db.prepare(`
       UPDATE profile_notification_deliveries
-      SET status = 'pending', attempts = 0, request_generation = 1,
+      SET status = 'pending', attempts = 0,
+          request_generation = request_generation + 1,
           request_started_at = NULL, transport_failures = 0,
           next_attempt_at = ?, last_error = NULL,
           claim_token = NULL, claimed_at = NULL, updated_at = ?

@@ -108,8 +108,14 @@ export async function qweatherGeo(city: string): Promise<{ id: string; lat: numb
     `https://${config.qweatherApiHost}/geo/v2/city/lookup?location=${encodeURIComponent(city)}&key=${config.qweatherKey}`,
   );
   const hit = geo.location?.[0];
-  if (!hit) throw new Error(`和风天气未找到城市：${city}`);
-  const result = { id: hit.id, lat: Number(hit.lat), lon: Number(hit.lon) };
+  if (!hit || typeof hit.id !== "string" || !hit.id) throw new Error(`和风天气未找到城市：${city}`);
+  const lat = Number(hit.lat);
+  const lon = Number(hit.lon);
+  // 坐标非有限数或越界：拒绝并避免把垃圾坐标写入 7 天缓存
+  if (!Number.isFinite(lat) || !Number.isFinite(lon) || lat < -90 || lat > 90 || lon < -180 || lon > 180) {
+    throw new Error(`和风天气返回无效坐标：${city}`);
+  }
+  const result = { id: hit.id, lat, lon };
   store.set(GEO_CACHE_PREFIX + city, { ...result, ts: Date.now() });
   return result;
 }
@@ -123,8 +129,9 @@ export async function fetchCurrent(lat: number, lon: number, city?: string): Pro
       const r = await httpJson<{ code?: string; now?: { temp: string; feelsLike: string; humidity: string; windSpeed: string; text: string; icon: string } }>(
         `https://${config.qweatherApiHost}/v7/weather/now?location=${loc?.id ?? `${lon.toFixed(2)},${lat.toFixed(2)}`}&key=${config.qweatherKey}`,
       );
-      // 和风业务错误：HTTP 200 + code 字段（如 401/402/403）→ 抛出后走 Open-Meteo 降级
-      if (typeof r.code === "string" && r.code !== "200") {
+      // 和风业务错误：HTTP 200 + code 字段（如 401/402/403）→ 抛出后走 Open-Meteo 降级。
+      // code 可能是数字或字符串，统一 String 化比较，避免数字型 code 绕过检查。
+      if (r.code !== undefined && r.code !== null && String(r.code) !== "200") {
         throw new Error(`QWeather weathernow error code ${r.code}`);
       }
       if (r.now) {
@@ -165,7 +172,7 @@ export async function fetchForecast(lat: number, lon: number, days = 3, city?: s
         `https://${config.qweatherApiHost}/v7/weather/${daysKey}?location=${loc?.id ?? `${lon.toFixed(2)},${lat.toFixed(2)}`}&key=${config.qweatherKey}`,
       );
       // 和风业务错误：HTTP 200 + code 字段（如 401/402/403）→ 抛出后走 Open-Meteo 降级
-      if (typeof r.code === "string" && r.code !== "200") {
+      if (r.code !== undefined && r.code !== null && String(r.code) !== "200") {
         throw new Error(`QWeather weatherforecast error code ${r.code}`);
       }
       if (r.daily) {
@@ -227,7 +234,7 @@ export async function fetchAlerts(city: string, lat: number, lon: number): Promi
         `https://${config.qweatherApiHost}/weatheralert/v1/current/${lat.toFixed(2)}/${lon.toFixed(2)}?key=${config.qweatherKey}`,
       );
       // 和风业务错误：HTTP 200 + code 字段（如 401/402/403）→ 抛出后走阈值推断降级
-      if (typeof r.code === "string" && r.code !== "200") {
+      if (r.code !== undefined && r.code !== null && String(r.code) !== "200") {
         throw new Error(`QWeather weatheralert error code ${r.code}`);
       }
       const attributions = r.metadata?.attributions ?? [];

@@ -55,12 +55,17 @@ function sanitizeRecurrence(raw: unknown, calendar: CalendarType): RecurrenceRul
   }
   const interval = candidate.interval;
   // 可选字段一律做类型/取值强制，非法即丢弃，杜绝损坏行再次进入 RRule/luxon 崩溃路径
-  const until = typeof candidate.until === "string" && /^\d{4}-\d{2}-\d{2}$/.test(candidate.until)
+  let until = typeof candidate.until === "string" && /^\d{4}-\d{2}-\d{2}$/.test(candidate.until)
     ? candidate.until
     : undefined;
-  const count = Number.isInteger(candidate.count) && (candidate.count as number) >= 1
+  // 格式合法但日历非法（如 2099-02-30）会打挂 localDate/RRule，读取侧直接丢弃
+  if (until !== undefined && !DateTime.fromISO(until, { zone: "utc" }).isValid) until = undefined;
+  let count = Number.isInteger(candidate.count) && (candidate.count as number) >= 1
     ? candidate.count as number
     : undefined;
+  // 存量行可能同时含 count 与 until（旧 schema 允许）：读取侧保留 count、丢弃 until，
+  // 避免 update 时被互斥校验误伤（输入路径仍严格互斥）。
+  if (count !== undefined && until !== undefined) until = undefined;
   const byMonthDay = Number.isInteger(candidate.byMonthDay)
     && (candidate.byMonthDay as number) >= 1
     && (candidate.byMonthDay as number) <= 31
@@ -70,6 +75,10 @@ function sanitizeRecurrence(raw: unknown, calendar: CalendarType): RecurrenceRul
     ? candidate.byWeekday.filter((day): day is string =>
       typeof day === "string" && ["SU", "MO", "TU", "WE", "TH", "FR", "SA"].includes(day))
     : undefined;
+  const leapMonthPolicy = typeof candidate.leapMonthPolicy === "string"
+    && ["normal", "leap", "both", "prefer-leap"].includes(candidate.leapMonthPolicy)
+    ? candidate.leapMonthPolicy as LeapMonthPolicy
+    : undefined;
   return {
     frequency: candidate.frequency as Frequency,
     interval: Number.isInteger(interval) && (interval as number) >= 1 ? (interval as number) : 1,
@@ -77,6 +86,7 @@ function sanitizeRecurrence(raw: unknown, calendar: CalendarType): RecurrenceRul
     ...(byMonthDay !== undefined ? { byMonthDay } : {}),
     ...(until !== undefined ? { until } : {}),
     ...(count !== undefined ? { count } : {}),
+    ...(leapMonthPolicy !== undefined ? { leapMonthPolicy } : {}),
     calendar,
   };
 }
@@ -84,18 +94,25 @@ function sanitizeRecurrence(raw: unknown, calendar: CalendarType): RecurrenceRul
 /** hydration 兜底：reminders_json 非数组时给默认提醒；数组内逐条过滤非对象项并归一化（P1-07）。 */
 function sanitizeReminders(raw: unknown): ReminderInput[] {
   if (!Array.isArray(raw)) return [{ minutesBefore: 0, id: "reminder-1", target: "occurrence" }];
+  const seen = new Set<string>();
   return raw
     .filter((entry): entry is Record<string, unknown> =>
       typeof entry === "object" && entry !== null && !Array.isArray(entry))
-    .map((entry, index) => ({
-      id: typeof entry.id === "string" && entry.id ? entry.id : `reminder-${index + 1}`,
-      minutesBefore: Number.isInteger(entry.minutesBefore)
-        && (entry.minutesBefore as number) >= 0
-        && (entry.minutesBefore as number) <= 60 * 24 * 365
-        ? entry.minutesBefore as number
-        : 0,
-      target: entry.target === "deadline" ? "deadline" : "occurrence",
-    }));
+    .map((entry, index) => {
+      const rawId = typeof entry.id === "string" && entry.id ? entry.id : undefined;
+      // 旧行可能含重复 id（输入路径已拒绝，此处兜底）：重复时回退为位置 id，避免同键静默吞提醒
+      const id = rawId && !seen.has(rawId) ? rawId : `reminder-${index + 1}`;
+      if (rawId) seen.add(rawId);
+      return {
+        id,
+        minutesBefore: Number.isInteger(entry.minutesBefore)
+          && (entry.minutesBefore as number) >= 0
+          && (entry.minutesBefore as number) <= 60 * 24 * 365
+          ? entry.minutesBefore as number
+          : 0,
+        target: entry.target === "deadline" ? "deadline" : "occurrence",
+      };
+    });
 }
 
 function assertDate(value: string | undefined, field: string): void {
@@ -440,6 +457,13 @@ function calculateInitialNextRun(
 
 function rowToItem(row: Record<string, unknown>): ScheduleItem {
   const recurrence = sanitizeRecurrence(parseJson(row.recurrence_json, null), String(row.calendar) as CalendarType);
+  // leap_month_policy 列是闰月策略的权威存储：即使 recurrence_json 漂移/缺失也以列值为准，
+  // 避免农历闰月日程在读取侧被按普通月计算（二次审查 P0）。
+  const rowLeapPolicy = row.leap_month_policy;
+  if (typeof rowLeapPolicy === "string"
+    && ["normal", "leap", "both", "prefer-leap"].includes(rowLeapPolicy)) {
+    recurrence.leapMonthPolicy = rowLeapPolicy as LeapMonthPolicy;
+  }
   const reminders = sanitizeReminders(parseJson(row.reminders_json, null));
   const item: ScheduleItem = {
     id: String(row.id),

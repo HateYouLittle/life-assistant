@@ -106,7 +106,13 @@ export async function runDailyWeatherBrief(options: DailyWeatherBriefOptions = {
     generatedAt: at.toISOString(),
     payload,
   };
-  await publishNotification(notification, options.publish ? { publishGlobal: options.publish } : {});
+  await publishNotification(
+    notification,
+    options.publish ? { publishGlobal: options.publish } : {},
+    // 升级兼容：旧版本键形如 weather:daily-brief:{localDate}，同日升级会与带城市的新键
+    // 各产生一条通知；传入 legacy 键让既有行被改键复用，避免升级当天重复推送。
+    [`weather:daily-brief:${localDate}`],
+  );
 }
 
 export interface WeatherAlertsCheckOptions {
@@ -140,7 +146,7 @@ export async function runWeatherAlertsCheck(options: WeatherAlertsCheckOptions =
         });
         await publishNotification(notification, { publishGlobal: publish }, legacyDedupeKeys);
       } catch (error) {
-        // 与 official 分支一致：单条推断告警失败不影响其余告警
+        // 推断分支连发布失败也一并隔离（不阻断其余告警）；official 分支仅隔离构建错误。
         console.error(`[weather] inferred alert omitted: ${(error as Error).message}`);
       }
       continue;
@@ -189,6 +195,11 @@ async function resolveLocation(city?: string): Promise<{ city: string; lat: numb
   );
   const hit = r.results?.[0];
   if (!hit) throw new Error(`未找到城市：${city}`);
+  // 与 location.detect 同一校验口径：坐标非有限数或越界时拒绝
+  if (!Number.isFinite(hit.latitude) || !Number.isFinite(hit.longitude)
+    || hit.latitude < -90 || hit.latitude > 90 || hit.longitude < -180 || hit.longitude > 180) {
+    throw new Error(`城市坐标无效：${city}`);
+  }
   return { city: hit.name, lat: hit.latitude, lon: hit.longitude };
 }
 

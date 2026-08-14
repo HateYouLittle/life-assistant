@@ -462,3 +462,53 @@ test("a provider window date within one day of the nearest table window stays si
   }
   assert.equal(errors.length, 0);
 });
+
+test("a one-cent rounding deviation is accepted end to end and publishes the official result", async () => {
+  // provider 与 watch 必须同口径：±1 分舍入偏差允许发布，2 分偏差仍拒绝（retry）
+  const repository = memoryRepository(structuredClone(baselineState));
+  const calls: string[] = [];
+  const outcome = await observeOilPrice(nextObservation({
+    fuels: {
+      p92: { current: "8.03", previous: "7.93", change: "0.09" },   // 差值 0.10，偏差 +1 分
+      p95: { current: "8.46", previous: "8.51", change: "-0.04" },  // 差值 -0.05，偏差 +1 分
+      p0: { current: "7.69", previous: "7.69", change: "0.00" },
+    },
+  }), {
+    observedAt: new Date("2026-08-15T01:00:00.000Z"),
+    repository,
+    publish: async (_source, _title, _body, dedupeKey) => { calls.push(dedupeKey); },
+  });
+  assert.equal(outcome, "published");
+  assert.deepEqual(calls, ["oilprice:result:江西:2026-08-14"]);
+
+  const twoCent = memoryRepository(structuredClone(baselineState));
+  const twoCentCalls: string[] = [];
+  assert.equal(await observeOilPrice(nextObservation({
+    fuels: {
+      p92: { current: "8.03", previous: "7.93", change: "0.08" },   // 差值 0.10，偏差 2 分
+      p95: { current: "8.46", previous: "8.51", change: "-0.05" },
+      p0: { current: "7.69", previous: "7.69", change: "0.00" },
+    },
+  }), {
+    observedAt: new Date("2026-08-15T01:00:00.000Z"),
+    repository: twoCent,
+    publish: async (_source, _title, _body, dedupeKey) => { twoCentCalls.push(dedupeKey); },
+  }), "retry");
+  assert.equal(twoCentCalls.length, 0);
+});
+
+test("a complete pre-upgrade state without schemaVersion keeps the in-flight window flow", async () => {
+  // 升级兼容：字段完整仅缺 schemaVersion 的旧 state 应直接走发布流程，
+  // 而不是被当作损坏重建 baseline（那样会吞掉一个在途窗口的正式结果）
+  const { schemaVersion: _dropped, ...legacyState } = structuredClone(baselineState);
+  const repository = memoryRepository(legacyState as OilPriceState);
+  const calls: string[] = [];
+  const outcome = await observeOilPrice(nextObservation(), {
+    observedAt: new Date("2026-08-15T01:00:00.000Z"),
+    repository,
+    publish: async (_source, _title, _body, dedupeKey) => { calls.push(dedupeKey); },
+  });
+  assert.equal(outcome, "published");
+  assert.deepEqual(calls, ["oilprice:result:江西:2026-08-14"]);
+  assert.equal(repository.value?.schemaVersion, 1);
+});

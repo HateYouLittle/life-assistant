@@ -29,6 +29,8 @@ export function nextAdjustmentSummary(at = new Date()) {
   if (!window) return null;
   return {
     ...window,
+    // 展示层保留 1 位小数，避免浮点误差；逻辑阈值使用精确值
+    hoursUntil: Math.round(window.hoursUntil * 10) / 10,
     note: "调价于窗口日 24:00 生效；正式结果发布时间不固定，请以正式调价数据为准。",
   };
 }

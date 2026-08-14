@@ -74,6 +74,31 @@
 - 投递表 retention 清理 job、X-Request-ID 匿名化、secret 熵校验增强：后续版本。
 - notifier 每 tick 全表扫描 UPDATE 的索引优化：个人助理规模可接受，后续版本。
 
+## 二次审查（对抗性复审）
+
+修复 commit `b274d08` 之后，用 3 个全新 flash 审查代理对全部 diff 做了对抗性复审（只读），
+发现并修复：
+
+| 级别 | 问题 | 修复 |
+|---|---|---|
+| P0 | sanitizeRecurrence 丢弃 leapMonthPolicy，农历闰月日程读取侧按普通月算日期 | 保留 JSON 中的合法策略 + 以 `leap_month_policy` 列值为权威覆盖；回归测试 |
+| P1 | ±1 分容差只在 provider 放宽，watch.ts:117 仍严格比对 → 官方结果静默丢弃 | watch 消费端同口径放宽；端到端发布测试 + 2 分拒绝测试 |
+| P1 | 数字型 code 绕过和风业务错误码检查（fetchAlerts 静默为空） | 三处改为 `String(r.code) !== "200"` 统一比较 |
+| P1 | legacy 行同时含 count+until 时任何 update 被互斥校验误伤 | hydration 侧保留 count 丢弃 until；回归测试 |
+| P1 | 格式合法但日历非法的 until（2099-02-30）仍打挂读取路径 | sanitize 用 luxon 校验日历合法性，非法丢弃；回归测试 |
+| P2 | daily-brief 键加城市后升级当天与旧键重复推送 | runDailyWeatherBrief 传 legacy 键走既有改键复用机制；回归测试 |
+| P2 | fallback 重新入队重置 request_generation=1，可能与漂移前 a1 请求号撞号 | 改为 `request_generation + 1` |
+| P2 | hoursUntil 四舍五入使 `hoursUntil < 40` 阈值漂移（39.96→40 漏发 advance） | 逻辑用精确值，仅工具展示层取整 |
+| P2 | isValidOilPriceState 拒绝缺 schemaVersion 的完整旧 state → 升级后吞掉在途窗口结果 | schemaVersion 允许缺失（其余字段严格校验）；迁移测试 |
+| P2 | 旧库脏位置数据（空 city/越界坐标）继续毒化天气/油价链路 | currentLocation 读取侧 safeParse 校验 + env 坐标校验 |
+| P2 | resolveLocation / qweatherGeo 的兜底坐标未校验（与 location.detect 不对称） | 两处补有限性/范围校验，qweatherGeo 拒绝垃圾坐标入缓存 |
+| P2 | hydration 后重复 reminder id 静默折叠 | sanitizeReminders 重复 id 回退为位置 id；回归测试 |
+| P2 | nearestWindowDeviationDays 遇表内非法条目得 NaN 禁用告警 | 循环内 Number.isFinite 防御 |
+| P2 | 测试缺口（边界坐标/NaN、迁移场景） | location 边界接受测试、oilprice 迁移测试 |
+
+接受并记录（不改）：redactUrl 对非 URL 输入原样返回（当前无调用方）；catch-up 滞后无上限
+（targetAt 仍在未来即补发是有意语义）；stale-snapshot 跳过日志可能刷屏（并发持续时）。
+
 ## 验证命令
 
 ```bash
@@ -87,6 +112,11 @@ node --import tsx/esm --test tests/schedule-*.test.ts tests/profile-schedule.tes
 
 ## 进度日志（新条目加在最上面）
 
+- 2026-08-13 二次对抗性复审（3 路 flash 代理）完成：发现 1 P0 + 3 P1 + 若干 P2（见
+  「二次审查」表），全部修复并补回归测试（含 lunar 闰月 hydration、legacy count+until
+  更新、日历非法 until、重复 reminder id、daily-brief legacy 改键、±1 分端到端发布、
+  无 schemaVersion 迁移、坐标边界/NaN 等 9 个新用例）。最终验证：npm run build 零错误、
+  npm test 204/204 全绿。已提交 commit `6f0b0b7`（待确认哈希）。
 - 2026-08-13 全部 P1（12 项）与 P2-01..P2-22 完成：主代理修复 notifier/scheduler/package/gitignore；
   三路 flash 子代理（workflow，deepseek-v4-flash）修复 weather/oilprice/schedule 分区；
   主代理集成审查修正两处：O8 窗口交叉校验改为"最近窗口日±1 天"（消除每日误告警）、

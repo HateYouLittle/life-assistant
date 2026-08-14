@@ -71,13 +71,14 @@ function currentFuels(observation: OilPriceObservation): Record<FuelKey, string>
 }
 
 /**
- * 校验持久化 state 的形状：schemaVersion 1、必填字符串字段、油价为两位小数正价格、
- * 可选字段为 string 或缺失。用于识别损坏/旧格式的持久化数据，避免每日 TypeError 死循环。
+ * 校验持久化 state 的形状：必填字符串字段、油价为两位小数正价格、可选字段为 string 或缺失。
+ * schemaVersion 允许缺失（升级前的完整旧 state 视为合法，避免吞掉在途窗口的正式结果）；
+ * 用于识别损坏/旧格式的持久化数据，避免每日 TypeError 死循环。
  */
 export function isValidOilPriceState(state: unknown): state is OilPriceState {
   if (!state || typeof state !== "object") return false;
   const candidate = state as Record<string, unknown>;
-  if (candidate.schemaVersion !== 1) return false;
+  if (candidate.schemaVersion !== undefined && candidate.schemaVersion !== 1) return false;
   if (candidate.initialized !== true) return false;
   if (typeof candidate.province !== "string") return false;
   if (candidate.unit !== "元/升") return false;
@@ -114,7 +115,10 @@ function completeAdjustmentEvidence(observation: OilPriceObservation, state: Oil
     const previous = cents(fuel.previous);
     const change = cents(fuel.change);
     if (current === undefined || previous === undefined || change === undefined) return false;
-    if (current - previous !== change) return false;
+    // 与 provider.ts 的 ±1 分容差保持同一口径：数据源四舍五入口径不同时仍视为证据完整，
+    // 否则该窗口的正式结果会被静默丢弃（二次审查 P1）。
+    const delta = (current - previous) - change;
+    if (delta > 1n || delta < -1n) return false;
   }
   return true;
 }

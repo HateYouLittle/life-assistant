@@ -1931,3 +1931,129 @@ test("hydration tolerates malformed recurrence_json and reminders_json without t
     db.prepare("DELETE FROM schedules WHERE profile_id = ? AND id LIKE 'hydrate-%'").run(a.id);
   }
 });
+
+test("hydration preserves lunar leap-month policy from the authoritative column", () => {
+  // 二次审查 P0 回归：sanitizeRecurrence 曾丢弃 leapMonthPolicy，导致闰月日程
+  // 在读取侧被按普通月计算。列值 leap_month_policy 是权威存储，JSON 漂移也必须以列值为准。
+  const a = requireProfileContext("profile-a");
+  const item = createSchedule(a, {
+    title: "闰月纪念",
+    calendar: "lunar",
+    lunarMonth: 2,
+    lunarDay: 10,
+    leapMonthPolicy: "leap",
+    timezone: "Asia/Shanghai",
+  });
+  try {
+    const raw = db.prepare(
+      "SELECT leap_month_policy, recurrence_json FROM schedules WHERE profile_id = ? AND id = ?",
+    ).get(a.id, item.id) as Record<string, unknown>;
+    assert.equal(raw.leap_month_policy, "leap");
+    // 模拟 recurrence_json 漂移（缺 leapMonthPolicy）
+    const drifted = JSON.parse(String(raw.recurrence_json)) as Record<string, unknown>;
+    delete drifted.leapMonthPolicy;
+    db.prepare("UPDATE schedules SET recurrence_json = ? WHERE profile_id = ? AND id = ?")
+      .run(JSON.stringify(drifted), a.id, item.id);
+    const hydrated = getSchedule(a, item.id);
+    assert.equal(hydrated.recurrence.leapMonthPolicy, "leap");
+    assert.equal(hydrated.isLeapMonth, true);
+  } finally {
+    db.prepare("DELETE FROM schedules WHERE profile_id = ? AND id = ?").run(a.id, item.id);
+  }
+});
+
+test("legacy rows carrying both count and until can still be updated", () => {
+  // 旧 schema 允许 count 与 until 共存；读取侧归一化（保留 count 丢弃 until），
+  // 仅改标题的 update 不得被互斥校验误伤
+  const a = requireProfileContext("profile-a");
+  const stamp = "2099-01-01T00:00:00.000Z";
+  db.prepare(`
+    INSERT INTO schedules(profile_id, id, type, title, priority, status, calendar, date, time, all_day, timezone, recurrence_json, reminders_json, enabled, version, created_at, updated_at)
+    VALUES(?, 'legacy-count-until', 'todo', 'legacy', 'normal', 'active', 'solar', '2099-01-02', '09:00', 1, 'Asia/Shanghai',
+      '{"frequency":"daily","interval":1,"count":3,"until":"2099-01-31","calendar":"solar"}',
+      '[{"minutesBefore":0,"id":"reminder-1","target":"occurrence"}]', 0, 1, ?, ?)
+  `).run(a.id, stamp, stamp);
+  try {
+    const updated = updateSchedule(a, "legacy-count-until", { title: "renamed legacy" });
+    assert.equal(updated.title, "renamed legacy");
+    assert.equal(updated.recurrence.count, 3);
+    assert.equal(updated.recurrence.until, undefined);
+  } finally {
+    db.prepare("DELETE FROM schedules WHERE profile_id = ? AND id = ?").run(a.id, "legacy-count-until");
+  }
+});
+
+test("hydration drops format-legal but calendar-invalid until dates", () => {
+  // "2099-02-30" 格式合法但日历非法：读取侧必须丢弃，否则 localDate/RRule 抛错
+  const a = requireProfileContext("profile-a");
+  const stamp = "2099-01-01T00:00:00.000Z";
+  db.prepare(`
+    INSERT INTO schedules(profile_id, id, type, title, priority, status, calendar, time, all_day, timezone, recurrence_json, reminders_json, enabled, version, created_at, updated_at)
+    VALUES(?, 'legacy-bad-until', 'todo', 'bad until', 'normal', 'active', 'solar', '09:00', 1, 'Asia/Shanghai',
+      '{"frequency":"daily","interval":1,"until":"2099-02-30","calendar":"solar"}',
+      '[{"minutesBefore":0,"id":"reminder-1","target":"occurrence"}]', 0, 1, ?, ?)
+  `).run(a.id, stamp, stamp);
+  try {
+    const item = getSchedule(a, "legacy-bad-until");
+    assert.equal(item.recurrence.until, undefined);
+    assert.doesNotThrow(() => listSchedules(a));
+  } finally {
+    db.prepare("DELETE FROM schedules WHERE profile_id = ? AND id = ?").run(a.id, "legacy-bad-until");
+  }
+});
+
+test("hydration re-ids duplicate reminder ids so no reminder is silently folded", () => {
+  // 旧行含重复 id 时读取侧回退为位置 id，避免同 dedupe 键静默吞掉一条提醒
+  const a = requireProfileContext("profile-a");
+  const stamp = "2099-01-01T00:00:00.000Z";
+  db.prepare(`
+    INSERT INTO schedules(profile_id, id, type, title, priority, status, calendar, time, all_day, timezone, recurrence_json, reminders_json, enabled, version, created_at, updated_at)
+    VALUES(?, 'legacy-dup-reminders', 'todo', 'dup', 'normal', 'active', 'solar', '09:00', 1, 'Asia/Shanghai',
+      '{"frequency":"daily","interval":1,"calendar":"solar"}',
+      '[{"id":"dup","minutesBefore":10},{"id":"dup","minutesBefore":20}]', 0, 1, ?, ?)
+  `).run(a.id, stamp, stamp);
+  try {
+    const item = getSchedule(a, "legacy-dup-reminders");
+    assert.equal(item.reminders.length, 2);
+    assert.deepEqual(item.reminders.map((reminder) => reminder.id).sort(), ["dup", "reminder-2"]);
+  } finally {
+    db.prepare("DELETE FROM schedules WHERE profile_id = ? AND id = ?").run(a.id, "legacy-dup-reminders");
+  }
+});
+
+test("the daily brief reuses the legacy same-day key so an upgrade-day run does not duplicate", () => {
+  // 升级当天旧版本已按 weather:daily-brief:{date} 发布过：新代码传入 legacy 键，
+  // 旧行应被改键复用而不是再插一条。日期选用未被其他测试占用的 2026-08-09。
+  const options = {
+    timezone: "Asia/Shanghai",
+    getLocation: () => ({ city: "北京", lat: 39.9, lon: 116.4 }),
+    getCurrent: async () => ({
+      temperature: 28,
+      apparent: 30,
+      humidity: 61,
+      windSpeed: 12,
+      windSpeedUnit: "km/h" as const,
+      weatherText: "多云",
+    }),
+    getForecast: async () => [{
+      date: "2026-08-09",
+      tMax: 32,
+      tMin: 24,
+      weatherText: "晴",
+      precipProb: 10,
+    }],
+  };
+  return (async () => {
+    await publishProfile("profile-a", "weather", "旧键简报", "旧正文", "weather:daily-brief:2026-08-09");
+    await runDailyWeatherBrief({ ...options, at: new Date("2026-08-09T07:00:00.000Z") });
+    const rows = db.prepare(`
+      SELECT dedupe_key, COUNT(*) AS count FROM profile_notifications
+      WHERE profile_id = 'profile-a'
+        AND dedupe_key IN ('weather:daily-brief:2026-08-09', 'weather:daily-brief:北京:2026-08-09')
+      GROUP BY dedupe_key
+    `).all() as Array<Record<string, unknown>>;
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].dedupe_key, "weather:daily-brief:北京:2026-08-09");
+    assert.equal(Number(rows[0].count), 1);
+  })();
+});

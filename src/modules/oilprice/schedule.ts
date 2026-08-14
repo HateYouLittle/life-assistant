@@ -35,8 +35,8 @@ export function nextWindow(now = new Date()): AdjustmentWindow | null {
       return {
         date,
         effectiveAt,
-        // 保留 1 位小数，避免浮点误差导致展示为 182.99999999999997
-        hoursUntil: Math.round(((effective.toMillis() - now.getTime()) / 3600_000) * 10) / 10,
+        // 保留精确值供逻辑阈值（如 hoursUntil < 40）使用；展示层再取整
+        hoursUntil: (effective.toMillis() - now.getTime()) / 3600_000,
       };
     }
   }
@@ -54,6 +54,8 @@ export function nearestWindowDeviationDays(date: string): number | null {
   let minDays: number | null = null;
   for (const entry of ADJUSTMENT_WINDOWS_2026) {
     const deviation = Math.abs(parsed.diff(DateTime.fromISO(entry, { zone: BUSINESS_TIMEZONE }), "days").days);
+    // 表内条目损坏导致 NaN 时跳过，避免告警被静默禁用
+    if (!Number.isFinite(deviation)) continue;
     if (minDays === null || deviation < minDays) minDays = deviation;
   }
   return minDays;
