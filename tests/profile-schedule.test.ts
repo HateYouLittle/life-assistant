@@ -38,7 +38,7 @@ const parseProfilePushRoutes = (configModule as Record<string, unknown>).parsePr
 ) => Record<string, { route: string; url: string; secret: string }>;
 const {
   createSchedule, listSchedules, getSchedule, updateSchedule, deleteSchedule, hydrateRow,
-  logHydrationError, hydrationErrorLogSize,
+  logHydrationError, hydrationErrorLogSize, resetHydrationErrorLog,
 } = await import(
   "../src/modules/schedule/service.js",
 );
@@ -2248,7 +2248,8 @@ test("updating a schedule with a dirty legacy version does not conflict", () => 
 
 test("hydration errors are logged once per row within the dedup window", () => {
   // P3-1：同一 profileId/id 在 5 分钟窗口内只记一次完整日志；窗口外恢复记录；
-  // 不同行互不抑制。用注入的假时钟使窗口可控。
+  // 不同行互不抑制。用注入的假时钟使窗口可控。测试前后重置模块级 Map（N4 隔离）。
+  resetHydrationErrorLog();
   const errors: string[] = [];
   const original = console.error;
   console.error = (...args: unknown[]) => { errors.push(args.map(String).join(" ")); };
@@ -2262,11 +2263,13 @@ test("hydration errors are logged once per row within the dedup window", () => {
     assert.equal(errors.length, 3);
   } finally {
     console.error = original;
+    resetHydrationErrorLog();
   }
 });
 
 test("hydration error log bookkeeping cleans up expired entries", () => {
-  // P3-1：Map 无泄漏——容量达到阈值时清扫过期条目（用已过期时间戳批量填充后验证回收）
+  // P3-1：过期条目不累积——阈值清扫时被回收（配合 N3 硬上限，Map 有界）
+  resetHydrationErrorLog();
   const errors: string[] = [];
   const original = console.error;
   console.error = (...args: unknown[]) => { errors.push(args.map(String).join(" ")); };
@@ -2275,11 +2278,93 @@ test("hydration error log bookkeeping cleans up expired entries", () => {
     for (let index = 0; index < 300; index += 1) {
       logHydrationError("profile-a", `bulk-${index}`, new Error("bulk"), expiredBase);
     }
-    assert.ok(hydrationErrorLogSize() >= 300, "批量条目应已登记");
+    assert.equal(hydrationErrorLogSize(), 256, "未过期时 Map 停在硬上限（由 N3 淘汰最旧保证）");
+    // 以"当前时间"记录一条新日志：触发阈值清扫，10 分钟前的过期条目被回收
     logHydrationError("profile-a", "fresh-entry", new Error("fresh"), Date.now());
-    // 清扫后仅剩未过期条目（此前其他测试的零星条目 + 本测试的 fresh-entry）
-    assert.ok(hydrationErrorLogSize() <= 10, "过期条目应被清扫");
+    assert.ok(hydrationErrorLogSize() <= 10, "过期条目应被清扫，仅剩 fresh-entry 等未过期条目");
   } finally {
     console.error = original;
+    resetHydrationErrorLog();
+  }
+});
+
+test("the hydration error log map has a hard size cap", () => {
+  // N3：全活跃（未过期）时 Map 也不得超过阈值——清理过期后仍超限则淘汰最旧条目
+  resetHydrationErrorLog();
+  const errors: string[] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => { errors.push(args.map(String).join(" ")); };
+  try {
+    const base = Date.now();
+    for (let index = 0; index < 300; index += 1) {
+      logHydrationError("profile-a", `cap-${index}`, new Error("cap"), base);
+    }
+    assert.equal(hydrationErrorLogSize(), 256, "Map 不得超过硬上限");
+    logHydrationError("profile-a", "cap-new", new Error("cap"), base);
+    assert.equal(hydrationErrorLogSize(), 256, "新增条目后仍不得超过硬上限");
+  } finally {
+    console.error = original;
+    resetHydrationErrorLog();
+  }
+});
+
+test("updateSchedule reads the current row and raw version from a single snapshot", () => {
+  // N1：乐观锁 WHERE 与 current 计算必须来自同一次读取（消除 T1→T2 二次读取的 TOCTOU 窗口）
+  const a = requireProfileContext("profile-a");
+  const item = createSchedule(a, {
+    title: "single snapshot",
+    calendar: "solar",
+    date: "2099-01-02",
+    time: "09:00",
+    timezone: "Asia/Shanghai",
+  });
+  try {
+    const originalPrepare = db.prepare.bind(db) as typeof db.prepare;
+    let snapshotSelects = 0;
+    (db as unknown as { prepare: (sql: string) => unknown }).prepare = ((sql: string) => {
+      if (String(sql).includes("SELECT * FROM schedules") || String(sql).includes("SELECT version FROM schedules")) {
+        snapshotSelects += 1;
+      }
+      return originalPrepare(sql);
+    }) as typeof db.prepare;
+    try {
+      const updated = updateSchedule(a, item.id, { title: "single snapshot renamed" });
+      assert.equal(updated.title, "single snapshot renamed");
+      assert.equal(snapshotSelects, 1, "整行快照与原始 version 应来自同一次读取");
+    } finally {
+      (db as unknown as { prepare: typeof db.prepare }).prepare = originalPrepare;
+    }
+  } finally {
+    db.prepare("DELETE FROM schedules WHERE profile_id = ? AND id = ?").run(a.id, item.id);
+  }
+});
+
+test("updating a schedule with a NULL legacy version self-heals", () => {
+  // N2：version=NULL 时 UPDATE 的 WHERE 必须用 version IS ?（SQLite 的 IS 匹配 NULL），
+  // 写回归一化值自愈，否则永远冲突。schema 为 NOT NULL，测试用 CTAS 重建表
+  // （CTAS 不保留 NOT NULL 约束）模拟外部写入的 NULL 损坏；本测试为文件末尾测试。
+  const a = requireProfileContext("profile-a");
+  const item = createSchedule(a, {
+    title: "null version",
+    calendar: "solar",
+    date: "2099-01-02",
+    time: "09:00",
+    timezone: "Asia/Shanghai",
+  });
+  try {
+    db.exec(`
+      CREATE TABLE schedules_nullable AS SELECT * FROM schedules;
+      DROP TABLE schedules;
+      ALTER TABLE schedules_nullable RENAME TO schedules;
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_schedules_pk_recreated ON schedules(profile_id, id);
+    `);
+    db.prepare("UPDATE schedules SET version = NULL WHERE profile_id = ? AND id = ?").run(a.id, item.id);
+    const updated = updateSchedule(a, item.id, { title: "null version renamed" });
+    assert.equal(updated.title, "null version renamed");
+    const row = db.prepare("SELECT version FROM schedules WHERE profile_id = ? AND id = ?")
+      .get(a.id, item.id) as { version: number };
+    assert.equal(row.version, 2, "写回应自愈为归一化值+1");
+  } finally {
+    db.prepare("DELETE FROM schedules WHERE profile_id = ? AND id = ?").run(a.id, item.id);
   }
 });

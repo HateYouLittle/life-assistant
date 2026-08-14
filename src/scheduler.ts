@@ -180,8 +180,9 @@ async function processDue(item: ScheduleItem, at: DateTime<true>): Promise<void>
 
   const nextRun = calculateNextIncompleteRun(item, at.plus({ milliseconds: 1 }) as DateTime<true>);
   // P2-1：写回用归一化后的版本（脏行 version=0 → 2，自愈），WHERE 用原始列值防并发冲突。
+  // N2：WHERE 用 version IS ? —— SQLite 的 IS 可匹配 NULL，NULL 脏行同样命中并自愈。
   const nextVersion = normalizeVersion(fresh.version) + 1;
-  const updated = db.prepare("UPDATE schedules SET next_run_at = ?, enabled = ?, status = ?, version = ?, updated_at = ? WHERE profile_id = ? AND id = ? AND version = ?").run(
+  const updated = db.prepare("UPDATE schedules SET next_run_at = ?, enabled = ?, status = ?, version = ?, updated_at = ? WHERE profile_id = ? AND id = ? AND version IS ?").run(
     nextRun?.toISO() ?? null,
     nextRun ? 1 : 0,
     nextRun ? item.status : "completed",

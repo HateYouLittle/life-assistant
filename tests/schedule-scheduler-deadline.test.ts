@@ -314,12 +314,51 @@ test("dirty legacy version values are normalized instead of stale-skipping remin
       `schedule:${profile.id}:${item.id}:2099-05-01T01:00:00.000Z:occurrence:start`,
     ], `version=${dirtyVersion} 的脏行应正常发布提醒`);
     const scheduleRow = db.prepare(`
-      SELECT next_run_at, enabled, status FROM schedules WHERE profile_id = ? AND id = ?
+      SELECT next_run_at, enabled, status, version FROM schedules WHERE profile_id = ? AND id = ?
     `).get(profile.id, item.id) as Record<string, unknown>;
     assert.deepEqual({ ...scheduleRow }, {
       next_run_at: "2099-05-02T01:00:00.000Z",
       enabled: 1,
       status: "active",
-    }, `version=${dirtyVersion} 的脏行应正常推进`);
+      version: 2,
+    }, `version=${dirtyVersion} 的脏行应正常推进且版本自愈为 2`);
   }
+});
+
+test("a NULL legacy version self-heals through the scheduler", async () => {
+  // N2：version=NULL 时 UPDATE 的 WHERE 必须用 version IS ?（匹配 NULL），
+  // 否则每 tick 只 warn、提醒永久卡住。schema 为 NOT NULL，测试用 CTAS 重建表
+  // （CTAS 不保留 NOT NULL 约束）模拟外部写入的 NULL 损坏；本测试为文件末尾测试。
+  db.prepare("UPDATE schedules SET enabled = 0").run();
+  const item = createSchedule(profile, {
+    title: "null version",
+    calendar: "solar",
+    date: "2099-05-01",
+    time: "09:00",
+    timezone: "Asia/Shanghai",
+    recurrence: "daily",
+    reminders: [{ id: "start", minutesBefore: 0 }],
+  });
+  db.exec(`
+    CREATE TABLE schedules_nullable AS SELECT * FROM schedules;
+    DROP TABLE schedules;
+    ALTER TABLE schedules_nullable RENAME TO schedules;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_schedules_pk_recreated ON schedules(profile_id, id);
+  `);
+  db.prepare("UPDATE schedules SET version = NULL, next_run_at = ? WHERE profile_id = ? AND id = ?")
+    .run("2099-05-01T01:00:00.000Z", profile.id, item.id);
+
+  await runDueSchedules(new Date("2099-05-01T01:01:00.000Z"));
+  assert.deepEqual(notices(item.id).map((row) => row.dedupe_key), [
+    `schedule:${profile.id}:${item.id}:2099-05-01T01:00:00.000Z:occurrence:start`,
+  ], "version=NULL 的脏行应正常发布提醒");
+  const scheduleRow = db.prepare(`
+    SELECT next_run_at, enabled, status, version FROM schedules WHERE profile_id = ? AND id = ?
+  `).get(profile.id, item.id) as Record<string, unknown>;
+  assert.deepEqual({ ...scheduleRow }, {
+    next_run_at: "2099-05-02T01:00:00.000Z",
+    enabled: 1,
+    status: "active",
+    version: 2,
+  }, "version=NULL 的脏行应正常推进且版本自愈为 2");
 });

@@ -513,6 +513,12 @@ export function logHydrationError(profileId: string, scheduleId: string, error: 
       if (now - loggedAt >= HYDRATION_LOG_WINDOW_MS) hydrationErrorLastLoggedAt.delete(entryKey);
     }
   }
+  // N3：硬上限——清理过期后仍达阈值，淘汰最旧条目（有界 TTL），Map 不随活跃错误无界增长。
+  while (hydrationErrorLastLoggedAt.size >= HYDRATION_LOG_MAX_ENTRIES) {
+    const entries = [...hydrationErrorLastLoggedAt.entries()].sort((a, b) => a[1] - b[1]);
+    if (entries.length === 0) break;
+    hydrationErrorLastLoggedAt.delete(entries[0][0]);
+  }
   hydrationErrorLastLoggedAt.set(key, now);
   console.error(
     `[schedule] hydration failed to derive next occurrence for ${profileId}/${scheduleId}: ` +
@@ -522,6 +528,11 @@ export function logHydrationError(profileId: string, scheduleId: string, error: 
 
 export function hydrationErrorLogSize(): number {
   return hydrationErrorLastLoggedAt.size;
+}
+
+/** 测试专用（N4）：清空 hydration 错误日志去重状态。生产代码不得调用。 */
+export function resetHydrationErrorLog(): void {
+  hydrationErrorLastLoggedAt.clear();
 }
 
 function rowToItem(
@@ -700,13 +711,15 @@ export function getSchedule(value: ProfileContext | string, id: string): Schedul
 
 export function updateSchedule(value: ProfileContext | string, id: string, changes: Partial<ScheduleInput>): ScheduleItem {
   const profile = context(value);
-  const current = getSchedule(profile, id);
-  // P2-1：乐观锁 WHERE 用 DB 原始列值（hydration 的归一化只用于比较口径），
-  // 脏行（version=0/-1/1.5）不再因归一化不一致而误冲突；写回统一用归一化后的值。
-  const rawVersionRow = getDatabase().prepare(
-    "SELECT version FROM schedules WHERE profile_id = ? AND id = ?",
-  ).get(profile.id, id) as { version: number } | undefined;
-  const rawVersion = rawVersionRow?.version ?? current.version;
+  // N1：current（经 rowToItem hydration 归一化）与乐观锁 WHERE 用的原始 version
+  // 来自同一次 SELECT 快照，消除 getSchedule+rawVersion 两次独立读取的 TOCTOU 窗口；
+  // 写回统一用归一化后的值自愈（N2：WHERE 用 version IS ? 以匹配 NULL）。
+  const rawRow = getDatabase().prepare(
+    "SELECT * FROM schedules WHERE profile_id = ? AND id = ?",
+  ).get(profile.id, id) as Record<string, unknown> | undefined;
+  if (!rawRow) throw new Error("schedule not found");
+  const current = rowToItem(rawRow);
+  const rawVersion = rawRow.version as number | null;
   const { recurrence: recurrenceChange, ...restChanges } = changes;
   // P2-12：recurrence 为 plain object 时与现有规则深合并（部分更新）；
   // 为字符串枚举（如 "daily"）时整体替换频率规则。
@@ -754,7 +767,7 @@ export function updateSchedule(value: ProfileContext | string, id: string, chang
   next.nextOccurrenceSolar = event?.toISO() ?? undefined;
   const result = getDatabase().prepare(`
     UPDATE schedules SET type=?, title=?, note=?, priority=?, status=?, calendar=?, date=?, lunar_month=?, lunar_day=?, leap_month_policy=?, time=?, all_day=?, timezone=?, recurrence_json=?, reminders_json=?, deadline_at=?, deadline_offset_minutes=?, enabled=?, next_run_at=?, version=?, updated_at=?
-    WHERE profile_id=? AND id=? AND version=?
+    WHERE profile_id=? AND id=? AND version IS ?
   `).run(
     next.type, next.title, next.note ?? null, next.priority, next.status, next.calendar, next.date ?? null, next.lunarMonth ?? null, next.lunarDay ?? null,
     next.recurrence.leapMonthPolicy ?? null, next.time, next.allDay ? 1 : 0, next.timezone, JSON.stringify(next.recurrence), JSON.stringify(next.reminders), next.deadlineAt ?? null, next.deadlineOffsetMinutes ?? null, next.enabled ? 1 : 0,
