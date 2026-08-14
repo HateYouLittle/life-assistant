@@ -95,4 +95,5 @@ node --import tsx/esm --test tests/schedule-*.test.ts tests/profile-schedule.tes
   路径，node-cron 实际只用 v4，不可利用；修复需 node-cron 4 大版本，暂缓）。全部验证：
   npm run build 零错误、npm test 196/196 全绿（基线 171 + 新增 25）。文档同步：
   README Node >= 22.13、architecture.md 投递恢复/简报键/补发语义。
+  已提交本地 commit `b274d08`。
 - 2026-08-13 计划定稿：P1×12 + P2×22 选做清单、文件分区、验证命令。开始主代理分区修复（notifier/scheduler/package/gitignore）。
