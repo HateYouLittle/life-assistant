@@ -128,11 +128,20 @@
 | P2-1 | P2 | hydration 把越界/非整数 `version` 统一归为 1（service.ts:551），但 scheduler 用 DB 原始 `fresh.version` 与 `item.version` 严格比较（scheduler.ts:125-133）并按 item.version 更新（180-188）→ `version=0` 等脏行永远判为 stale snapshot：不发布、不推进，提醒持续丢失；`updateSchedule` 版本冲突。正常 version≥1 不受影响 | schedule/service.ts:551 vs scheduler.ts:125-133,180-188 | done（共享 normalizeVersion 口径：scheduler 比较归一化值、WHERE 用原始列值、写回归一化值自愈；updateSchedule WHERE 同样用原始列值） |
 | P3-1 | P3 | `findOccurrence` 若持续抛错，hydration 每 tick 记日志（service.ts:570-573）+ scheduler 捕获抛回（204-209）+ tick 失败再记（306-307）→ 同一行双日志刷屏。不产生重复提醒（occurrences/通知去重仍在），但持久 bug 下运营噪声大 | schedule/service.ts:570-573, scheduler.ts:204-209,306-307 | done（logHydrationError 5 分钟窗口去重，Map 容量阈值清扫过期条目；scheduler tick 级日志保留） |
 
+### 第五轮审查新发现（2026-08-14，待 DSH 修）
+
+| # | 级别 | 问题 | 位置 | 状态 |
+|---|---|---|---|---|
+| N1 | P2 | `updateSchedule` 乐观锁 TOCTOU：`getSchedule`（T1）读整行与 `rawVersion`（T2）单独读是两次独立查询，MCP 与 scheduler 独立进程，T1→T2 窗口内并发版本推进会使 WHERE 用新版本、写旧数据，覆盖并发更新、丢失 next_run_at/enabled/status 推进 | schedule/service.ts:703,706,761 | done（合并为单条 SELECT * 快照，插桩测试断言仅 1 次读取） |
+| N2 | P3 | NULL version 未纳入自愈口径：schema 为 NOT NULL DEFAULT 1 正常不会出现，但手工损坏/外部写入 NULL 时，scheduler 比较通过发布一次后 `WHERE version = NULL` 永不命中 → 永久卡住、updateSchedule 永远冲突；测试只覆盖 0/-1/1.5 | schedule/service.ts:495, scheduler.ts:130,192, service.ts:709 | done（WHERE 改用 `version IS ?` 匹配 NULL，写回归一化值自愈；测试用 CTAS 重建表模拟 NULL） |
+| N3 | P3 | 日志去重 Map 非硬上限：256 阈值只清过期条目，全活跃时仍继续 set（测试已见 size=300），5 分钟窗口内大量不同 key 持续失败时内存无界增长 | schedule/service.ts:511,516 | done（清理过期后仍达阈值则淘汰最旧条目，Map 有硬上限恒 ≤256） |
+| N4 | P3 | 测试覆盖/隔离缺口：脏版本调度测试未断言 DB version 自愈值（若改成"推进但不修版本"测试仍绿）；模块级 hydrationErrorLastLoggedAt 测试前后未重置，依赖执行顺序，抗重构性弱 | schedule-scheduler-deadline.test.ts:316, profile-schedule.test.ts:2249, service.ts:505 | done（补 version=2 自愈断言；新增测试专用 resetHydrationErrorLog，日志测试前后重置，两文件可独立运行） |
+
 ## 验证命令
 
 ```bash
 npm run build                        # 必须零错误
-npm test                             # 全量，必须全绿（当前 218/218）
+npm test                             # 全量，必须全绿（当前 222/222）
 node --import tsx/esm --test tests/notification-publisher.test.ts tests/scheduler-notification-contract.test.ts
 node --import tsx/esm --test tests/weather-provider.test.ts tests/weather-notification.test.ts tests/location.test.ts
 node --import tsx/esm --test tests/oilprice-*.test.ts
@@ -141,6 +150,17 @@ node --import tsx/esm --test tests/schedule-*.test.ts tests/profile-schedule.tes
 
 ## 进度日志（新条目加在最上面）
 
+- 2026-08-14 N1-N4 收官修复完成（按 ~/artifacts/documents/life-assistant/dsh-fix-prompt-p6.md，
+  TDD 先红后绿）：N1 updateSchedule 单条 SELECT * 快照消除 TOCTOU；N2 乐观锁 WHERE
+  改用 version IS ? 匹配 NULL 并自愈；N3 日志 Map 淘汰最旧条目实现硬上限（恒 ≤256）；
+  N4 补 version 自愈断言 + resetHydrationErrorLog 测试隔离。新增 4 个回归测试
+  （profile-schedule ×3 + schedule-scheduler-deadline ×1），npm run build 零错误、
+  npm test 222/222 全绿，两测试文件可独立运行。代码提交 `5807d93`。
+- 2026-08-14 第五轮复审（Codex CLI）完成：P2-1/P3-1 原始目标关闭（0/-1/1.5 脏版本
+  不再 stale、hydration 日志去重生效、测试非假绿、文档自洽）；无 P0/P1。新发现
+  1 P2 + 3 P3（见「第五轮审查新发现」表）：N1 updateSchedule 乐观锁 TOCTOU 竞态、
+  N2 NULL version 未纳入自愈口径、N3 日志 Map 无硬上限、N4 测试覆盖/隔离缺口。
+  待 DeepSeek Harness 修复。独立验证：218/218、build 零错误、diff-check 干净。
 - 2026-08-14 P2-1/P3-1 修复完成（按 ~/artifacts/documents/life-assistant/dsh-fix-prompt-p5.md，
   TDD 先红后绿）：P2-1 共享 normalizeVersion 口径（scheduler 比较归一化值、WHERE 原始列值、
   写回归一化值自愈；updateSchedule 同样处理）；P3-1 logHydrationError 5 分钟窗口去重 +
