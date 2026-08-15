@@ -208,7 +208,7 @@ node --version
 node -p "process.execPath"
 ```
 
-将 unit 保存为 `/etc/systemd/system/life-assistant-scheduler.service`，并把 `ExecStart` 中的 Node 占位符替换为上一步输出。未过期的 SQLite singleton lease 会让新 scheduler 成功早退，因此 unit 必须继续重试，直到 lease 过期后能够接管：
+将 unit 保存为 `/etc/systemd/system/life-assistant-scheduler.service`，并把 `ExecStart` 中的 Node 占位符替换为上一步输出。未过期的 SQLite singleton lease 会让新 scheduler 以退出码 1 早退（systemd 将其视为失败并按 `Restart=always` 继续重试），直到 lease 过期后能够接管：
 
 ```ini
 [Unit]
@@ -247,7 +247,7 @@ systemctl status --no-pager life-assistant-scheduler.service
 | `DATA_DIR` | SQLite/WAL 和旧 `store.json` 迁移源；生产必须使用绝对路径 |
 | `HERMES_PROFILE` | MCP 进程的 Profile 身份；必填且不得静默回退 |
 | `PROFILE_PUSH_ROUTES_JSON` | Profile 到 Hermes route、loopback URL、HMAC secret 的映射 |
-| `LIFE_ASSISTANT_TIMEZONE` | scheduler 使用的 IANA 时区 |
+| `LIFE_ASSISTANT_TIMEZONE` | scheduler 简报/预警渲染时区，以及 schedule 创建/更新时未显式指定 timezone 的默认时区 |
 | `DAILY_WEATHER_BRIEF_CRON` | 每日生活简报 cron，默认 `0 7 * * *` |
 | `HOLIDAY_REFRESH_CRON` | 节假日安排每日刷新 cron（Asia/Shanghai），默认 `0 2 * * *` |
 | `LOCATION_CITY/LAT/LON` | 可选预置共享位置；未设置时由 Agent 首次确认 |
@@ -260,7 +260,7 @@ systemctl status --no-pager life-assistant-scheduler.service
 
 ## 07:00 确定性生活简报
 
-`weather.daily_brief` 的默认时间是配置时区每天 07:00，可分别通过 `DAILY_WEATHER_BRIEF_CRON` 和 `LIFE_ASSISTANT_TIMEZONE` 调整。内容由当前天气、当日预报以及可用时的油价确定性生成，不调用 LLM；单个天气源失败时使用另一个结果继续，油价不可用时省略。
+`weather.daily_brief` 的默认时间是配置时区每天 07:00，可分别通过 `DAILY_WEATHER_BRIEF_CRON` 和 `LIFE_ASSISTANT_TIMEZONE` 调整。内容仅由当前天气与当日预报确定性生成，不包含油价，也不调用 LLM；单个天气源失败时使用另一个结果继续，两个天气源都不可用时本轮不发送。
 
 迁移旧部署时，如果 Hermes 中仍存在外部 LLM 天气 cron，应先端到端验证内置简报，再暂停或删除旧任务；验证期间两者并存会产生重复通知。
 
@@ -277,7 +277,7 @@ hermes -p "<profile>" webhook subscribe "<route-name>" \
   --deliver-only
 ```
 
-这种切换通常无需修改 `PROFILE_PUSH_ROUTES_JSON`、SQLite 或 scheduler，也无需重启 Gateway。只有平台凭据或静态平台配置变化时才可能需要重启对应 Gateway；route 名、URL 或 secret 变化时，必须同步更新 `PROFILE_PUSH_ROUTES_JSON` 并重启 scheduler。
+这种切换通常无需修改 `PROFILE_PUSH_ROUTES_JSON`、SQLite 或 scheduler，也无需重启 Gateway。只有平台凭据或静态平台配置变化时才可能需要重启对应 Gateway；route 名、URL、secret 或 `renderTarget` 变化时，必须同步更新 `PROFILE_PUSH_ROUTES_JSON` 并重启 scheduler，以及读取该配置的 MCP 进程（`PROFILE_PUSH_ROUTES_JSON` 在进程启动时一次性解析并缓存）。
 
 ## 平台渲染
 
@@ -296,6 +296,7 @@ hermes -p "<profile>" webhook subscribe "<route-name>" \
 
 - 四种目标都从同一份 `RenderBlock[]` 中间表示投影：QQ / 飞书 / 微信共用同一套保守 markdown 规则，plain 是缺省与兜底。markdown 快照 title 为 `# <headline>`，body 为 `**标签**：值`、块间 `\n\n` 分段的 markdown 块。
 - 通知快照在生成时按该 Profile 的 `renderTarget` 渲染并落库，之后不重渲染；因此 `renderTarget` 只影响配置变更之后新生成的通知，已落库的旧快照不会自动升级为 markdown。
+- `renderTarget` 或 `PROFILE_PUSH_ROUTES_JSON` 任一字段变化后，必须重启 scheduler 与读取该配置的 MCP 进程才会生效。
 - 平台 markdown 分支任何渲染异常都回退 plain 兜底，不会导致通知发送失败。
 
 ## 中国大陆节假日与工作日

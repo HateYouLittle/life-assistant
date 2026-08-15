@@ -10,12 +10,12 @@
   Codex CLI，2026-08-14）：可以无保留收官。历史见 docs/history/repair-history.md。
 - **holiday/workday 功能已交付并收官**（2026-08-15）：中国大陆法定节假日/工作日模块
   （4 个 MCP 工具 + 日程 workday/holiday 频率 + schema v4 + 每日刷新 job）。
-  实现经 **7 批修复（T1-T4 / H1-H5 / K1-K3 / M1-M3 / N1-N3 / N4，共 18 项）+ 7 轮
+  实现经 **6 批修复（T1-T4 / H1-H5 / K1-K3 / M1-M3 / N1-N3 / N4，共 19 个编号缺陷 + 1 个 P3 顺手项）+ 7 轮
   Codex 独立复审** 闭环，最终轮（2026-08-15）结论：**可以无保留验收**，零 P0/P1/P2。
   核心保证「无数据年份绝不按普通周历猜测」在所有查询与 schedule 路径生效。
 - **基线**：`npm test` 333/333 全绿（222 既有 + 111 holiday 相关新增），`npm run build`
   零错误，diff-check 干净。
-- **HEAD**：`6de3657`（feat: 新增中国大陆法定节假日/工作日模块（holiday）——功能、测试、docs 已一并提交；提交前基线 333/333 全绿、build 零错误）。
+- **HEAD**：`d942c3a`（feat: 新增中国大陆法定节假日/工作日模块（holiday）——功能、测试、docs 已一并提交；提交前基线 333/333 全绿、build 零错误；2026-08-15 全量复审后另见 docs/final-review-and-fix-plan.md，修复工作在 `fix/final-review-20260815` 分支进行）。
 - **交付文档**：`docs/holiday-workday-implementation-review.md`（设计、数据源、校验策略、
   六批修复记录、最终复审清单、部署注意）。
 

@@ -37,7 +37,7 @@ Hermes 将 MCP 工具注册为 `mcp_life_assistant_<tool>`，点号转换为下�
 - 回答应包含地点、单位和有用的穿衣、降水或出行建议，不只复述字段。
 - 当前油价用 `oilprice.current`；调价时间和是否提前加油用 `oilprice.next_adjustment`。
 - 油价 Provider 优先 TianAPI，失败且配置 JUHE 时回退 JUHE。两者均未配置或不可用时，按工具返回的说明告知用户，不要假定只需要某一个 Key。
-- 内置每日生活简报由当前天气、当日预报和可用油价确定性生成，不调用 LLM；不要另建 LLM cron 重复实现它。
+- 内置每日生活简报仅由当前天气和当日预报确定性生成，不包含油价，不调用 LLM；不要另建 LLM cron 重复实现它。
 
 天气、油价、预警和生活简报是公共事件，会按已配置的 Profile route 各生成一份隔离投递。位置与 Provider 数据共享，但每个 Profile 独立接收和标记通知。
 
@@ -70,7 +70,7 @@ Hermes 将 MCP 工具注册为 `mcp_life_assistant_<tool>`，点号转换为下�
 
 - 单目标切换只重建对应 Profile 的同名 subscription，并修改 `--deliver`。
 - 保持 route 名、loopback URL 和 HMAC secret 不变时，不修改 SQLite 或 scheduler，通常也不重启 Gateway。
-- route 名、URL 或 secret 变化时，必须同步 `PROFILE_PUSH_ROUTES_JSON` 并重启 scheduler。
+- route 名、URL、secret 或 `renderTarget` 变化时，必须同步 `PROFILE_PUSH_ROUTES_JSON` 并重启 scheduler 与读取该配置的 MCP 进程。
 - secret 必须是安全保存的 64 位随机十六进制值，不得输出到聊天、日志或 Git。
 - 当前每个 Profile 只有一个主动目标；用户要求多平台同时投递时，说明当前不支持，不要伪造配置。
 - 切换后用对应 Profile 的 `hermes webhook list` 和临时日程做端到端验证。
@@ -79,6 +79,7 @@ Hermes 将 MCP 工具注册为 `mcp_life_assistant_<tool>`，点号转换为下�
 
 - `PROFILE_PUSH_ROUTES_JSON` 每个 Profile 条目可配置可选 `renderTarget`：`"plain"`（纯文本，缺省兜底）、`"qq-markdown"`、`"feishu-markdown"`、`"wechat-markdown"`；缺省或未知值一律按 `"plain"` 处理。
 - 通知快照在生成时按该 Profile 的 `renderTarget` 渲染并落库，之后不重渲染；修改配置只影响之后新生成的通知，已落库的旧快照不会自动重渲染。
+- `renderTarget` 或 `PROFILE_PUSH_ROUTES_JSON` 任一字段变化后，需重启 scheduler 与读取该配置的 MCP 进程才会生效。
 - QQ / 飞书 / 微信共用同一套 markdown 投影，plain 是缺省与兜底；平台渲染异常不会导致通知发送失败。
 
 ## 已封存能力
