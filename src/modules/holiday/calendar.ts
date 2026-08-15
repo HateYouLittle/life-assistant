@@ -3,6 +3,7 @@ import { getDatabase } from "../../core/database.js";
 import {
   fetchHolidayYear as defaultFetchHolidayYear,
   holidayNameHits,
+  validateHolidayYear,
   type FetchHolidayYearOptions,
   type HolidayDay,
   type HolidayDayType,
@@ -203,6 +204,8 @@ export function ingestHolidayYear(
   dataset: HolidayYearDataset,
   at = new Date(),
 ): { changed: boolean; days: number } {
+  // H4：入口兜底校验，防止绕过 parseDataset/validateHolidayYear 写入非法日期。
+  validateHolidayYear(dataset);
   const db = getDatabase();
   const existing = yearStatus(dataset.year);
   const samePayload = existing?.ready === true && existing.source === dataset.source;
@@ -429,7 +432,7 @@ export function nextHoliday(from = new Date()): NextHolidayResult {
         message: `${year} 年节假日安排尚未获取，scheduler 会在发布窗口自动更新，请稍后重试。`,
       };
     }
-    coveredUntil = `${year}-12-31`;
+    coveredUntil = `${year}-12-19`;
     for (const period of view.periods) {
       if (period.endDate < today) continue;
       if (period.startDate <= today) {

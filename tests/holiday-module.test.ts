@@ -16,6 +16,7 @@ const { getDatabase, resetDatabaseForTests } = await import("../src/core/databas
 const { requireProfileContext } = await import("../src/core/profile.js");
 const { dayInfo, holidayYearView, ingestHolidayYear } = await import("../src/modules/holiday/calendar.js");
 const { parseDataset } = await import("../src/modules/holiday/provider.js");
+const { createSchedule, getSchedule } = await import("../src/modules/schedule/service.js");
 const holidayIndex = await import("../src/modules/holiday/index.js");
 const { ensureDayCoverage, ensureYearForView } = holidayIndex;
 
@@ -386,4 +387,106 @@ test("N4: holiday.list returns an error instead of a truncated view for the mixe
   const result = await tool("list").handler({ year: 2019 }, profile);
   assert.equal(result.isError, true);
   assert.match(result.content[0].text, /2019 年节假日安排尚未获取/);
+});
+
+// ---------------------------------------------------------------------------
+// H2：holiday.next 的 from 必须通过真实日历校验
+// ---------------------------------------------------------------------------
+
+test("H2: holiday.next rejects calendar-invalid from dates", async () => {
+  const result = await tool("next").handler({ from: "2026-02-30" }, profile);
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /from must be a valid calendar date/);
+});
+
+// ---------------------------------------------------------------------------
+// H7：MCP 查询补到数据后立即重算 workday/holiday 日程
+// ---------------------------------------------------------------------------
+
+function h7Year(offset: number): number {
+  // 选择真实当前年之后的年份，避免 createSchedule 的真实时间扫描与固定年冲突。
+  return DateTime.now().setZone("Asia/Shanghai").year + 3 + offset;
+}
+
+test("H7: list 查询路径补到数据后立即 reconcile 受影响 workday 日程", async () => {
+  const targetYear = h7Year(0);
+  clearHolidayYears([targetYear, targetYear - 1]);
+  const item = createSchedule(profile, {
+    title: "H7 list workday",
+    calendar: "solar",
+    date: `${targetYear}-01-01`,
+    time: "09:00",
+    timezone: "Asia/Shanghai",
+    recurrence: "workday",
+  });
+  assert.equal(item.enabled, false);
+
+  const fetch = async (year: number): Promise<HolidayYearDataset> => {
+    if (year === targetYear) return parseDataset("holiday-cn", syntheticRaw(targetYear));
+    throw new Error(`unexpected fetch for year ${year}`);
+  };
+  await ensureYearForView(targetYear, {
+    fetch,
+    at: new Date(`${targetYear - 1}-06-01T00:00:00.000Z`),
+  });
+
+  const after = getSchedule(profile, item.id);
+  assert.equal(after.enabled, true);
+  assert.ok(after.nextRunAt);
+});
+
+test("H7: is_workday 查询路径补到数据后立即 reconcile 受影响 workday 日程", async () => {
+  const targetYear = h7Year(1);
+  clearHolidayYears([targetYear, targetYear - 1]);
+  const item = createSchedule(profile, {
+    title: "H7 is_workday workday",
+    calendar: "solar",
+    date: `${targetYear}-01-01`,
+    time: "09:00",
+    timezone: "Asia/Shanghai",
+    recurrence: "workday",
+  });
+  assert.equal(item.enabled, false);
+
+  const fetch = async (year: number): Promise<HolidayYearDataset> => {
+    if (year === targetYear) return parseDataset("holiday-cn", syntheticRaw(targetYear));
+    throw new Error(`unexpected fetch for year ${year}`);
+  };
+  await ensureDayCoverage(`${targetYear}-01-01`, {
+    fetch,
+    at: new Date(`${targetYear - 1}-06-01T00:00:00.000Z`),
+  });
+
+  const after = getSchedule(profile, item.id);
+  assert.equal(after.enabled, true);
+  assert.ok(after.nextRunAt);
+});
+
+test("H7: 已 ready 的查询路径不触发全表 reconcile", async () => {
+  const targetYear = h7Year(2);
+  clearHolidayYears([targetYear, targetYear - 1]);
+  const item = createSchedule(profile, {
+    title: "H7 no reconcile workday",
+    calendar: "solar",
+    date: `${targetYear}-01-01`,
+    time: "09:00",
+    timezone: "Asia/Shanghai",
+    recurrence: "workday",
+  });
+  assert.equal(item.enabled, false);
+
+  // 直接入库但不 reconcile：模拟“年份已 ready，只是日程尚未收敛”的场景。
+  ingestHolidayYear(parseDataset("holiday-cn", syntheticRaw(targetYear)));
+  let calls = 0;
+  const fetch = async (): Promise<HolidayYearDataset> => {
+    calls += 1;
+    throw new Error("fetch must not be called");
+  };
+  await ensureDayCoverage(`${targetYear}-01-01`, {
+    fetch,
+    at: new Date(`${targetYear - 1}-06-01T00:00:00.000Z`),
+  });
+  assert.equal(calls, 0);
+  // 已 ready 查询不得顺带做全表 reconcile：该日程应保持原状。
+  assert.equal(getSchedule(profile, item.id).enabled, false);
 });
