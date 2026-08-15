@@ -96,4 +96,10 @@ git diff --check
 
 - 最终验证（2026-08-15）：`npm test` **370/370 全绿**（原 333 + 新增回归 37）、`npm run build` 零错误、`git diff --check` 干净。
 - 真实数据复验：2013/2015/2020 官方 holiday-cn 数据均可通过校验并入库。
-- 工作分支：`fix/final-review-20260815`（尚未提交/推送）。
+- 全部清单项已 `[x]`。
+- 工作分支：`fix/final-review-20260815`，已本地提交但未推送：
+  - `6522546` docs: record final review findings and correct stale documentation
+  - `22d6fdc` fix(holiday): accept official 2013/2015/2020 calendars and harden validation
+  - `1b75bdb` fix(core): harden config, http retries, schema guard and weather providers
+  - `c72d531` fix(notifier): close pull/delivery races and bound delivery concurrency
+  - `594099c` fix(schedule): align delete, completion and exhausted-state semantics
