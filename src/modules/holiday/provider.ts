@@ -36,6 +36,21 @@ export interface FetchHolidayYearOptions {
 const CHINA_ZONE = "Asia/Shanghai";
 const VALID_HOLIDAY_NAMES = ["元旦", "春节", "清明", "劳动节", "端午", "中秋", "国庆"] as const;
 
+/**
+ * 法定节假日之外的「特殊假日」名称集合（如 2015 抗战胜利 70 周年纪念日）。
+ * 七个法定节日仍保持强制齐全语义；特殊假日单独做「休假 + 调休上班日」成对校验。
+ */
+const SPECIAL_HOLIDAY_NAMES = ["抗日战争暨世界反法西斯战争胜利70周年纪念日"] as const;
+
+/** 官方中秋与国庆合并放假的年份（chinese-days 兜底源可能只写「国庆节」）。 */
+const MID_AUTUMN_NATIONAL_MERGED_YEARS = new Set([2020]);
+
+/** 特殊假日的合理日期窗口与总天数上限（2015 仅 9 月）。 */
+const SPECIAL_HOLIDAY_WINDOWS: ReadonlyArray<{ name: string; from: [number, number]; to: [number, number] }> = [
+  { name: "抗日战争暨世界反法西斯战争胜利70周年纪念日", from: [9, 1], to: [9, 30] },
+];
+const MAX_SPECIAL_HOLIDAY_TOTAL_DAYS = 10;
+
 /** 每个法定节日的休假日允许出现的日历窗口（拦截错位数据）。 */
 const HOLIDAY_WINDOWS: ReadonlyArray<{ name: string; from: [number, number]; to: [number, number] }> = [
   { name: "元旦", from: [12, 20], to: [1, 10] },
@@ -48,6 +63,17 @@ const HOLIDAY_WINDOWS: ReadonlyArray<{ name: string; from: [number, number]; to:
 ];
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+/** 仅接受 http/https 且 hostname 为 www.gov.cn 或以 .gov.cn 结尾的官方通知链接。 */
+function isGovCnPaperUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return false;
+    return url.hostname === "www.gov.cn" || url.hostname.endsWith(".gov.cn");
+  } catch {
+    return false;
+  }
+}
 
 function primaryUrl(year: number): string {
   return `https://cdn.jsdelivr.net/gh/NateScarlet/holiday-cn@master/${year}.json`;
@@ -81,6 +107,13 @@ export function parseHolidayCn(raw: unknown): HolidayYearDataset {
     if (typeof entry.name !== "string" || !entry.name.trim()) throw new Error("holiday-cn day name must be a non-empty string");
     if (typeof entry.date !== "string" || !DATE_RE.test(entry.date)) throw new Error("holiday-cn day date must be YYYY-MM-DD");
     if (typeof entry.isOffDay !== "boolean") throw new Error("holiday-cn day isOffDay must be a boolean");
+    if (entry.isOffDay === false) {
+      // 2020 疫情复工等场景会把普通周一（如 2020-02-03）标成 isOffDay:false。
+      // 那只是「工作日」标记而非调休上班日：dayInfo 对周内日期默认就是工作日，
+      // 因此仅保留周末调休上班日；日历非法的条目留给 validateHolidayYear 拒绝。
+      const parsed = DateTime.fromISO(entry.date, { zone: CHINA_ZONE });
+      if (parsed.isValid && parsed.toISODate() === entry.date && parsed.weekday < 6) continue;
+    }
     days.push({
       date: entry.date,
       year: Number(entry.date.slice(0, 4)),
@@ -89,7 +122,8 @@ export function parseHolidayCn(raw: unknown): HolidayYearDataset {
     });
   }
   const papers = Array.isArray(candidate.papers)
-    ? candidate.papers.filter((paper): paper is string => typeof paper === "string" && paper.length > 0)
+    ? candidate.papers.filter((paper): paper is string =>
+      typeof paper === "string" && paper.length > 0 && isGovCnPaperUrl(paper))
     : [];
   return {
     year,
@@ -156,12 +190,16 @@ function inWindow(value: string, from: [number, number], to: [number, number]): 
 }
 
 function nameHits(value: string): string[] {
-  return VALID_HOLIDAY_NAMES.filter((name) => value.includes(name));
+  return [...VALID_HOLIDAY_NAMES, ...SPECIAL_HOLIDAY_NAMES].filter((name) => value.includes(name));
 }
 
-/** 判断名称是否包含任一法定节日名（供 calendar 关联调休上班日）。 */
+/** 判断名称是否包含任一法定节日名或特殊假日名（供 calendar 关联调休上班日）。 */
 export function holidayNameHits(value: string): string[] {
   return nameHits(value);
+}
+
+function specialNameHits(value: string): string[] {
+  return SPECIAL_HOLIDAY_NAMES.filter((name) => value.includes(name));
 }
 
 function isWeekend(value: string): boolean {
@@ -211,13 +249,21 @@ export function validateHolidayYear(dataset: HolidayYearDataset): void {
   for (const day of holidayDays) {
     for (const hit of nameHits(day.name)) names.add(hit);
     const hit = nameHits(day.name);
-    if (!hit.some((name) => HOLIDAY_WINDOWS.some((window) =>
-      window.name === name && inWindow(day.date, window.from, window.to)))) {
+    if (!hit.some((name) =>
+      HOLIDAY_WINDOWS.some((window) => window.name === name && inWindow(day.date, window.from, window.to))
+      || SPECIAL_HOLIDAY_WINDOWS.some((window) => window.name === name && inWindow(day.date, window.from, window.to)))) {
       throw new Error(`holiday date outside legal window: ${day.date} (${day.name})`);
     }
   }
+  // chinese-days 兜底源在官方中秋国庆合并放假年可能只写「国庆节」：
+  // 仅当数据集中确有「国庆」且年份为官方合并年时，把「中秋」视为已满足。
+  const midAutumnAliasSatisfied = dataset.source === "chinese-days"
+    && MID_AUTUMN_NATIONAL_MERGED_YEARS.has(dataset.year)
+    && names.has("国庆");
   for (const expected of requiredNames) {
-    if (!names.has(expected)) throw new Error(`holiday dataset is missing statutory holiday: ${expected}`);
+    if (!names.has(expected) && !(expected === "中秋" && midAutumnAliasSatisfied)) {
+      throw new Error(`holiday dataset is missing statutory holiday: ${expected}`);
+    }
   }
   for (const day of workDays) {
     if (!isWeekend(day.date)) throw new Error(`make-up workday must be a weekend: ${day.date}`);
@@ -227,7 +273,27 @@ export function validateHolidayYear(dataset: HolidayYearDataset): void {
   if (holidayCount < minHolidayDays || holidayCount > 45) {
     throw new Error(`unexpected holiday day count: ${holidayCount} (expected ${minHolidayDays}-45)`);
   }
-  if (workDays.length > 10) throw new Error(`unexpected make-up workday count: ${workDays.length}`);
+  if (workDays.length > 12) throw new Error(`unexpected make-up workday count: ${workDays.length}`);
+
+  // 特殊假日必须同时包含休假与调休上班日、总天数有限、且全部落在合理日期窗口内。
+  for (const special of SPECIAL_HOLIDAY_NAMES) {
+    const specialDays = dataset.days.filter((day) => specialNameHits(day.name).includes(special));
+    if (specialDays.length === 0) continue;
+    const specialHolidayDays = specialDays.filter((day) => day.dayType === "holiday");
+    const specialWorkDays = specialDays.filter((day) => day.dayType === "workday");
+    if (specialHolidayDays.length === 0 || specialWorkDays.length === 0) {
+      throw new Error(`special holiday ${special} must include both holiday and make-up workday days`);
+    }
+    if (specialDays.length > MAX_SPECIAL_HOLIDAY_TOTAL_DAYS) {
+      throw new Error(`unexpected special holiday day count: ${specialDays.length}`);
+    }
+    const window = SPECIAL_HOLIDAY_WINDOWS.find((candidate) => candidate.name === special);
+    for (const day of specialDays) {
+      if (!window || !inWindow(day.date, window.from, window.to)) {
+        throw new Error(`special holiday date outside legal window: ${day.date} (${day.name})`);
+      }
+    }
+  }
 
   // 每个节日名的休息日必须按名字分组形成有限个连续段（官方安排每段连续）。
   const groups = new Map<string, number>();
@@ -254,6 +320,13 @@ export function parseDataset(source: HolidayDataSource, raw: unknown): HolidayYe
   const dataset = source === "holiday-cn" ? parseHolidayCn(raw) : parseChineseDays(raw);
   validateHolidayYear(dataset);
   return dataset;
+}
+
+/** 汇总错误信息时脱敏：错误不得包含 URL 或密钥。 */
+function redactSensitiveError(value: string): string {
+  return value
+    .replace(/https?:\/\/[^\s);]+/gi, "<url>")
+    .replace(/[A-Za-z0-9_-]{32,}/g, "<secret>");
 }
 
 /** 按序抓取并解析某年节假日数据：主源 CDN → 主源 raw 镜像 →（可选）chinese-days。 */
@@ -292,5 +365,9 @@ export async function fetchHolidayYear(
       errors.push(`${candidate.source}: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
-  throw new AggregateError(errors, `failed to fetch official holiday arrangement for ${year}`);
+  const sanitized = errors.map(redactSensitiveError);
+  throw new AggregateError(
+    errors.map(redactSensitiveError),
+    `failed to fetch official holiday arrangement for ${year} (${sanitized.join("; ")})`,
+  );
 }

@@ -36,6 +36,16 @@ async function ensureYear(year: number, at: Date, fetch?: QueryFetchOptions["fet
   });
 }
 
+/** 若调用前未 ready 的年份在本轮确实补到了数据，则重算一次 workday/holiday 日程。 */
+function reconcileIfYearsBecameReady(notReadyBefore: ReadonlySet<number>): void {
+  for (const year of notReadyBefore) {
+    if (yearStatus(year)?.ready === true) {
+      reconcileHolidaySchedules();
+      return;
+    }
+  }
+}
+
 /** list(year) 的保障：K1 方案 A 下视图只依赖标题年 year 的文件，ensure year 即可；
  * 若 year 数据来自 chinese-days（单自然年），还需补齐 year-1 才能让视图的
  * 12/20-12/31 跨年段完整（N3）。 */
@@ -44,9 +54,12 @@ export async function ensureYearForView(
   options: QueryFetchOptions = {},
 ): Promise<void> {
   const at = options.at ?? new Date();
-  if (!readHolidayYear(year)) await ensureYear(year, at, options.fetch);
+  const notReadyBefore = new Set<number>();
+  if (!readHolidayYear(year)) notReadyBefore.add(year);
+  if (notReadyBefore.has(year)) await ensureYear(year, at, options.fetch);
   const status = yearStatus(year);
   if (status?.ready !== true || status.source !== "chinese-days" || year - 1 < 2004) {
+    reconcileIfYearsBecameReady(notReadyBefore);
     return;
   }
   // 跨年段只能由 year-1 的 chinese-days 自然年文件提供：
@@ -55,8 +68,10 @@ export async function ensureYearForView(
   //   由视图层判定缺口并返回 undefined，list 经 viewOrFail 报错呈现（N4）。
   const prev = yearStatus(year - 1);
   if (prev?.ready !== true) {
+    notReadyBefore.add(year - 1);
     await ensureYear(year - 1, at, options.fetch);
   }
+  reconcileIfYearsBecameReady(notReadyBefore);
 }
 
 /**
@@ -72,6 +87,7 @@ export async function ensureDayCoverage(
   const year = Number(target.slice(0, 4));
   const inCrossYearWindow = target.slice(5, 10) >= "12-20";
   const candidates = inCrossYearWindow ? [year + 1, year] : [year];
+  const notReadyBefore = new Set(candidates.filter((candidate) => !readHolidayYear(candidate)));
   let lastError: unknown;
   for (const candidate of candidates) {
     if (!readHolidayYear(candidate)) {
@@ -82,15 +98,25 @@ export async function ensureDayCoverage(
         continue;
       }
     }
-    if (!inCrossYearWindow) return;
+    if (!inCrossYearWindow) {
+      reconcileIfYearsBecameReady(notReadyBefore);
+      return;
+    }
     // 跨年窗口：仅 holiday-cn 的 year+1 标题年文件完整覆盖该窗口，ready 即视为
     // 覆盖（目标无行时 dayInfo 的普通周历兜底正确）；chinese-days 是单自然年
     // 数据，year+1 不含目标日期行，必须继续回退自然年 year 并做行命中确认。
-    if (candidate === year + 1 && yearStatus(candidate)?.source === "holiday-cn") return;
+    if (candidate === year + 1 && yearStatus(candidate)?.source === "holiday-cn") {
+      reconcileIfYearsBecameReady(notReadyBefore);
+      return;
+    }
     if (candidate === year + 1) continue;
     const info = dayInfo(target);
-    if (info && (info.dayType === "holiday" || info.dayType === "workday")) return;
+    if (info && (info.dayType === "holiday" || info.dayType === "workday")) {
+      reconcileIfYearsBecameReady(notReadyBefore);
+      return;
+    }
   }
+  reconcileIfYearsBecameReady(notReadyBefore);
   if (lastError !== undefined) {
     throw lastError instanceof Error ? lastError : new Error(String(lastError));
   }
@@ -121,6 +147,12 @@ const holidayModule: AssistantModule = {
       handler: async (args) => {
         try {
           const { from } = z.object({ from: z.string().regex(DATE_RE).optional() }).parse(args ?? {});
+          if (from !== undefined) {
+            const parsed = DateTime.fromISO(from, { zone: CHINA_ZONE });
+            if (!parsed.isValid || parsed.toISODate() !== from) {
+              return fail("from must be a valid calendar date");
+            }
+          }
           const at = from
             ? DateTime.fromISO(from, { zone: CHINA_ZONE }).startOf("day").toJSDate()
             : new Date();

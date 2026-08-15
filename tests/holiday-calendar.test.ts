@@ -184,7 +184,8 @@ test("nextHoliday returns unknown when the next year is not covered", () => {
   db.prepare("DELETE FROM cn_holiday_days WHERE year = ?").run(2026);
   const result = nextHoliday(new Date("2025-12-31T12:00:00+08:00"));
   assert.equal(result.status, "unknown");
-  assert.equal(result.coveredUntil, "2025-12-31");
+  // H6：ready 年份的覆盖边界与 holidayYearView 一致，到 12-19 为止。
+  assert.equal(result.coveredUntil, "2025-12-19");
   assert.match(result.message ?? "", /2026 年节假日安排尚未获取/);
 });
 
@@ -642,4 +643,44 @@ test("N4: mixed-source view is not silently truncated when the previous year is 
   ingestHolidayYear(chineseDaysDataset(2019, false, true)); // chinese-days 2019，元旦仅 1/1
   assert.equal(holidayYearView(2019), undefined);
   assert.equal(nextHoliday(new Date("2018-12-28T08:00:00+08:00")).status, "unknown");
+});
+
+// ---------------------------------------------------------------------------
+// H1：2015 特殊假日视图与补班关联
+// ---------------------------------------------------------------------------
+
+test("H1: holidayYearView shows the 2015 special holiday with its make-up workday", () => {
+  clearYears([2014, 2015]);
+  const raw = JSON.parse(fs.readFileSync(
+    path.join(process.cwd(), "tests", "fixtures", "holiday-cn-2015.json"),
+    "utf8",
+  )) as Record<string, unknown>;
+  ingestHolidayYear(parseDataset("holiday-cn", raw));
+
+  const view = holidayYearView(2015);
+  assert.ok(view);
+  const special = view.periods.find((period) =>
+    period.name === "抗日战争暨世界反法西斯战争胜利70周年纪念日");
+  assert.ok(special);
+  assert.equal(special.startDate, "2015-09-03");
+  assert.equal(special.endDate, "2015-09-05");
+  assert.equal(special.days, 3);
+  assert.deepEqual(special.makeUpWorkdays.map((day) => day.date), ["2015-09-06"]);
+});
+
+// ---------------------------------------------------------------------------
+// H4：ingest 入口必须校验，非法 dataset 不得写库
+// ---------------------------------------------------------------------------
+
+test("H4: ingestHolidayYear rejects invalid datasets before marking the year ready", () => {
+  clearYears([2050]);
+  const base = syntheticDataset(2050);
+  const invalid = {
+    ...base,
+    days: base.days.filter((day) => !day.name.includes("春节")),
+  };
+  assert.throws(() => ingestHolidayYear(invalid), /missing statutory holiday: 春节/);
+  assert.equal(isHolidayYearReady(2050), false);
+  assert.equal(readHolidayYear(2050), undefined);
+  assert.equal(yearStatus(2050), undefined);
 });

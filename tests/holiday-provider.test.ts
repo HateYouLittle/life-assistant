@@ -2,8 +2,10 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
+import { DateTime } from "luxon";
 import {
   fetchHolidayYear,
+  holidayNameHits,
   parseChineseDays,
   parseDataset,
   parseHolidayCn,
@@ -131,10 +133,18 @@ test("validation rejects a missing statutory holiday", () => {
 });
 
 test("validation rejects make-up workdays that are not weekends", () => {
-  const raw = structuredClone(holidayCnRaw) as { days: Array<Record<string, unknown>> };
-  const workday = raw.days.find((day) => day.isOffDay === false && day.date === "2025-01-26") as Record<string, unknown>;
-  workday.date = "2025-01-27"; // Monday
-  assert.throws(() => validateHolidayYear(parseHolidayCn(raw)), /make-up workday must be a weekend/);
+  // H1-2020：parseHolidayCn 现在会直接丢弃「非休日且不是周末」的普通工作日标记
+  // （如 2020-02-03 复工），因此这里改为直接构造 dataset 校验周末要求仍然保留。
+  const base = parseHolidayCn(holidayCnRaw);
+  const mutated = {
+    ...base,
+    days: base.days.map((day) => (
+      day.date === "2025-01-26" && day.dayType === "workday"
+        ? { ...day, date: "2025-01-27" } // Monday
+        : day
+    )),
+  };
+  assert.throws(() => validateHolidayYear(mutated), /make-up workday must be a weekend/);
 });
 
 test("validation rejects holiday dates outside their legal window", () => {
@@ -370,4 +380,126 @@ test("H5: fetchHolidayYear aggregates a mixed-year chinese-days fallback failure
     assert.ok(error.errors.some((entry) => String(entry).includes("exactly one calendar year")));
     return true;
   });
+});
+
+// ---------------------------------------------------------------------------
+// H1：2013/2015/2020 真实年数据校验
+// ---------------------------------------------------------------------------
+
+test("H1: 2013 official 12 make-up workdays pass validation", () => {
+  const dataset = parseHolidayCn(readJson("holiday-cn-2013.json"));
+  const workdays = dataset.days.filter((day) => day.dayType === "workday");
+  assert.equal(workdays.length, 12);
+  assert.ok(workdays.every((day) => {
+    const weekday = DateTime.fromISO(day.date, { zone: "Asia/Shanghai" }).weekday;
+    return weekday === 6 || weekday === 7;
+  }));
+  validateHolidayYear(dataset);
+  assert.equal(parseDataset("holiday-cn", readJson("holiday-cn-2013.json")).days.length, dataset.days.length);
+});
+
+test("H1: 2015 special holiday passes validation and holidayNameHits supports it", () => {
+  const dataset = parseDataset("holiday-cn", readJson("holiday-cn-2015.json"));
+  const specialName = "抗日战争暨世界反法西斯战争胜利70周年纪念日";
+  const specialDays = dataset.days.filter((day) => day.name === specialName);
+  assert.ok(specialDays.some((day) => day.dayType === "holiday" && day.date >= "2015-09-03" && day.date <= "2015-09-05"));
+  assert.ok(specialDays.some((day) => day.dayType === "workday" && day.date === "2015-09-06"));
+  assert.ok(holidayNameHits(specialName).includes(specialName));
+});
+
+test("H1: 2020 holiday-cn drops non-weekend ordinary workday markers", () => {
+  const dataset = parseHolidayCn(readJson("holiday-cn-2020.json"));
+  assert.equal(dataset.days.some((day) => day.date === "2020-02-03"), false);
+  const workdays = dataset.days.filter((day) => day.dayType === "workday");
+  assert.equal(workdays.length, 6);
+  assert.ok(workdays.every((day) => {
+    const weekday = DateTime.fromISO(day.date, { zone: "Asia/Shanghai" }).weekday;
+    return weekday === 6 || weekday === 7;
+  }));
+  validateHolidayYear(dataset);
+});
+
+test("H1: chinese-days 2020 National-Day-only alias satisfies Mid-Autumn for the merged year", () => {
+  const dataset = parseDataset("chinese-days", readJson("chinese-days-2020.json"));
+  assert.ok(dataset.days.some((day) => day.dayType === "holiday" && day.name === "国庆节"));
+  assert.ok(!dataset.days.some((day) => day.name.includes("中秋")));
+  validateHolidayYear(dataset);
+});
+
+test("H1: chinese-days alias does not relax Mid-Autumn for other years", () => {
+  const raw = syntheticChineseDaysRaw(2021);
+  const holidays = raw.holidays as Record<string, string>;
+  for (const [date, value] of Object.entries(holidays)) {
+    if (value.includes("中秋")) delete holidays[date];
+  }
+  assert.throws(
+    () => parseDataset("chinese-days", raw),
+    /missing statutory holiday: 中秋/,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// H3：AggregateError message 必须包含各候选源错误摘要，且不含 URL
+// ---------------------------------------------------------------------------
+
+test("H3: fetchHolidayYear aggregate error message contains per-source failure summaries", async () => {
+  const httpJson = async (): Promise<unknown> => {
+    throw new Error("network down");
+  };
+  await assert.rejects(() => fetchHolidayYear(2025, { httpJson }), (error: unknown) => {
+    assert.ok(error instanceof AggregateError);
+    assert.equal(error.errors.length, 3);
+    assert.match(error.message, /failed to fetch official holiday arrangement for 2025/);
+    assert.match(error.message, /holiday-cn: network down/);
+    assert.match(error.message, /chinese-days: network down/);
+    assert.doesNotMatch(error.message, /https?:\/\//);
+    return true;
+  });
+});
+
+test("H3: aggregate error message redacts URLs from underlying failures", async () => {
+  const httpJson = async (): Promise<unknown> => {
+    throw new Error("GET https://cdn.jsdelivr.net/gh/NateScarlet/holiday-cn@master/2025.json failed");
+  };
+  await assert.rejects(() => fetchHolidayYear(2025, { httpJson }), (error: unknown) => {
+    assert.ok(error instanceof AggregateError);
+    assert.doesNotMatch(error.message, /https?:\/\//);
+    assert.match(error.message, /<url>/);
+    return true;
+  });
+});
+
+// ---------------------------------------------------------------------------
+// H5：papers 过滤为合法 gov.cn URL
+// ---------------------------------------------------------------------------
+
+test("H5: parseHolidayCn keeps only http/https gov.cn papers", () => {
+  const raw = structuredClone(holidayCnRaw) as Record<string, unknown>;
+  raw.papers = [
+    "https://evil.example.com/x",
+    "https://www.gov.cn/zhengce/content.htm",
+    "http://www.gov.cn/older.htm",
+    "https://sub.henan.gov.cn/notice.htm",
+    "ftp://www.gov.cn/x",
+    "not-a-url",
+  ];
+  const dataset = parseHolidayCn(raw);
+  assert.deepEqual(dataset.officialPapers, [
+    "https://www.gov.cn/zhengce/content.htm",
+    "http://www.gov.cn/older.htm",
+    "https://sub.henan.gov.cn/notice.htm",
+  ]);
+});
+
+test("H5: next-year gate rejects when every paper is filtered out", async () => {
+  const raw = { ...syntheticHolidayCnRaw(2026), papers: ["https://evil.example.com/x"] };
+  const httpJson = async (): Promise<unknown> => raw;
+  await assert.rejects(
+    () => fetchHolidayYear(2026, { httpJson, allowFallback: false, requireOfficialPapers: true }),
+    /failed to fetch official holiday arrangement/,
+  );
+  await assert.rejects(
+    () => fetchHolidayYear(2026, { httpJson, allowFallback: false, requireOfficialPapers: true }),
+    /primary source has no official State Council paper/,
+  );
 });

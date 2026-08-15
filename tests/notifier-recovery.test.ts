@@ -39,7 +39,8 @@ function clearDeliveries(): void {
 
 function deliveryRow(dedupeKey: string): Record<string, unknown> {
   return db.prepare(`
-    SELECT d.status, d.attempts, d.last_error, d.route
+    SELECT d.status, d.attempts, d.last_error, d.route, d.request_generation,
+           d.transport_failures, d.next_attempt_at, d.claimed_at
     FROM profile_notification_deliveries d
     JOIN profile_notifications n ON n.id = d.notification_id AND n.profile_id = d.profile_id
     WHERE n.dedupe_key = ? AND n.profile_id = ?
@@ -198,4 +199,165 @@ test("transport-failure fallbacks stay terminal after route recovery", async () 
   });
   assert.deepEqual(summary, { attempted: 0, sent: 0, failed: 0 });
   assert.equal(deliveryRow("recovery:transport:1").status, "fallback");
+});
+
+function setDeliverySending(dedupeKey: string, claimedAt: string): void {
+  db.prepare(`
+    UPDATE profile_notification_deliveries
+    SET status = 'sending', claim_token = 'manual-claim', claimed_at = ?, updated_at = ?
+    WHERE profile_id = 'profile-a'
+      AND notification_id = (
+        SELECT id FROM profile_notifications WHERE profile_id = 'profile-a' AND dedupe_key = ?
+      )
+  `).run(claimedAt, claimedAt, dedupeKey);
+}
+
+test("N1: pull read prevents redelivery of an in-flight sending row on a restored route", async () => {
+  clearDeliveries();
+  await publishProfile("profile-a", "schedule", "N1 in-flight", "N1 body", "recovery:n1:1");
+  const original = routes["profile-a"];
+  const claimedAt = "2100-04-01T00:00:00.000Z";
+  setDeliverySending("recovery:n1:1", claimedAt);
+
+  routes["profile-a"] = {
+    route: "qqbot-2",
+    url: "http://127.0.0.1:8644/webhooks/route-2",
+    secret: testSecret,
+  };
+  try {
+    const pulled = pullPending(requireProfileContext("profile-a"));
+    assert.equal(pulled.some((notice) => notice.title === "N1 in-flight"), true);
+  } finally {
+    routes["profile-a"] = original;
+  }
+  assert.equal(deliveryRow("recovery:n1:1").status, "sending");
+
+  let calls = 0;
+  const at = new Date("2100-04-01T00:10:00.000Z");
+  const summary = await deliverPendingProfileNotifications({
+    at,
+    profileId: "profile-a",
+    fetchImpl: (async () => {
+      calls += 1;
+      return new Response("ok", { status: 200 });
+    }) as typeof fetch,
+    clock: () => at,
+  });
+  assert.deepEqual(summary, { attempted: 0, sent: 0, failed: 0 });
+  assert.equal(calls, 0);
+  assert.equal(deliveryRow("recovery:n1:1").status, "sending");
+});
+
+test("N2: idempotency-window fallback wins over route-missing fallback", async () => {
+  clearDeliveries();
+  await publishProfile("profile-a", "schedule", "N2 idempotency", "N2 body", "recovery:n2:1");
+  const original = routes["profile-a"];
+  const t0 = new Date("2100-05-01T00:00:00.000Z");
+  const timeoutFetch = (async () => {
+    throw new TypeError("network timeout");
+  }) as typeof fetch;
+
+  await deliverPendingProfileNotifications({
+    at: t0,
+    profileId: "profile-a",
+    fetchImpl: timeoutFetch,
+    clock: () => t0,
+  });
+  assert.equal(deliveryRow("recovery:n2:1").status, "failed");
+
+  const t1 = new Date("2100-05-01T01:00:00.000Z");
+  delete routes["profile-a"];
+  try {
+    await deliverPendingProfileNotifications({
+      at: t1,
+      profileId: "profile-a",
+      fetchImpl: successFetch,
+      clock: () => t1,
+    });
+  } finally {
+    routes["profile-a"] = original;
+  }
+
+  const row = deliveryRow("recovery:n2:1");
+  assert.equal(row.status, "fallback");
+  assert.equal(row.last_error, "uncertain delivery exceeded webhook idempotency window");
+
+  const t2 = new Date("2100-05-01T01:05:00.000Z");
+  const summary = await deliverPendingProfileNotifications({
+    at: t2,
+    profileId: "profile-a",
+    fetchImpl: successFetch,
+    clock: () => t2,
+  });
+  assert.deepEqual(summary, { attempted: 0, sent: 0, failed: 0 });
+  assert.equal(deliveryRow("recovery:n2:1").status, "fallback");
+});
+
+test("N3: pullPending returns zombie sending claims older than two minutes", async () => {
+  clearDeliveries();
+  await publishProfile("profile-a", "schedule", "N3 zombie", "N3 zombie body", "recovery:n3:zombie");
+  await publishProfile("profile-a", "schedule", "N3 fresh", "N3 fresh body", "recovery:n3:fresh");
+  setDeliverySending("recovery:n3:zombie", new Date(Date.now() - 10 * 60 * 1000).toISOString());
+  setDeliverySending("recovery:n3:fresh", new Date().toISOString());
+
+  const pulled = pullPending(requireProfileContext("profile-a"));
+  assert.equal(pulled.some((notice) => notice.title === "N3 zombie"), true);
+  assert.equal(pulled.some((notice) => notice.title === "N3 fresh"), false);
+});
+
+test("N4: due deliveries are attempted with bounded concurrency", async () => {
+  clearDeliveries();
+  for (let i = 1; i <= 5; i += 1) {
+    await publishProfile("profile-a", "schedule", `N4 concurrent ${i}`, `N4 body ${i}`, `recovery:n4:${i}`);
+  }
+  let active = 0;
+  let maxActive = 0;
+  const fetchImpl = (async () => {
+    active += 1;
+    maxActive = Math.max(maxActive, active);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    active -= 1;
+    return new Response("ok", { status: 200 });
+  }) as typeof fetch;
+
+  const at = new Date("2100-06-01T00:00:00.000Z");
+  const summary = await deliverPendingProfileNotifications({
+    at,
+    profileId: "profile-a",
+    fetchImpl,
+    clock: () => at,
+  });
+  assert.equal(maxActive, 5);
+  assert.deepEqual(summary, { attempted: 5, sent: 5, failed: 0 });
+  for (let i = 1; i <= 5; i += 1) {
+    assert.equal(deliveryRow(`recovery:n4:${i}`).status, "sent");
+  }
+});
+
+test("N8: 3xx is treated as a confirmed HTTP failure via redirect manual", async () => {
+  clearDeliveries();
+  await publishProfile("profile-a", "schedule", "N8 redirect", "N8 body", "recovery:n8:1");
+  let redirectMode: string | undefined;
+  const redirectFetch = (async (_input: unknown, init?: { redirect?: string }) => {
+    redirectMode = init?.redirect;
+    return new Response("redirecting", { status: 302, headers: { Location: "http://127.0.0.1:1/elsewhere" } });
+  }) as typeof fetch;
+
+  const t0 = new Date("2100-07-01T00:00:00.000Z");
+  for (const offset of [0, 61, 362, 1263, 4864]) {
+    const at = new Date(t0.getTime() + offset * 1000);
+    await deliverPendingProfileNotifications({ at, profileId: "profile-a", fetchImpl: redirectFetch, clock: () => at });
+  }
+
+  assert.equal(redirectMode, "manual");
+  const row = deliveryRow("recovery:n8:1");
+  assert.equal(row.status, "fallback");
+  assert.equal(row.attempts, 5);
+  assert.equal(row.request_generation, 6);
+  assert.equal(row.transport_failures, 0);
+
+  const at6 = new Date(t0.getTime() + 4865 * 1000);
+  const summary = await deliverPendingProfileNotifications({ at: at6, profileId: "profile-a", fetchImpl: redirectFetch, clock: () => at6 });
+  assert.deepEqual(summary, { attempted: 0, sent: 0, failed: 0 });
+  assert.equal(deliveryRow("recovery:n8:1").status, "fallback");
 });

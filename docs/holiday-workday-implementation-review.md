@@ -1,8 +1,8 @@
 # 交付文档：中国大陆法定节假日/工作日功能（供第三方代码复审）
 
-- 状态：实现完成；Codex 六轮复审发现均已修复，全量测试通过
+- 状态：实现完成；Codex 六轮复审发现的缺陷均已修复，第七轮最终验收通过
 - 测试基线：222（改动前）→ **333（第六轮修复后，全绿）**
-- 变更范围：15 个既有文件修改 + 11 个新文件（3 源码 + 4 测试 + 4 fixture）
+- 变更范围：16 个既有文件修改 + 12 个新文件（3 源码 + 4 测试 + 4 fixture + 本文档），既有文件含 `docs/repair-plan.md`
 - 目标读者：独立代码复审人员（无需了解本项目历史）
 
 ---
@@ -167,7 +167,7 @@
 3. 调休上班日必须落在周六/周日；
 4. 每个节日的休假日必须落在该节日的历史合理日期窗口（如劳动节 4/20–5/12）；
 5. 每个节日名的休假日按名字分组后连续段数量 ≤ 4；
-6. 全年休假日总数 20–45（2004 起统一口径；2004 黄金周真实值 22），调休上班日 ≤ 10；
+6. 全年休假日总数 20–45（2004 起统一口径；2004 黄金周真实值 22），调休上班日 ≤ 12；已知临时附加假日（如 2015 抗战胜利 70 周年纪念日）单独校验窗口与成对性；
 7. 次年额外门槛见 4.1。
 
 校验失败保留旧数据并记录 `last_attempt_at/last_error`。
@@ -240,9 +240,9 @@ CREATE TABLE IF NOT EXISTS cn_holiday_year_meta (
 
 | 文件 | 职责 |
 |---|---|
-| `src/modules/holiday/provider.ts` (294 行) | 双源 URL、两格式解析归一、结构校验、按序抓取、次年官方门槛、请求年份核对 |
-| `src/modules/holiday/calendar.ts` (395 行) | 事务入库、ready 判定、日期分类、连休期分组、nextHoliday、ensure/refresh（冷却） |
-| `src/modules/holiday/index.ts` (147 行) | 模块注册：4 tools + refresh job + onStart；工具懒补齐门控 |
+| `src/modules/holiday/provider.ts` (373 行) | 双源 URL、两格式解析归一、结构校验、按序抓取、次年官方门槛、请求年份核对 |
+| `src/modules/holiday/calendar.ts` (471 行) | 事务入库、ready 判定、日期分类、连休期分组、nextHoliday、ensure/refresh（冷却） |
+| `src/modules/holiday/index.ts` (248 行) | 模块注册：4 tools + refresh job + onStart；工具懒补齐门控 |
 
 ### 修改源码
 
@@ -271,7 +271,7 @@ CREATE TABLE IF NOT EXISTS cn_holiday_year_meta (
 | `tests/fixtures/holiday-cn-2004.json` | — | 真实 2004 黄金周形态：22 holiday + 6 周末补班 |
 | `tests/fixtures/holiday-cn-2019.json` | — | 真实 2019 形态：2018-12-29/30/31 跨年元旦 |
 
-既有测试改动仅两处：schema 版本断言 3→4（`profile-schedule.test.ts`、`schedule-migration.test.ts`）。
+既有测试改动三处：`tests/config.test.ts`（+2 HOLIDAY_REFRESH_CRON 用例）、`tests/profile-schedule.test.ts` 与 `tests/schedule-migration.test.ts`（schema 版本断言 3→4）。
 
 ## 7. 测试与验证
 

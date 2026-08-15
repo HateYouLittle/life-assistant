@@ -38,7 +38,7 @@ src/scheduler.ts -> module cron + schedule scan + outbox delivery
 | 数据/事件 | 作用域 | 行为 |
 |---|---|---|
 | 位置、天气 geo cache、油价数据 | 共享 | 所有 MCP Profile 和 scheduler 读取同一份数据 |
-| 中国大陆节假日/工作日历法 | 共享 | scheduler 自动抓取并按数据集日期范围入库；MCP 工具只读（缺数据时按规则补齐） |
+| 中国大陆节假日/工作日历法 | 共享 | scheduler 自动抓取并按数据集日期范围入库；MCP 查询工具不跑 cron，但 `holiday.list`/`holiday.is_workday`/`holiday.refresh` 在缺数据时会按冷却窗口补抓 |
 | 天气预警、油价预通知、每日生活简报 | 公共事件 | 为每个已配置 route 的 Profile 独立 materialize、去重和投递 |
 | 日程、occurrence、日程通知 | Profile 私有 | 所有读写均带 `profile_id`，不会跨 Profile 查询或投递 |
 | notification read、outbox delivery | Profile 私有 | 每个 Profile 独立确认、取消和 fallback |
@@ -109,11 +109,11 @@ route 缺失或变化时，旧的未完成 delivery 会转为 `fallback`；同�
 
 `weather.daily_brief` 的 cron 来自 `DAILY_WEATHER_BRIEF_CRON`，默认 `0 7 * * *`；IANA 时区来自 `LIFE_ASSISTANT_TIMEZONE`，未配置时使用进程本地时区。
 
-job 并发读取当前天气、当日预报和可选油价：
+job 并发读取当前天气与当日预报：
 
 - 当前天气或预报单项失败时，使用另一个天气结果继续生成；
 - 两个天气结果都不可用时，本轮失败，不发送空简报；
-- 油价未配置、失败或为不可用占位值时省略油价；
+- 简报不包含油价；油价信息由独立的 `oilprice.*` 通知承载；
 - 使用 `weather:daily-brief:<城市>:<本地日期>` 作为 dedupe key，同日更换已保存位置后新城市简报不会被旧键吞掉；
 - 内容由 Provider 数据确定性拼装，不调用 OpenAI 或其他 LLM。
 
@@ -129,7 +129,7 @@ Profile outbox -> stable loopback webhook route -> --deliver <platform>
 
 订阅 prompt 为 `{notification.title}\n\n{notification.body}`，并使用与 `PROFILE_PUSH_ROUTES_JSON` 相同的 HMAC secret。当前模型中，一个 Profile route 只选择一个 Gateway 目标平台，不从 Life Assistant 同时直发 QQ、微信、Bark 或 Server酱。
 
-平台选择属于 Hermes 动态订阅，不属于 Life Assistant 数据模型。route 名、URL 和 secret 不变时，重建同名 subscription 并只修改 `--deliver` 即可，通常无需迁移 SQLite、修改 scheduler 配置或重启 Gateway。平台凭据/静态配置变化时可能需要重启对应 Gateway；route 名、URL 或 secret 变化时必须同步更新 `PROFILE_PUSH_ROUTES_JSON` 并重启 scheduler。
+平台选择属于 Hermes 动态订阅，不属于 Life Assistant 数据模型。route 名、URL 和 secret 不变时，重建同名 subscription 并只修改 `--deliver` 即可，通常无需迁移 SQLite、修改 scheduler 配置或重启 Gateway。平台凭据/静态配置变化时可能需要重启对应 Gateway；route 名、URL、secret 或 `renderTarget` 变化时必须同步更新 `PROFILE_PUSH_ROUTES_JSON` 并重启 scheduler 与读取该配置的 MCP 进程（配置在进程启动时一次性解析）。
 
 secret 只来自环境变量或权限受限的配置文件，不得打印到日志、粘贴到聊天或提交 Git。
 
@@ -149,7 +149,7 @@ secret 只来自环境变量或权限受限的配置文件，不得打印到日�
 
 - **存储**：`cn_holiday_days(date PK, year, day_type holiday|workday, name, source, …)` 与 `cn_holiday_year_meta(year PK, status, source, payload_hash, fetched_at, last_attempt_at, last_error)`。只有 `status='ready'` 的年份参与日期分类。入库在单个事务中按**数据集实际覆盖日期范围**替换（不是按标题年整年删除），避免后抓相邻上一年文件时清掉另一标题年写入的 12 月下旬跨年行（H1）。`readHolidayYear(year)` 按标题年日期范围 `[year-1-12-20, year-12-19]` 读取，返回标题年完整数据（含跨年行，M3）。
 - **自动获取**：`holiday.refresh_calendar` job（`HOLIDAY_REFRESH_CRON`，默认 `0 2 * * *`，Asia/Shanghai）每日确保当年数据；每年 10 月起额外尝试获取下一年安排。scheduler 启动时经模块 `onStart` 引导补齐。抓取失败写 `last_attempt_at/last_error` 并按 6 小时冷却重试。
-- **数据源与门槛**：主源 holiday-cn（jsDelivr + raw.githubusercontent 镜像），独立兜底 chinese-days（npm/jsDelivr）。次年数据只有主源返回且携带国务院通知原文链接（`papers`）时才接受，兜底源不会被用于把预估值写成权威安排。每个候选源的返回数据集年份必须与请求年份一致（T1）。入库前做结构校验：日期必须是真实存在的规范日历日；按年份口径要求节日齐全（2008 年起七节日，2004–2007 仅元旦/春节/劳动节/国庆）；休假日落在合法日期窗口；补班日必须是周末；每个节日休假日连续；全年休假日总数 20–45（2004 年起统一口径）。
+- **数据源与门槛**：主源 holiday-cn（jsDelivr + raw.githubusercontent 镜像），独立兜底 chinese-days（npm/jsDelivr）。次年数据只有主源返回且携带国务院通知原文链接（`papers` 中的 `gov.cn` URL）时才接受，兜底源不会被用于把预估值写成权威安排。每个候选源的返回数据集年份必须与请求年份一致（T1）。入库前做结构校验：日期必须是真实存在的规范日历日；按年份口径要求节日齐全（2008 年起七节日，2004–2007 仅元旦/春节/劳动节/国庆；已知的国务院临时附加假日如 2015 抗战胜利 70 周年纪念日单独成对校验，但七个法定节日仍必须齐全）；休假日落在合法日期窗口；调休上班日必须是周末（数据源中的工作日冗余标记会被忽略）；每个节日的休假日连续段数 ≤ 4；全年休假日总数 20–45（2004 年起统一口径），调休上班日 ≤ 12。
 - **跨年元旦**：holiday-cn 年文件按国务院文件标题年份命名，仅放行「上一年 12/20 之后的元旦日期」作为跨年形态；下一年日期一律拒绝。入库仍按日期自然年写入 `cn_holiday_days`，按自然年查询可命中。`holidayYearView(year)` 按标题年日期范围 `[year-1-12-20, year-12-19]` 查询（K1：不含下一年标题年写入的 12 月下旬行），把 12/30–1/1 合并为同一连休期；补班日按「最近同名段 + 10 天窗口」关联，避免同名元旦段串染。chinese-days 是单自然年数据：year 文件不含上一年 12 月行，只有 year-1 同为 chinese-days 时视图才完整（N3/N4）——year-1 未 ready 或为 holiday-cn 时视图返回 undefined（unknown），`list` 入口经 `ensureYearForView` 仅在 year-1 未 ready 时尝试补齐，year-1 为 holiday-cn 时不覆盖既有数据、由视图层报错。`nextHoliday` 在当年未 ready 但下一年标题年已 ready 且 today 处于 12/20 后时继续扫描下一年（K3），双缺仍返回 unknown。
 - **分类口径**：命中 `cn_holiday_days` 按行分类；未命中的日期默认周一至周五为工作日、周六日为休息日。
 - **schedule 集成**：`workday`/`holiday` 频率仅支持公历与 `Asia/Shanghai`。occurrence 按天扫描，候选日期经日期级覆盖判断 `isDateCoveredByHolidayData`（M1/N1：12/20–12/31 仅当 year+1 为 holiday-cn 且 ready 时视为完整覆盖；否则自然年 ready 且命中权威行才算覆盖；其余日期看自然年标题年），未覆盖立即返回 null（无数据区间不触发，也不跨越缺失区间继续猜）；`until`/`count` 在扫描中生效。`createSchedule`/`updateSchedule`/`reconcileHolidaySchedules` 在算不出 next run 时调用 `holidayAwareRuleFinished`：`until/count` 真正耗尽 → `status='completed'`（archived 除外）；仅数据缺失 → 停用但保持 `active`，新数据入库后由 `reconcileHolidaySchedules` 恢复启用（派生状态重算不推进内容版本，冲突时放弃本轮）。

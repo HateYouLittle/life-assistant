@@ -1,7 +1,7 @@
 {
   "name": "life-assistant",
-  "version": "0.1.0",
-  "description": "Personal life assistant for Hermes Agent: weather, oil prices, Profile-private schedules, and reliable Hermes Webhook notifications.",
+  "version": "0.2.0",
+  "description": "Personal life assistant for Hermes Agent: weather, oil prices, Profile-private schedules, CN holidays/workdays, and reliable Hermes Webhook notifications.",
   "type": "module",
   "license": "MIT",
   "engines": {

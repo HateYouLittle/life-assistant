@@ -158,6 +158,100 @@ test("QWeather alerts business error code falls back to threshold inference", as
   assert.equal(calls, 2);
 });
 
+test("Open-Meteo current response with missing fields throws instead of returning NaN", async (t) => {
+  const originalKey = config.qweatherKey;
+  const originalFetch = globalThis.fetch;
+  config.qweatherKey = "";
+  globalThis.fetch = (async (input) => {
+    assert.match(String(input), /api\.open-meteo\.com/);
+    return Response.json({ current: { temperature_2m: 28, relative_humidity_2m: 60, apparent_temperature: 30, wind_speed_10m: 5 } });
+  }) as typeof fetch;
+  t.after(() => {
+    config.qweatherKey = originalKey;
+    globalThis.fetch = originalFetch;
+  });
+
+  await assert.rejects(
+    () => fetchCurrent(39.9, 116.4),
+    /weather provider: current\.weather_code is missing or not a finite number/,
+  );
+});
+
+test("QWeather forecast with empty daily falls back to Open-Meteo", async (t) => {
+  const originalKey = config.qweatherKey;
+  const originalFetch = globalThis.fetch;
+  config.qweatherKey = "test-key";
+  let calls = 0;
+  globalThis.fetch = (async (input) => {
+    calls += 1;
+    const url = String(input);
+    if (url.includes("/v7/weather/3d")) return Response.json({ daily: [] });
+    assert.match(url, /api\.open-meteo\.com/);
+    return Response.json({
+      daily: {
+        time: ["2026-08-03"],
+        temperature_2m_max: [30],
+        temperature_2m_min: [23],
+        weather_code: [80],
+        precipitation_probability_max: [65],
+      },
+    });
+  }) as typeof fetch;
+  t.after(() => {
+    config.qweatherKey = originalKey;
+    globalThis.fetch = originalFetch;
+  });
+
+  assert.deepEqual(await fetchForecast(39.9, 116.4, 1), [{
+    date: "2026-08-03",
+    tMax: 30,
+    tMin: 23,
+    weatherText: "阵雨",
+    precipProb: 65,
+  }]);
+  assert.equal(calls, 2);
+});
+
+test("QWeather current with NaN temperature falls back to Open-Meteo", async (t) => {
+  const originalKey = config.qweatherKey;
+  const originalFetch = globalThis.fetch;
+  config.qweatherKey = "test-key";
+  let calls = 0;
+  globalThis.fetch = (async (input) => {
+    calls += 1;
+    const url = String(input);
+    if (url.includes("/v7/weather/now")) {
+      return Response.json({
+        now: { temp: "NaN", feelsLike: "33", humidity: "60", windSpeed: "12", text: "多云", icon: "101" },
+      });
+    }
+    assert.match(url, /api\.open-meteo\.com/);
+    return Response.json({
+      current: {
+        temperature_2m: 28.5,
+        relative_humidity_2m: 55,
+        apparent_temperature: 29,
+        weather_code: 2,
+        wind_speed_10m: 8,
+      },
+    });
+  }) as typeof fetch;
+  t.after(() => {
+    config.qweatherKey = originalKey;
+    globalThis.fetch = originalFetch;
+  });
+
+  assert.deepEqual(await fetchCurrent(39.9, 116.4), {
+    temperature: 28.5,
+    apparent: 29,
+    humidity: 55,
+    windSpeed: 8,
+    windSpeedUnit: "m/s",
+    weatherText: "多云",
+  });
+  assert.equal(calls, 2);
+});
+
 test("redactUrl strips query parameters while keeping origin and pathname", () => {
   assert.equal(
     redactUrl("https://devapi.qweather.com/v7/weather/now?location=116.40,39.90&key=super-secret"),
@@ -165,7 +259,8 @@ test("redactUrl strips query parameters while keeping origin and pathname", () =
   );
   assert.equal(redactUrl("https://api.open-meteo.com/v1/forecast?latitude=39.9"), "https://api.open-meteo.com/v1/forecast?(redacted)");
   assert.equal(redactUrl("https://example.com/path"), "https://example.com/path");
-  assert.equal(redactUrl("not-a-url"), "not-a-url");
+  assert.equal(redactUrl("not-a-url"), "(invalid-url)");
+  assert.equal(redactUrl("not a url?key=SECRET"), "(invalid-url)");
 });
 
 test("httpJson HTTP error message never leaks the query string", async (t) => {
@@ -183,6 +278,71 @@ test("httpJson HTTP error message never leaks the query string", async (t) => {
       return true;
     },
   );
+});
+
+test("httpJson 4xx is not retried and the error message is redacted", async (t) => {
+  const originalFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = (async () => {
+    calls += 1;
+    return Response.json({}, { status: 400 });
+  }) as typeof fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  await assert.rejects(
+    () => httpJson("https://devapi.qweather.com/v7/weather/now?key=super-secret"),
+    (err: Error) => {
+      assert.equal(err.message, "HTTP 400 for https://devapi.qweather.com/v7/weather/now?(redacted)");
+      assert.ok(!err.message.includes("super-secret"), "error message must not contain the API key");
+      return true;
+    },
+  );
+  assert.equal(calls, 1);
+});
+
+test("httpJson 5xx is retried exactly once", async (t) => {
+  const originalFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = (async () => {
+    calls += 1;
+    return Response.json({}, { status: 503 });
+  }) as typeof fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  await assert.rejects(
+    () => httpJson("https://example.com/api?token=super-secret"),
+    (err: Error) => {
+      assert.equal(err.message, "HTTP 503 for https://example.com/api?(redacted)");
+      assert.ok(!err.message.includes("super-secret"), "error message must not contain the token");
+      return true;
+    },
+  );
+  assert.equal(calls, 2);
+});
+
+test("httpJson does not retry a POST with a body on network error", async (t) => {
+  const originalFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = (async () => {
+    calls += 1;
+    throw new TypeError("network down");
+  }) as typeof fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  await assert.rejects(
+    () => httpJson("https://example.com/api", {
+      method: "POST",
+      body: JSON.stringify({ action: "archive" }),
+    }),
+    /network down/,
+  );
+  assert.equal(calls, 1);
 });
 
 test("Open-Meteo forecast maps daily precipitation maximum as probability percent", async (t) => {

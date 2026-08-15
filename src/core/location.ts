@@ -34,7 +34,9 @@ export function currentLocation(): Location | null {
     }
     return null;
   }
-  if (config.location.city && config.location.lat !== undefined && config.location.lon !== undefined) {
+  // env 预置城市需 trim 后非空且 <=64（N14），与 location.set 的 schema 保持一致
+  const envCity = config.location.city.trim();
+  if (envCity && envCity.length <= 64 && config.location.lat !== undefined && config.location.lon !== undefined) {
     const { lat, lon } = config.location;
     // env 预置坐标同样校验有限性与范围，非法视为未配置
     if (Number.isFinite(lat) && Number.isFinite(lon) && lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180) {
@@ -68,7 +70,7 @@ const locationModule: AssistantModule = {
     {
       name: "get",
       description:
-        "获取用户当前位置。首次使用天气/油价/快递功能前必须调用。若返回 need_confirm，请把 suggestion 用自然语言复述给用户并请其确认，确认后将 city、province（如有）和经纬度传给 location.set 保存。",
+        "获取用户当前位置。首次使用天气/油价功能前必须调用。若返回 need_confirm，请把 suggestion 用自然语言复述给用户并请其确认，确认后将 city、province（如有）和经纬度传给 location.set 保存。",
       schema: {},
       handler: async () => {
         const loc = currentLocation();
