@@ -75,9 +75,15 @@ export function parseProfilePushRoutes(raw: string | undefined): Record<string, 
 }
 
 /** 全局配置：全部来自环境变量，密钥不落代码库 */
+const profilePushRoutesRaw = process.env.PROFILE_PUSH_ROUTES_JSON;
+const profilePushRoutes = parseProfilePushRoutes(profilePushRoutesRaw);
+if (profilePushRoutesRaw && Object.keys(profilePushRoutes).length === 0) {
+  console.warn("PROFILE_PUSH_ROUTES_JSON is set but produced no valid routes");
+}
+
 export const config = {
-  dataDir: path.resolve(process.env.DATA_DIR ?? "./data"),
-  profilePushRoutes: parseProfilePushRoutes(process.env.PROFILE_PUSH_ROUTES_JSON),
+  dataDir: path.resolve(nonBlankOrDefault(process.env.DATA_DIR, "./data")),
+  profilePushRoutes,
   timezone: nonBlankOrDefault(process.env.LIFE_ASSISTANT_TIMEZONE, Intl.DateTimeFormat().resolvedOptions().timeZone),
 
   location: {

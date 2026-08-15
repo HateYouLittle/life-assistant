@@ -105,6 +105,38 @@ function isValidCoordinatePair(lat: unknown, lon: unknown): boolean {
     && typeof lon === "number" && Number.isFinite(lon) && lon >= -180 && lon <= 180;
 }
 
+/** 轻量响应形状校验：字段必须存在且为有限数，无效则抛错交给上层降级/报错（N12）。 */
+function requireFiniteNumber(value: unknown, label: string): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new Error(`weather provider: ${label} is missing or not a finite number`);
+  }
+  return value;
+}
+
+function requireFiniteNumberArray(value: unknown, label: string): number[] {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new Error(`weather provider: ${label} is missing or empty`);
+  }
+  return value.map((item) => {
+    if (typeof item !== "number" || !Number.isFinite(item)) {
+      throw new Error(`weather provider: ${label} contains a non-finite number`);
+    }
+    return item;
+  });
+}
+
+function requireStringArray(value: unknown, label: string): string[] {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new Error(`weather provider: ${label} is missing or empty`);
+  }
+  return value.map((item) => {
+    if (typeof item !== "string" || item.length === 0) {
+      throw new Error(`weather provider: ${label} contains an invalid string value`);
+    }
+    return item;
+  });
+}
+
 function isValidGeoCacheEntry(raw: unknown): raw is GeoCacheEntry {
   if (!raw || typeof raw !== "object") return false;
   const candidate = raw as Record<string, unknown>;
@@ -162,11 +194,20 @@ export async function fetchCurrent(lat: number, lon: number, city?: string): Pro
         throw new Error(`QWeather weathernow error code ${r.code}`);
       }
       if (r.now) {
+        const temperature = Number(r.now.temp);
+        const apparent = Number(r.now.feelsLike);
+        const humidity = Number(r.now.humidity);
+        const windSpeed = Number(r.now.windSpeed);
+        // 数值非法（NaN/Infinity）视为失败并走 Open-Meteo 兜底（N12）
+        if (!Number.isFinite(temperature) || !Number.isFinite(apparent)
+          || !Number.isFinite(humidity) || !Number.isFinite(windSpeed)) {
+          throw new Error("QWeather current returned invalid numeric fields");
+        }
         return {
-          temperature: Number(r.now.temp),
-          apparent: Number(r.now.feelsLike),
-          humidity: Number(r.now.humidity),
-          windSpeed: Number(r.now.windSpeed),
+          temperature,
+          apparent,
+          humidity,
+          windSpeed,
           windSpeedUnit: "km/h",
           weatherText: r.now.text || (QW_TEXT[r.now.icon] ?? `code ${r.now.icon}`),
         };
@@ -175,17 +216,22 @@ export async function fetchCurrent(lat: number, lon: number, city?: string): Pro
       console.error(`[weather] QWeather current failed, fallback to Open-Meteo: ${(e as Error).message}`);
     }
   }
-  const r = await httpJson<{ current: Record<string, number> }>(
+  const r = await httpJson<{ current?: Record<string, unknown> }>(
     `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}` +
       `&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m&timezone=auto`,
   );
+  const current = r.current;
+  if (!current || typeof current !== "object") {
+    throw new Error("weather provider: Open-Meteo current response is missing current");
+  }
+  const weatherCode = requireFiniteNumber(current.weather_code, "current.weather_code");
   return {
-    temperature: r.current.temperature_2m,
-    apparent: r.current.apparent_temperature,
-    humidity: r.current.relative_humidity_2m,
-    windSpeed: r.current.wind_speed_10m,
+    temperature: requireFiniteNumber(current.temperature_2m, "current.temperature_2m"),
+    apparent: requireFiniteNumber(current.apparent_temperature, "current.apparent_temperature"),
+    humidity: requireFiniteNumber(current.relative_humidity_2m, "current.relative_humidity_2m"),
+    windSpeed: requireFiniteNumber(current.wind_speed_10m, "current.wind_speed_10m"),
     windSpeedUnit: "m/s",
-    weatherText: WMO[r.current.weather_code] ?? `code ${r.current.weather_code}`,
+    weatherText: WMO[weatherCode] ?? `code ${weatherCode}`,
   };
 }
 
@@ -202,31 +248,55 @@ export async function fetchForecast(lat: number, lon: number, days = 3, city?: s
       if (r.code !== undefined && r.code !== null && String(r.code) !== "200") {
         throw new Error(`QWeather weatherforecast error code ${r.code}`);
       }
+      if (r.daily !== undefined && r.daily.length === 0) {
+        // 空 daily 视为失败，继续 Open-Meteo 兜底，而不是把空数组返回给上层（N12）
+        throw new Error("QWeather forecast returned empty daily");
+      }
       if (r.daily) {
-        return r.daily.slice(0, days).map((d) => ({
-          date: d.fxDate,
-          tMax: Number(d.tempMax),
-          tMin: Number(d.tempMin),
-          weatherText: d.textDay || (QW_TEXT[d.iconDay] ?? `code ${d.iconDay}`),
-          // Number("")/Number("0")/NaN 一律折叠为 undefined，避免 "预计0mm" 噪音
-          precipAmountMm: Number(d.precip) || undefined,
-        }));
+        return r.daily.slice(0, days).map((d) => {
+          const tMax = Number(d.tempMax);
+          const tMin = Number(d.tempMin);
+          // 温度等关键数值非法（NaN/Infinity）视为失败并走 Open-Meteo 兜底（N12）
+          if (!Number.isFinite(tMax) || !Number.isFinite(tMin)) {
+            throw new Error("QWeather forecast returned invalid numeric fields");
+          }
+          return {
+            date: d.fxDate,
+            tMax,
+            tMin,
+            weatherText: d.textDay || (QW_TEXT[d.iconDay] ?? `code ${d.iconDay}`),
+            // Number("")/Number("0")/NaN 一律折叠为 undefined，避免 "预计0mm" 噪音
+            precipAmountMm: Number(d.precip) || undefined,
+          };
+        });
       }
     } catch (e) {
       console.error(`[weather] QWeather forecast failed, fallback to Open-Meteo: ${(e as Error).message}`);
     }
   }
-  const r = await httpJson<{ daily: Record<string, Array<number | string>> }>(
+  const r = await httpJson<{ daily?: Record<string, unknown> }>(
     `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}` +
       `&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max&forecast_days=${days}&timezone=auto`,
   );
   const d = r.daily;
-  return (d.time as string[]).map((date, i) => ({
+  if (!d || typeof d !== "object") {
+    throw new Error("weather provider: Open-Meteo forecast response is missing daily");
+  }
+  const time = requireStringArray(d.time, "daily.time");
+  const tMax = requireFiniteNumberArray(d.temperature_2m_max, "daily.temperature_2m_max");
+  const tMin = requireFiniteNumberArray(d.temperature_2m_min, "daily.temperature_2m_min");
+  const weatherCodes = requireFiniteNumberArray(d.weather_code, "daily.weather_code");
+  const precipProbs = requireFiniteNumberArray(d.precipitation_probability_max, "daily.precipitation_probability_max");
+  if (tMax.length < time.length || tMin.length < time.length
+    || weatherCodes.length < time.length || precipProbs.length < time.length) {
+    throw new Error("weather provider: Open-Meteo forecast daily arrays are shorter than time");
+  }
+  return time.map((date, i) => ({
     date,
-    tMax: d.temperature_2m_max[i] as number,
-    tMin: d.temperature_2m_min[i] as number,
-    weatherText: WMO[d.weather_code[i] as number] ?? `code ${d.weather_code[i]}`,
-    precipProb: d.precipitation_probability_max[i] as number,
+    tMax: tMax[i],
+    tMin: tMin[i],
+    weatherText: WMO[weatherCodes[i]] ?? `code ${weatherCodes[i]}`,
+    precipProb: precipProbs[i],
   }));
 }
 
@@ -289,15 +359,21 @@ export async function fetchAlerts(city: string, lat: number, lon: number): Promi
     }
   }
   // 降级：阈值推断
-  const r = await httpJson<{ hourly: Record<string, number[]> }>(
+  const r = await httpJson<{ hourly?: Record<string, unknown> }>(
     `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}` +
       `&hourly=temperature_2m,precipitation,wind_speed_10m&forecast_days=2&timezone=auto`,
   );
   const alerts: WeatherAlert[] = [];
   const h = r.hourly;
-  const maxPrecip = Math.max(...h.precipitation);
-  const maxTemp = Math.max(...h.temperature_2m);
-  const maxWind = Math.max(...h.wind_speed_10m);
+  if (!h || typeof h !== "object") {
+    throw new Error("weather provider: Open-Meteo hourly response is missing hourly");
+  }
+  const precipitation = requireFiniteNumberArray(h.precipitation, "hourly.precipitation");
+  const temperature2m = requireFiniteNumberArray(h.temperature_2m, "hourly.temperature_2m");
+  const windSpeed10m = requireFiniteNumberArray(h.wind_speed_10m, "hourly.wind_speed_10m");
+  const maxPrecip = Math.max(...precipitation);
+  const maxTemp = Math.max(...temperature2m);
+  const maxWind = Math.max(...windSpeed10m);
   if (maxPrecip >= 16) alerts.push({ kind: "inferred", title: `${city}强降雨推断提醒`, level: "inferred", description: `未来48小时小时降水峰值约 ${maxPrecip}mm，可能达暴雨量级，注意出行安全。` });
   if (maxTemp >= 35) alerts.push({ kind: "inferred", title: `${city}高温推断提醒`, level: "inferred", description: `未来48小时最高气温约 ${maxTemp}℃，注意防暑降温。` });
   if (maxWind >= 17.2) alerts.push({ kind: "inferred", title: `${city}大风推断提醒`, level: "inferred", description: `未来48小时风速峰值约 ${maxWind}m/s（约8级），注意防风。` });

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import path from "node:path";
 import test from "node:test";
 
 import crypto from "node:crypto";
@@ -8,7 +9,11 @@ import {
   type ProfilePushRoute,
 } from "../src/config.js";
 
-type ConfigEnvironmentVariable = "DAILY_WEATHER_BRIEF_CRON" | "LIFE_ASSISTANT_TIMEZONE" | "HOLIDAY_REFRESH_CRON";
+type ConfigEnvironmentVariable =
+  | "DAILY_WEATHER_BRIEF_CRON"
+  | "LIFE_ASSISTANT_TIMEZONE"
+  | "HOLIDAY_REFRESH_CRON"
+  | "DATA_DIR";
 
 let importSequence = 0;
 
@@ -59,6 +64,35 @@ test("blank holiday refresh cron falls back to the default schedule", async () =
 test("holiday refresh cron is trimmed before use", async () => {
   const config = await loadConfigWith("HOLIDAY_REFRESH_CRON", "  30 3 * * *\t");
   assert.equal(config.cron.holidayRefresh, "30 3 * * *");
+});
+
+test("blank DATA_DIR falls back to the ./data directory", async () => {
+  for (const value of ["", " \t "]) {
+    const config = await loadConfigWith("DATA_DIR", value);
+    assert.equal(config.dataDir, path.resolve("./data"));
+  }
+});
+
+test("non-empty but invalid PROFILE_PUSH_ROUTES_JSON warns once without secrets", async () => {
+  const previous = process.env.PROFILE_PUSH_ROUTES_JSON;
+  const originalWarn = console.warn;
+  const warnings: string[] = [];
+  console.warn = ((message: string) => {
+    warnings.push(message);
+  }) as typeof console.warn;
+  process.env.PROFILE_PUSH_ROUTES_JSON = JSON.stringify({
+    bad: { route: "bad route", url: "http://127.0.0.1:8899/x", secret: "short" },
+  });
+  try {
+    await import(`../src/config.js?config-test=${importSequence++}`);
+  } finally {
+    if (previous === undefined) delete process.env.PROFILE_PUSH_ROUTES_JSON;
+    else process.env.PROFILE_PUSH_ROUTES_JSON = previous;
+    console.warn = originalWarn;
+  }
+  assert.equal(warnings.length, 1);
+  assert.equal(warnings[0], "PROFILE_PUSH_ROUTES_JSON is set but produced no valid routes");
+  assert.ok(!warnings[0].includes("short"), "warning must not contain the route secret");
 });
 
 // ============================================================================

@@ -31,7 +31,7 @@ const expressModule: AssistantModule = {
   tools: [
     {
       name: "track",
-      description: "订阅一个快递单号的动态追踪。订阅后系统每 30 分钟自动轮询，物流状态变更时主动通知用户。",
+      description: "订阅一个快递单号的动态追踪。订阅后系统按 expressPoll cron（默认每小时）自动轮询，物流状态变更时主动通知用户。",
       schema: trackSchema,
       handler: async (args) => {
         try {
@@ -116,4 +116,9 @@ const expressModule: AssistantModule = {
   ],
 };
 
-registerModule(expressModule);
+// 2026-08-01 封存护栏：默认不注册，避免取消 modules/index.ts 中的注释后意外恢复；确需恢复时设置 EXPRESS_ENABLED=1。
+if (process.env.EXPRESS_ENABLED === "1") {
+  registerModule(expressModule);
+} else {
+  console.warn("[express] 模块已封存，未注册；如需恢复请设置 EXPRESS_ENABLED=1。");
+}

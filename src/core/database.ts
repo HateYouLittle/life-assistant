@@ -143,10 +143,19 @@ export function migrateDatabaseSchema(db: DatabaseSync): void {
       last_error TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_schedules_due ON schedules(enabled, next_run_at);
-    CREATE INDEX IF NOT EXISTS idx_profile_notifications_owner ON profile_notifications(profile_id, id);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_profile_notifications_composite ON profile_notifications(profile_id, id);
     CREATE INDEX IF NOT EXISTS idx_profile_deliveries_due ON profile_notification_deliveries(status, next_attempt_at);
     `);
+
+    // 版本护栏：schema_meta 表可能刚创建，读取现有 version 必须放在 CREATE 之后、事务内。
+    // 现有版本比当前支持版本新时拒绝打开/迁移，避免旧代码破坏新库。
+    const versionRow = db.prepare("SELECT value FROM schema_meta WHERE key = 'version'").get() as { value?: string } | undefined;
+    if (versionRow?.value !== undefined) {
+      const existingVersion = Number(versionRow.value);
+      if (Number.isFinite(existingVersion) && existingVersion > 4) {
+        throw new Error(`database schema version ${versionRow.value} is newer than supported version 4`);
+      }
+    }
 
     // Additive migration for databases created by early development builds.
     ensureColumn(db, "schedules", "type", "TEXT NOT NULL DEFAULT 'todo'");
