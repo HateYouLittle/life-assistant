@@ -10,7 +10,7 @@ import { deliverPendingProfileNotifications, notify, publishProfile, type Delive
 import { notifyModule } from "./core/notify-module.js";
 import { ok, type AssistantModule } from "./core/registry.js";
 import { buildScheduleReminderNotification } from "./modules/schedule/notification.js";
-import { calculateNextRun, deadlineForOccurrence, hydrateRow, nextReminderTiming, normalizeVersion } from "./modules/schedule/service.js";
+import { calculateNextRun, deadlineForOccurrence, holidayAwareRuleFinished, hydrateRow, nextReminderTiming, normalizeVersion } from "./modules/schedule/service.js";
 import type { ScheduleItem } from "./modules/schedule/types.js";
 
 export { notifyModule };
@@ -179,13 +179,20 @@ async function processDue(item: ScheduleItem, at: DateTime<true>): Promise<void>
   }
 
   const nextRun = calculateNextIncompleteRun(item, at.plus({ milliseconds: 1 }) as DateTime<true>);
+  // workday/holiday：无数据区间算不出 next run 时保持 active 并停用，等新一年节假日数据
+  // 入库后由 reconcileHolidaySchedules 恢复；until/count 真正耗尽才标记 completed。
+  const nextStatus = nextRun
+    ? item.status
+    : (item.recurrence.frequency === "workday" || item.recurrence.frequency === "holiday")
+      ? (holidayAwareRuleFinished(item, at) ? "completed" : item.status)
+      : "completed";
   // P2-1：写回用归一化后的版本（脏行 version=0 → 2，自愈），WHERE 用原始列值防并发冲突。
   // N2：WHERE 用 version IS ? —— SQLite 的 IS 可匹配 NULL，NULL 脏行同样命中并自愈。
   const nextVersion = normalizeVersion(fresh.version) + 1;
   const updated = db.prepare("UPDATE schedules SET next_run_at = ?, enabled = ?, status = ?, version = ?, updated_at = ? WHERE profile_id = ? AND id = ? AND version IS ?").run(
     nextRun?.toISO() ?? null,
     nextRun ? 1 : 0,
-    nextRun ? item.status : "completed",
+    nextStatus,
     nextVersion,
     isoNow(),
     item.profileId,
@@ -285,6 +292,17 @@ export function startScheduler(): SchedulerHandle {
     fence();
   }, 60_000);
   heartbeat.unref();
+  for (const module of getModules()) {
+    if (!module.onStart) continue;
+    // 启动引导：不阻塞 startScheduler 返回，异常只记日志，不影响其余模块与后续 job。
+    void runFenced(async () => {
+      try {
+        await module.onStart!();
+      } catch (error) {
+        console.error(`[startup ${module.name}] failed:`, error);
+      }
+    });
+  }
   for (const module of getModules()) {
     for (const job of module.jobs ?? []) {
       const task = cron.schedule(job.cron, async () => {

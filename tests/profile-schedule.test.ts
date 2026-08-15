@@ -1524,7 +1524,7 @@ test("a displaced scheduler owner cannot refresh or reacquire through the heartb
   assert.equal(refreshSchedulerLease("stale-owner"), false);
 });
 
-test("schema v2 upgrades to a valid v3 delivery outbox", () => {
+test("schema v2 upgrades to a valid v4 delivery outbox", () => {
   assert.equal(typeof migrateDatabaseSchema, "function");
   const legacy = new DatabaseSync(":memory:");
   legacy.exec(`
@@ -1545,7 +1545,7 @@ test("schema v2 upgrades to a valid v3 delivery outbox", () => {
   migrateDatabaseSchema(legacy);
   const version = legacy.prepare("SELECT value FROM schema_meta WHERE key = 'version'").get() as { value: string };
   const columns = legacy.prepare("PRAGMA table_info(profile_notification_deliveries)").all() as Array<{ name: string }>;
-  assert.equal(version.value, "3");
+  assert.equal(version.value, "4");
   assert.equal(columns.some((column) => column.name === "claim_token"), true);
   assert.equal(columns.some((column) => column.name === "transport_failures"), true);
   assert.equal(columns.some((column) => column.name === "request_started_at"), true);

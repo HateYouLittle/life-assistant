@@ -8,7 +8,7 @@ import {
   type ProfilePushRoute,
 } from "../src/config.js";
 
-type ConfigEnvironmentVariable = "DAILY_WEATHER_BRIEF_CRON" | "LIFE_ASSISTANT_TIMEZONE";
+type ConfigEnvironmentVariable = "DAILY_WEATHER_BRIEF_CRON" | "LIFE_ASSISTANT_TIMEZONE" | "HOLIDAY_REFRESH_CRON";
 
 let importSequence = 0;
 
@@ -47,6 +47,18 @@ test("blank life assistant timezone falls back to the process local timezone", a
 test("life assistant timezone is trimmed before use", async () => {
   const config = await loadConfigWith("LIFE_ASSISTANT_TIMEZONE", "  Asia/Shanghai\t");
   assert.equal(config.timezone, "Asia/Shanghai");
+});
+
+test("blank holiday refresh cron falls back to the default schedule", async () => {
+  for (const value of ["", " \t "]) {
+    const config = await loadConfigWith("HOLIDAY_REFRESH_CRON", value);
+    assert.equal(config.cron.holidayRefresh, "0 2 * * *");
+  }
+});
+
+test("holiday refresh cron is trimmed before use", async () => {
+  const config = await loadConfigWith("HOLIDAY_REFRESH_CRON", "  30 3 * * *\t");
+  assert.equal(config.cron.holidayRefresh, "30 3 * * *");
 });
 
 // ============================================================================

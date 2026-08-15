@@ -128,7 +128,7 @@ test("schema v3 additively upgrades legacy schedules without touching protected 
 
   assert.equal(
     (legacy.prepare("SELECT value FROM schema_meta WHERE key = 'version'").get() as { value: string }).value,
-    "3",
+    "4",
   );
   assert.ok(columnNames(legacy, "schedules").includes("deadline_at"));
   assert.ok(columnNames(legacy, "schedules").includes("deadline_offset_minutes"));

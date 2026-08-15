@@ -36,6 +36,8 @@ export interface AssistantModule {
   name: string;
   tools?: ToolDef[];
   jobs?: JobDef[];
+  /** 可选：scheduler 取得租约后启动时执行一次（如引导抓取全局数据）；异常由 scheduler 隔离记录。 */
+  onStart?: () => Promise<void>;
 }
 
 const modules: AssistantModule[] = [];

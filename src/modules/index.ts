@@ -7,6 +7,7 @@ import "../core/location.js";   // 内建：位置服务
 import "./weather/index.js";
 import "./oilprice/index.js";
 import "./schedule/index.js";
+import "./holiday/index.js";   // 中国大陆法定节假日/工作日：共享历法数据 + 自动抓取
 // import "./express/index.js";  // 2026-08-01 封存：用户弃用快递追踪（电商自推送），省 TianAPI 额度；恢复时取消注释
 
 // import "./airquality/index.js";   // v0.3 示例：空气质量

@@ -5,6 +5,7 @@ import { Lunar, LunarYear } from "lunar-javascript";
 import { getDatabase } from "../../core/database.js";
 import { requireProfileContext, type ProfileContext } from "../../core/profile.js";
 import { config } from "../../config.js";
+import { dayInfo, isDateCoveredByHolidayData } from "../holiday/calendar.js";
 import type {
   CalendarType,
   Frequency,
@@ -23,7 +24,9 @@ import type {
 const { RRule } = rrulePkg as unknown as { RRule: any };
 const DEFAULT_ZONE = config.timezone;
 const DEFAULT_TIME = "09:00";
-const VALID_FREQUENCIES = ["once", "daily", "weekly", "monthly", "yearly"];
+const VALID_FREQUENCIES = ["once", "daily", "weekly", "monthly", "yearly", "workday", "holiday"];
+const HOLIDAY_AWARE_FREQUENCIES = ["workday", "holiday"];
+const HOLIDAY_ZONE = "Asia/Shanghai";
 const VALID_PROFILE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 type ValidDateTime = DateTime<true>;
 
@@ -53,7 +56,6 @@ function sanitizeRecurrence(raw: unknown, calendar: CalendarType): RecurrenceRul
   if (typeof candidate.frequency !== "string" || !VALID_FREQUENCIES.includes(candidate.frequency as Frequency)) {
     return fallback;
   }
-  const interval = candidate.interval;
   // 可选字段一律做类型/取值强制，非法即丢弃，杜绝损坏行再次进入 RRule/luxon 崩溃路径
   let until = typeof candidate.until === "string" && /^\d{4}-\d{2}-\d{2}$/.test(candidate.until)
     ? candidate.until
@@ -66,12 +68,19 @@ function sanitizeRecurrence(raw: unknown, calendar: CalendarType): RecurrenceRul
   // 存量行可能同时含 count 与 until（旧 schema 允许）：读取侧保留 count、丢弃 until，
   // 避免 update 时被互斥校验误伤（输入路径仍严格互斥）。
   if (count !== undefined && until !== undefined) until = undefined;
-  const byMonthDay = Number.isInteger(candidate.byMonthDay)
+  const frequency = candidate.frequency as Frequency;
+  const holidayAware = HOLIDAY_AWARE_FREQUENCIES.includes(frequency);
+  // 法定节假日/工作日频率仅支持公历；损坏行回退安全默认，避免进入不支持的历法路径。
+  if (holidayAware && calendar !== "solar") return fallback;
+  const interval = Number.isInteger(candidate.interval) && (candidate.interval as number) >= 1
+    ? (candidate.interval as number)
+    : 1;
+  const byMonthDay = !holidayAware && Number.isInteger(candidate.byMonthDay)
     && (candidate.byMonthDay as number) >= 1
     && (candidate.byMonthDay as number) <= 31
     ? candidate.byMonthDay as number
     : undefined;
-  const byWeekday = Array.isArray(candidate.byWeekday)
+  const byWeekday = !holidayAware && Array.isArray(candidate.byWeekday)
     ? candidate.byWeekday.filter((day): day is string =>
       typeof day === "string" && ["SU", "MO", "TU", "WE", "TH", "FR", "SA"].includes(day))
     : undefined;
@@ -81,8 +90,9 @@ function sanitizeRecurrence(raw: unknown, calendar: CalendarType): RecurrenceRul
     ? (candidate.leapMonthPolicy === "leap" ? "leap" : "normal")
     : undefined;
   return {
-    frequency: candidate.frequency as Frequency,
-    interval: Number.isInteger(interval) && (interval as number) >= 1 ? (interval as number) : 1,
+    frequency,
+    // workday/holiday 的 interval 无定义，读取侧强制为 1。
+    interval: holidayAware ? 1 : interval,
     ...(byWeekday && byWeekday.length > 0 ? { byWeekday } : {}),
     ...(byMonthDay !== undefined ? { byMonthDay } : {}),
     ...(until !== undefined ? { until } : {}),
@@ -172,8 +182,14 @@ function fromUtc(iso: string): ValidDateTime {
 function normalizeRecurrence(input: ScheduleInput, calendar: CalendarType, type: ScheduleType): RecurrenceRule {
   const raw = typeof input.recurrence === "string" ? { frequency: input.recurrence } : (input.recurrence ?? {});
   const frequency = (raw.frequency ?? (type === "birthday" || type === "anniversary" || calendar === "lunar" ? "yearly" : "once")) as Frequency;
-  if (!["once", "daily", "weekly", "monthly", "yearly"].includes(frequency)) throw new Error("unsupported recurrence frequency");
+  if (!["once", "daily", "weekly", "monthly", "yearly", "workday", "holiday"].includes(frequency)) throw new Error("unsupported recurrence frequency");
   if (calendar === "lunar" && frequency !== "yearly") throw new Error("lunar schedules currently support yearly recurrence only");
+  const holidayAware = HOLIDAY_AWARE_FREQUENCIES.includes(frequency);
+  if (holidayAware && calendar !== "solar") throw new Error("workday/holiday recurrence requires the solar calendar");
+  if (holidayAware && Number(raw.interval ?? 1) !== 1) throw new Error("workday/holiday recurrence does not support interval");
+  if (holidayAware && (raw.byWeekday !== undefined || raw.byMonthDay !== undefined)) {
+    throw new Error("workday/holiday recurrence does not support byWeekday/byMonthDay");
+  }
   // P2-11：count 与 until 互斥，避免 RRule 语义歧义。
   if (raw.count !== undefined && raw.until !== undefined) {
     throw new Error("count and until are mutually exclusive");
@@ -271,6 +287,9 @@ function normalizeInput(input: ScheduleInput): ScheduleInput & { type: ScheduleT
     }
   }
   const recurrence = normalizeRecurrence(input, calendar, type);
+  if (HOLIDAY_AWARE_FREQUENCIES.includes(recurrence.frequency) && timezone !== HOLIDAY_ZONE) {
+    throw new Error(`workday/holiday recurrence requires timezone ${HOLIDAY_ZONE}`);
+  }
   const reminders = normalizeReminders(input.reminders);
   const deadline = normalizeDeadline(input, recurrence, timezone, time);
   const { clearDeadline: _clearDeadline, ...persistentInput } = input;
@@ -346,7 +365,95 @@ function solarEventAt(item: ScheduleItem, from: ValidDateTime, inclusive: boolea
   return nextFloating ? fromFloating(nextFloating, item.timezone).toUTC() as ValidDateTime : null;
 }
 
+// ---------------------------------------------------------------------------
+// workday / holiday：基于 cn_holiday_days 的历法感知 occurrence。
+// 候选日期所在年份必须已有 ready 数据，否则返回 null（无数据区间不触发），
+// 也绝不跨越无数据年份继续向后猜。
+// ---------------------------------------------------------------------------
+
+function holidayAwareMatch(item: ScheduleItem, info: { isWorkday: boolean; isHoliday: boolean }): boolean {
+  return item.recurrence.frequency === "workday" ? info.isWorkday : info.isHoliday;
+}
+
+/** 统计 from 所在本地日（不含）之前已消耗的 count；遇无数据年份返回 null（无法确定序号）。 */
+function countPriorHolidayAwareMatches(item: ScheduleItem, beforeDate: string): number | null {
+  if (item.recurrence.count === undefined) return 0;
+  if (!item.date) return null;
+  const anchor = localDate(item.date, "00:00", item.timezone).startOf("day");
+  let cursor = DateTime.fromISO(beforeDate, { zone: item.timezone }).startOf("day");
+  let matched = 0;
+  while (cursor > anchor) {
+    cursor = cursor.minus({ days: 1 });
+    const date = cursor.toISODate();
+    if (!date) return null;
+    // 12/20-12/31 的日期权威数据属 year+1 标题年；按日期级覆盖判断，
+    // 未覆盖即无法确定 count 序号，返回 null（无数据不猜测）。
+    if (!isDateCoveredByHolidayData(date)) return null;
+    const info = dayInfo(date);
+    if (!info) return null;
+    if (holidayAwareMatch(item, info)) matched += 1;
+    if (matched >= (item.recurrence.count as number)) return matched;
+  }
+  return matched;
+}
+
+function holidayAwareOccurrence(item: ScheduleItem, from: ValidDateTime, inclusive: boolean): ValidDateTime | null {
+  const localFrom = from.setZone(item.timezone);
+  const fromDate = localFrom.toISODate();
+  if (!fromDate) return null;
+  const count = item.recurrence.count;
+  let consumed = count === undefined ? 0 : countPriorHolidayAwareMatches(item, fromDate);
+  if (consumed === null) return null;
+  if (count !== undefined && consumed >= count) return null;
+
+  // 锚点日期之前不存在 occurrence（与 RRule dtstart 语义一致）；从 max(from 日, 锚点日) 开始扫描。
+  let startDay = localFrom.startOf("day");
+  if (item.date !== undefined) {
+    const anchorDay = localDate(item.date, "00:00", item.timezone).startOf("day");
+    if (anchorDay > startDay) startDay = anchorDay;
+  }
+
+  for (let offset = 0; ; offset += 1) {
+    const candidateDay = startDay.plus({ days: offset });
+    if (candidateDay.year > 2100) return null;
+    const date = candidateDay.toISODate();
+    if (!date) return null;
+    if (item.recurrence.until !== undefined && date > item.recurrence.until) return null;
+    // 12/20-12/31 的日期权威数据属 year+1 标题年；日期级覆盖判断未覆盖 → 停止扫描，
+    // 不按普通周历猜测（无数据区间不触发）。
+    if (!isDateCoveredByHolidayData(date)) return null;
+    const info = dayInfo(date);
+    if (!info) return null;
+    if (!holidayAwareMatch(item, info)) continue;
+    consumed += 1;
+    if (count !== undefined && consumed > count) return null;
+    const event = localDate(date, item.time, item.timezone).toUTC();
+    if (event > from || (inclusive && event.equals(from))) return event as ValidDateTime;
+  }
+}
+
+/** workday/holiday 规则的 until/count 是否已真正耗尽（区别于「无数据暂不可算」）。 */
+export function holidayAwareRuleFinished(item: ScheduleItem, at: ValidDateTime): boolean {
+  const local = at.setZone(item.timezone);
+  if (item.recurrence.until !== undefined) {
+    const until = DateTime.fromISO(item.recurrence.until, { zone: item.timezone });
+    return until.isValid && local.startOf("day") >= until.startOf("day");
+  }
+  if (item.recurrence.count !== undefined) {
+    // 用「明天之前」统计，把今天已经发生的 occurrence 计入 count 消耗，
+    // 使最后一天的 occurrence 处理完后能正确判定规则结束。
+    const tomorrow = local.plus({ days: 1 }).toISODate();
+    if (!tomorrow) return false;
+    const prior = countPriorHolidayAwareMatches(item, tomorrow);
+    return prior !== null && prior >= item.recurrence.count;
+  }
+  return false;
+}
+
 export function findOccurrence(item: ScheduleItem, from: ValidDateTime = DateTime.utc(), inclusive = true): ValidDateTime | null {
+  if (HOLIDAY_AWARE_FREQUENCIES.includes(item.recurrence.frequency)) {
+    return holidayAwareOccurrence(item, from, inclusive);
+  }
   return item.calendar === "lunar" ? lunarEventAt(item, from, inclusive) : solarEventAt(item, from, inclusive);
 }
 
@@ -684,6 +791,17 @@ export function createSchedule(value: ProfileContext | string, input: ScheduleIn
   const now = DateTime.utc();
   const event = findOccurrence(base, now, true);
   base.nextRunAt = calculateInitialNextRun(base, event, now)?.toISO() ?? undefined;
+  // workday/holiday：数据缺失算不出 next run 时创建为停用，等节假日数据入库后由 reconcile 复活。
+  base.enabled = normalized.status !== "archived"
+    && (base.nextRunAt !== undefined || !HOLIDAY_AWARE_FREQUENCIES.includes(normalized.recurrence.frequency));
+  // 真正耗尽（until/count 已用完）与「无数据暂不可算」必须区分：
+  // 前者落 completed 终态，后者保持 active 等待数据；archived 等其他状态不被覆盖。
+  if (HOLIDAY_AWARE_FREQUENCIES.includes(normalized.recurrence.frequency)
+    && base.status === "active"
+    && base.nextRunAt === undefined
+    && holidayAwareRuleFinished(base, now)) {
+    base.status = "completed";
+  }
   base.nextOccurrenceSolar = event?.toISO() ?? undefined;
   insertSchedule(profile, base);
   return base;
@@ -764,6 +882,16 @@ export function updateSchedule(value: ProfileContext | string, id: string, chang
   const now = DateTime.utc();
   const event = findOccurrence(next, now, true);
   next.nextRunAt = calculateInitialNextRun(next, event, now)?.toISO() ?? undefined;
+  next.enabled = normalized.status !== "archived"
+    && (next.nextRunAt !== undefined || !HOLIDAY_AWARE_FREQUENCIES.includes(normalized.recurrence.frequency));
+  // T4：真正耗尽落 completed 终态；无数据暂不可算保持 active 等待 reconcile 复活；
+  // archived 等其他状态不被覆盖。
+  if (HOLIDAY_AWARE_FREQUENCIES.includes(normalized.recurrence.frequency)
+    && next.status === "active"
+    && next.nextRunAt === undefined
+    && holidayAwareRuleFinished(next, now)) {
+    next.status = "completed";
+  }
   next.nextOccurrenceSolar = event?.toISO() ?? undefined;
   const result = getDatabase().prepare(`
     UPDATE schedules SET type=?, title=?, note=?, priority=?, status=?, calendar=?, date=?, lunar_month=?, lunar_day=?, leap_month_policy=?, time=?, all_day=?, timezone=?, recurrence_json=?, reminders_json=?, deadline_at=?, deadline_offset_minutes=?, enabled=?, next_run_at=?, version=?, updated_at=?
@@ -781,6 +909,59 @@ export function deleteSchedule(value: ProfileContext | string, id: string): void
   const profile = context(value);
   const result = getDatabase().prepare("DELETE FROM schedules WHERE profile_id = ? AND id = ?").run(profile.id, id) as { changes: number };
   if (!result.changes) throw new Error("schedule not found");
+}
+
+export interface HolidayScheduleReconcileResult {
+  scanned: number;
+  updated: number;
+  skipped: number;
+}
+
+/**
+ * 节假日数据入库后重算全部 workday/holiday 日程的 next_run_at：
+ * - 有下一个触发时间 → 恢复启用；
+ * - 无数据暂不可算 → 停用但保留 status（区别于 until/count 真正到期）；
+ * - 不推进 version（派生状态重算，与内容乐观锁分离），冲突时放弃本轮。
+ */
+export function reconcileHolidaySchedules(at = new Date()): HolidayScheduleReconcileResult {
+  const db = getDatabase();
+  const rows = db.prepare("SELECT * FROM schedules").all() as Record<string, unknown>[];
+  const now = DateTime.fromJSDate(at, { zone: "utc" }) as ValidDateTime;
+  const summary: HolidayScheduleReconcileResult = { scanned: 0, updated: 0, skipped: 0 };
+  for (const row of rows) {
+    let item: ScheduleItem;
+    try {
+      item = rowToItem(row);
+    } catch (error) {
+      logHydrationError(String(row.profile_id ?? "unknown"), String(row.id ?? "unknown"), error);
+      summary.skipped += 1;
+      continue;
+    }
+    if (!HOLIDAY_AWARE_FREQUENCIES.includes(item.recurrence.frequency)) continue;
+    summary.scanned += 1;
+    const event = findOccurrence(item, now, true);
+    const nextRunAt = calculateInitialNextRun(item, event, now)?.toISO() ?? null;
+    // T4：真正耗尽（until/count）→ completed 终态；仅数据缺失 → 保持 active 等待复活；
+    // archived 等其他状态不被覆盖。status 与 enabled/next_run_at 一样是派生状态，重算不推进 version。
+    const exhausted = nextRunAt === null
+      && item.status === "active"
+      && holidayAwareRuleFinished(item, now);
+    const desiredStatus = exhausted ? "completed" : item.status;
+    const desiredEnabled = item.status === "active" && nextRunAt !== null ? 1 : 0;
+    const currentNext = row.next_run_at == null ? null : String(row.next_run_at);
+    if (currentNext === nextRunAt
+      && Number(row.enabled) === desiredEnabled
+      && String(row.status) === desiredStatus) {
+      continue;
+    }
+    const result = db.prepare(`
+      UPDATE schedules SET next_run_at = ?, enabled = ?, status = ?, updated_at = ?
+      WHERE profile_id = ? AND id = ? AND version IS ?
+    `).run(nextRunAt, desiredEnabled, desiredStatus, nowIso(), item.profileId, item.id, row.version as number | null) as { changes: number };
+    if (result.changes === 1) summary.updated += 1;
+    else summary.skipped += 1;
+  }
+  return summary;
 }
 
 export function completeSchedule(value: ProfileContext | string, id: string, occurrenceKey?: string): ScheduleItem {

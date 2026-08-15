@@ -123,6 +123,25 @@ export function migrateDatabaseSchema(db: DatabaseSync): void {
       owner TEXT NOT NULL,
       acquired_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS cn_holiday_days (
+      date TEXT PRIMARY KEY,
+      year INTEGER NOT NULL,
+      day_type TEXT NOT NULL CHECK(day_type IN ('holiday', 'workday')),
+      name TEXT NOT NULL,
+      source TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_cn_holiday_days_year ON cn_holiday_days(year);
+    CREATE TABLE IF NOT EXISTS cn_holiday_year_meta (
+      year INTEGER PRIMARY KEY,
+      status TEXT NOT NULL DEFAULT 'ready',
+      source TEXT NOT NULL,
+      payload_hash TEXT NOT NULL,
+      fetched_at TEXT NOT NULL,
+      last_attempt_at TEXT,
+      last_error TEXT
+    );
     CREATE INDEX IF NOT EXISTS idx_schedules_due ON schedules(enabled, next_run_at);
     CREATE INDEX IF NOT EXISTS idx_profile_notifications_owner ON profile_notifications(profile_id, id);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_profile_notifications_composite ON profile_notifications(profile_id, id);
@@ -142,7 +161,7 @@ export function migrateDatabaseSchema(db: DatabaseSync): void {
     ensureColumn(db, "profile_notification_deliveries", "claim_token", "TEXT");
     ensureColumn(db, "profile_notification_deliveries", "claimed_at", "TEXT");
 
-    db.prepare("INSERT OR REPLACE INTO schema_meta(key, value) VALUES('version', '3')").run();
+    db.prepare("INSERT OR REPLACE INTO schema_meta(key, value) VALUES('version', '4')").run();
     db.exec("COMMIT");
   } catch (error) {
     db.exec("ROLLBACK");

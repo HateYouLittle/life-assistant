@@ -6,10 +6,11 @@ Life Assistant 是面向 Hermes Agent 的 Skill + MCP 服务，提供天气、�
 |---|---|
 | 天气 | 实时天气、7 日预报、气象预警、确定性每日生活简报 |
 | 油价 | 当前 92#/95#/0# 油价、下一次调价窗口与提前通知 |
-| 日程 | 待办、生日、纪念日；支持公历、中国农历和重复提醒 |
+| 日程 | 待办、生日、纪念日；支持公历、中国农历、重复提醒和法定节假日/工作日频率 |
+| 节假日 | 中国大陆法定节假日与调休上班日历法；scheduler 每年自动获取下一年安排；放假倒计时查询 |
 | 通知 | Profile SQLite outbox、Hermes HMAC V2 `deliver-only` Webhook、`notify.pull` 失败兜底 |
 
-当前共注册 15 个 MCP 工具。快递追踪已经封存，未注册到运行时。
+当前共注册 19 个 MCP 工具。快递追踪已经封存，未注册到运行时。
 
 ## 架构概览
 
@@ -248,6 +249,7 @@ systemctl status --no-pager life-assistant-scheduler.service
 | `PROFILE_PUSH_ROUTES_JSON` | Profile 到 Hermes route、loopback URL、HMAC secret 的映射 |
 | `LIFE_ASSISTANT_TIMEZONE` | scheduler 使用的 IANA 时区 |
 | `DAILY_WEATHER_BRIEF_CRON` | 每日生活简报 cron，默认 `0 7 * * *` |
+| `HOLIDAY_REFRESH_CRON` | 节假日安排每日刷新 cron（Asia/Shanghai），默认 `0 2 * * *` |
 | `LOCATION_CITY/LAT/LON` | 可选预置共享位置；未设置时由 Agent 首次确认 |
 | `QWEATHER_KEY` | 可选，和风天气实时/预报/官方预警和 GeoAPI |
 | `QWEATHER_API_HOST` | 可选，和风天气 API host |
@@ -296,11 +298,31 @@ hermes -p "<profile>" webhook subscribe "<route-name>" \
 - 通知快照在生成时按该 Profile 的 `renderTarget` 渲染并落库，之后不重渲染；因此 `renderTarget` 只影响配置变更之后新生成的通知，已落库的旧快照不会自动升级为 markdown。
 - 平台 markdown 分支任何渲染异常都回退 plain 兜底，不会导致通知发送失败。
 
+## 中国大陆节假日与工作日
+
+节假日数据是共享历法数据，所有 Profile 读同一份，用户无需也不能手动提供。scheduler 的 `holiday.refresh_calendar` job 每天（默认 02:00 Asia/Shanghai，可用 `HOLIDAY_REFRESH_CRON` 调整）确保当年安排可用；每年 10 月起还会自动获取下一年国务院放假安排，并在 scheduler 启动时引导补齐当年数据。次年数据只在主源携带国务院通知原文链接时才入库，避免任何数据源的预估值被当成权威安排。
+
+数据源与兜底：
+
+1. 主源 [holiday-cn](https://github.com/NateScarlet/holiday-cn)（jsDelivr CDN + raw.githubusercontent 镜像）；
+2. 独立兜底 [chinese-days](https://github.com/vsme/chinese-days)（npm + jsDelivr）。
+
+抓取结果经过结构校验后按数据集实际覆盖的日期范围原子入库，校验项包括：返回数据集年份与请求年份一致、日期是真实存在的规范日历日、按年份口径要求节日齐全（2008 年起七个法定节日，2004–2007 为元旦/春节/劳动节/国庆四节日）、休假日落在合法日期窗口、补班日必须是周末、休假日按节日连续、全年休假日总数 20–45。跨年元旦仅允许「上一年 12/20 之后的元旦日期」，并按日期自然年入库；`holiday.list`/`holiday.next` 会把 12/30–1/1 这类跨年日期合并显示为同一个连休期。校验失败保留旧数据。无官方数据的年份被视为「无数据区间」：workday/holiday 日程在该区间不触发，也绝不按普通周历猜测。
+
+日程 recurrence 新增两个频率（仅公历 + `Asia/Shanghai` 时区）：
+
+- `"workday"`：中国大陆法定工作日 = 周一至周五 − 法定节假日 + 调休上班的周末；
+- `"holiday"`：仅法定节假日中的休假日（不包含普通周末）。
+
+示例：`schedule.create` 传 `recurrence: "workday"`、`time: "09:00"` 即「每个法定工作日早上 9 点提醒」；春节假期自动跳过，调休补班的周六正常触发。新一年数据入库后，scheduler 会自动重算所有受影响的 workday/holiday 日程并恢复此前因无数据停用的日程；`until`/`count` 规则真正耗尽的日程会自动标记为 `completed`，仅因数据缺失而停用的日程保持 `active` 等待恢复。
+
+查询工具：`holiday.next`（距离下次放假的天数、节日名、起止日期与调休上班日）、`holiday.list`（某年完整安排）、`holiday.is_workday`（判断某天是否法定工作日）、`holiday.refresh`（手动补抓某年，数据仍来自官方源）。
+
 ## 工具一览
 
-`location.get` · `location.set` · `location.detect` · `weather.current` · `weather.forecast` · `weather.alerts` · `oilprice.current` · `oilprice.next_adjustment` · `schedule.create` · `schedule.list` · `schedule.get` · `schedule.update` · `schedule.complete` · `schedule.delete` · `notify.pull`
+`location.get` · `location.set` · `location.detect` · `weather.current` · `weather.forecast` · `weather.alerts` · `oilprice.current` · `oilprice.next_adjustment` · `schedule.create` · `schedule.list` · `schedule.get` · `schedule.update` · `schedule.complete` · `schedule.delete` · `holiday.next` · `holiday.list` · `holiday.is_workday` · `holiday.refresh` · `notify.pull`
 
-日程工具不接受 `profileId`，而是绑定启动 MCP 时显式注入的 `HERMES_PROFILE`。农历生日或纪念日使用 `calendar: "lunar"`、`lunarMonth`、`lunarDay`；`leapMonthPolicy: "leap"` 仅在对应闰月年份触发。
+日程工具不接受 `profileId`，而是绑定启动 MCP 时显式注入的 `HERMES_PROFILE`。农历生日或纪念日使用 `calendar: "lunar"`、`lunarMonth`、`lunarDay`；`leapMonthPolicy: "leap"` 仅在对应闰月年份触发。法定节假日/工作日频率使用 `recurrence.frequency: "workday"` 或 `"holiday"`，见上文。
 
 ## 如何新增定时推送
 
@@ -314,7 +336,7 @@ hermes -p "<profile>" webhook subscribe "<route-name>" \
 
 ## 当前状态与计划
 
-已完成：SQLite 存储与旧数据迁移、Profile 私有日程、Profile notification/outbox、统一 Hermes HMAC V2 Webhook、`notify.pull` fallback、确定性生活简报、scheduler 单实例租约。
+已完成：SQLite 存储与旧数据迁移、Profile 私有日程、Profile notification/outbox、统一 Hermes HMAC V2 Webhook、`notify.pull` fallback、确定性生活简报、scheduler 单实例租约、中国大陆法定节假日/工作日历法（自动抓取 + workday/holiday 日程频率 + 放假倒计时查询）。
 
 计划中：
 

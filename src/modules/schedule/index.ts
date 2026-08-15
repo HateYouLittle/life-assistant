@@ -17,9 +17,9 @@ const reminderSchema = z.object({
 });
 
 const recurrenceSchema = z.union([
-  z.enum(["once", "daily", "weekly", "monthly", "yearly"]),
+  z.enum(["once", "daily", "weekly", "monthly", "yearly", "workday", "holiday"]),
   z.object({
-    frequency: z.enum(["once", "daily", "weekly", "monthly", "yearly"]).optional(),
+    frequency: z.enum(["once", "daily", "weekly", "monthly", "yearly", "workday", "holiday"]).optional(),
     interval: z.number().int().min(1).optional(),
     byWeekday: z.array(z.enum(["SU", "MO", "TU", "WE", "TH", "FR", "SA"])).optional(),
     byMonthDay: z.number().int().min(1).max(31).optional(),
@@ -77,7 +77,7 @@ const scheduleModule: AssistantModule = {
   tools: [
     {
       name: "create",
-      description: "在当前 Hermes Profile 中创建私有待办、生日或纪念日。支持公历和中国农历；农历日期必须使用 lunarMonth/lunarDay，不要当作公历日期填写。",
+      description: "在当前 Hermes Profile 中创建私有待办、生日或纪念日。支持公历和中国农历；农历日期必须使用 lunarMonth/lunarDay，不要当作公历日期填写。recurrence.frequency 支持 workday（中国大陆法定工作日：周一至周五剔除法定节假日、加入调休上班的周末）与 holiday（仅法定节假日休假日，不含普通周末），两者仅支持公历与 Asia/Shanghai 时区。",
       schema: commonFields,
       handler: async (args, context) => {
         try {

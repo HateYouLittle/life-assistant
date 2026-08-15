@@ -1,0 +1,38 @@
+{
+  "$schema": "https://raw.githubusercontent.com/NateScarlet/holiday-cn/master/schema.json",
+  "$id": "https://raw.githubusercontent.com/NateScarlet/holiday-cn/master/2004.json",
+  "year": 2004,
+  "papers": [
+    "https://www.gov.cn/zhengce/zhengceku/2004/content_example.htm"
+  ],
+  "days": [
+    { "name": "元旦", "date": "2004-01-01", "isOffDay": true },
+    { "name": "春节", "date": "2004-01-17", "isOffDay": false },
+    { "name": "春节", "date": "2004-01-18", "isOffDay": false },
+    { "name": "春节", "date": "2004-01-22", "isOffDay": true },
+    { "name": "春节", "date": "2004-01-23", "isOffDay": true },
+    { "name": "春节", "date": "2004-01-24", "isOffDay": true },
+    { "name": "春节", "date": "2004-01-25", "isOffDay": true },
+    { "name": "春节", "date": "2004-01-26", "isOffDay": true },
+    { "name": "春节", "date": "2004-01-27", "isOffDay": true },
+    { "name": "春节", "date": "2004-01-28", "isOffDay": true },
+    { "name": "劳动节", "date": "2004-04-24", "isOffDay": false },
+    { "name": "劳动节", "date": "2004-04-25", "isOffDay": false },
+    { "name": "劳动节", "date": "2004-05-01", "isOffDay": true },
+    { "name": "劳动节", "date": "2004-05-02", "isOffDay": true },
+    { "name": "劳动节", "date": "2004-05-03", "isOffDay": true },
+    { "name": "劳动节", "date": "2004-05-04", "isOffDay": true },
+    { "name": "劳动节", "date": "2004-05-05", "isOffDay": true },
+    { "name": "劳动节", "date": "2004-05-06", "isOffDay": true },
+    { "name": "劳动节", "date": "2004-05-07", "isOffDay": true },
+    { "name": "国庆节", "date": "2004-09-25", "isOffDay": false },
+    { "name": "国庆节", "date": "2004-09-26", "isOffDay": false },
+    { "name": "国庆节", "date": "2004-10-01", "isOffDay": true },
+    { "name": "国庆节", "date": "2004-10-02", "isOffDay": true },
+    { "name": "国庆节", "date": "2004-10-03", "isOffDay": true },
+    { "name": "国庆节", "date": "2004-10-04", "isOffDay": true },
+    { "name": "国庆节", "date": "2004-10-05", "isOffDay": true },
+    { "name": "国庆节", "date": "2004-10-06", "isOffDay": true },
+    { "name": "国庆节", "date": "2004-10-07", "isOffDay": true }
+  ]
+}

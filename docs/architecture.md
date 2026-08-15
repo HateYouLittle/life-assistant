@@ -38,6 +38,7 @@ src/scheduler.ts -> module cron + schedule scan + outbox delivery
 | 数据/事件 | 作用域 | 行为 |
 |---|---|---|
 | 位置、天气 geo cache、油价数据 | 共享 | 所有 MCP Profile 和 scheduler 读取同一份数据 |
+| 中国大陆节假日/工作日历法 | 共享 | scheduler 自动抓取并按数据集日期范围入库；MCP 工具只读（缺数据时按规则补齐） |
 | 天气预警、油价预通知、每日生活简报 | 公共事件 | 为每个已配置 route 的 Profile 独立 materialize、去重和投递 |
 | 日程、occurrence、日程通知 | Profile 私有 | 所有读写均带 `profile_id`，不会跨 Profile 查询或投递 |
 | notification read、outbox delivery | Profile 私有 | 每个 Profile 独立确认、取消和 fallback |
@@ -67,11 +68,13 @@ interface JobDef {
 }
 ```
 
+`AssistantModule` 还支持可选 `onStart(): Promise<void>`：scheduler 取得租约后为每个模块调用一次（不阻塞启动，异常只记日志），用于启动引导类数据补齐（当前 holiday 模块用它确保当年节假日数据可用）。
+
 模块 job 使用 `ctx.notify` 后进入公共事件发布路径，无需知道 Profile route、HMAC 或 Gateway 平台。私有通知必须由明确的 Profile 所有者路径发布。每个 job 都应使用正确 timezone、稳定 dedupe key，并让单轮 Provider 失败不破坏后续调度。
 
 定时需求分为三个层级：
 
-1. `schedule` reminder：静态或重复个人提醒，存储于 SQLite，严格属于创建它的 Profile。
+1. `schedule` reminder：静态或重复个人提醒，存储于 SQLite，严格属于创建它的 Profile。recurrence 除 RRule 频率外还支持 `workday`（中国大陆法定工作日）与 `holiday`（仅法定节假日休假日），两者基于共享节假日数据计算，见「中国大陆节假日历法」。
 2. code-defined module job：需要运行时天气、油价或其他实时数据的固定任务，由 scheduler 执行并通过标准通知接口发布。
 3. planned automation：通用自然语言动态信息推送。当前尚未实现；规划设计为 SQLite 配置、白名单 action、scheduler 无 LLM 执行。
 
@@ -142,7 +145,17 @@ secret 只来自环境变量或权限受限的配置文件，不得打印到日�
 
 天气 Open-Meteo 兜底的 WMO 天气码映射表（`WMO: Record<number, string>`）已补齐 53/55/56/57/66/67/77/85/86 等缺失码（如 55 = 密集毛毛雨），映射后不再出现原始 `code N` 回退；未知码仍保留 `code N` 兜底。天气 provider：QWeather 首选、Open-Meteo 兜底。
 
-## 7. 数据源
+## 7. 中国大陆节假日历法
+
+- **存储**：`cn_holiday_days(date PK, year, day_type holiday|workday, name, source, …)` 与 `cn_holiday_year_meta(year PK, status, source, payload_hash, fetched_at, last_attempt_at, last_error)`。只有 `status='ready'` 的年份参与日期分类。入库在单个事务中按**数据集实际覆盖日期范围**替换（不是按标题年整年删除），避免后抓相邻上一年文件时清掉另一标题年写入的 12 月下旬跨年行（H1）。`readHolidayYear(year)` 按标题年日期范围 `[year-1-12-20, year-12-19]` 读取，返回标题年完整数据（含跨年行，M3）。
+- **自动获取**：`holiday.refresh_calendar` job（`HOLIDAY_REFRESH_CRON`，默认 `0 2 * * *`，Asia/Shanghai）每日确保当年数据；每年 10 月起额外尝试获取下一年安排。scheduler 启动时经模块 `onStart` 引导补齐。抓取失败写 `last_attempt_at/last_error` 并按 6 小时冷却重试。
+- **数据源与门槛**：主源 holiday-cn（jsDelivr + raw.githubusercontent 镜像），独立兜底 chinese-days（npm/jsDelivr）。次年数据只有主源返回且携带国务院通知原文链接（`papers`）时才接受，兜底源不会被用于把预估值写成权威安排。每个候选源的返回数据集年份必须与请求年份一致（T1）。入库前做结构校验：日期必须是真实存在的规范日历日；按年份口径要求节日齐全（2008 年起七节日，2004–2007 仅元旦/春节/劳动节/国庆）；休假日落在合法日期窗口；补班日必须是周末；每个节日休假日连续；全年休假日总数 20–45（2004 年起统一口径）。
+- **跨年元旦**：holiday-cn 年文件按国务院文件标题年份命名，仅放行「上一年 12/20 之后的元旦日期」作为跨年形态；下一年日期一律拒绝。入库仍按日期自然年写入 `cn_holiday_days`，按自然年查询可命中。`holidayYearView(year)` 按标题年日期范围 `[year-1-12-20, year-12-19]` 查询（K1：不含下一年标题年写入的 12 月下旬行），把 12/30–1/1 合并为同一连休期；补班日按「最近同名段 + 10 天窗口」关联，避免同名元旦段串染。chinese-days 是单自然年数据：year 文件不含上一年 12 月行，只有 year-1 同为 chinese-days 时视图才完整（N3/N4）——year-1 未 ready 或为 holiday-cn 时视图返回 undefined（unknown），`list` 入口经 `ensureYearForView` 仅在 year-1 未 ready 时尝试补齐，year-1 为 holiday-cn 时不覆盖既有数据、由视图层报错。`nextHoliday` 在当年未 ready 但下一年标题年已 ready 且 today 处于 12/20 后时继续扫描下一年（K3），双缺仍返回 unknown。
+- **分类口径**：命中 `cn_holiday_days` 按行分类；未命中的日期默认周一至周五为工作日、周六日为休息日。
+- **schedule 集成**：`workday`/`holiday` 频率仅支持公历与 `Asia/Shanghai`。occurrence 按天扫描，候选日期经日期级覆盖判断 `isDateCoveredByHolidayData`（M1/N1：12/20–12/31 仅当 year+1 为 holiday-cn 且 ready 时视为完整覆盖；否则自然年 ready 且命中权威行才算覆盖；其余日期看自然年标题年），未覆盖立即返回 null（无数据区间不触发，也不跨越缺失区间继续猜）；`until`/`count` 在扫描中生效。`createSchedule`/`updateSchedule`/`reconcileHolidaySchedules` 在算不出 next run 时调用 `holidayAwareRuleFinished`：`until/count` 真正耗尽 → `status='completed'`（archived 除外）；仅数据缺失 → 停用但保持 `active`，新数据入库后由 `reconcileHolidaySchedules` 恢复启用（派生状态重算不推进内容版本，冲突时放弃本轮）。
+- **查询工具**：`holiday.next`（下一个/当前连休期、倒计时、调休上班日）、`holiday.list`、`holiday.is_workday`、`holiday.refresh`。`holiday.next` 只读，覆盖区间内没有后续数据时返回 unknown 提示；`list` 经 `ensureYearForView` 只确保标题年，并对 chinese-days 来源在 year-1 未 ready 时补齐上一自然年（N3/N4：year-1 为 holiday-cn 时不补齐、不覆盖，由视图 unknown/报错呈现）；`is_workday` 经 `ensureDayCoverage` 对 12/20–12/31 日期优先确保下一年标题年（K2）：仅 holiday-cn 的 year+1 视为权威覆盖（N2），自然年兜底必须命中目标日期的 holiday/workday 行，否则抛错而不是周历猜测（M2）。均按冷却窗口补齐（未来年份只走官方主源），仍不可用则明确报错，绝不按普通周历猜测。
+
+## 8. 数据源
 
 | 能力 | 首选 | 兜底 |
 |---|---|---|
@@ -150,9 +163,10 @@ secret 只来自环境变量或权限受限的配置文件，不得打印到日�
 | 天气预警 | QWeather 官方预警 | Open-Meteo 阈值推断 |
 | 当前油价 | TianAPI | JUHE；均不可用时返回说明 |
 | 调价窗口 | 本地年度窗口表 | 无 |
+| 节假日安排 | holiday-cn（jsDelivr + raw 镜像） | chinese-days（npm/jsDelivr） |
 
 外部 HTTP 逻辑收敛在模块 `provider.ts` 和 `core/http.ts`。快递模块已封存且未注册到运行时。
 
-## 8. 演进原则
+## 9. 演进原则
 
 迁移保持 additive，并保留旧数据读取兼容。新增模块不得直绑消息平台；新增私有数据必须带 Profile 所有权；新增公共 job 必须接受按配置 Profile 独立 materialize 的语义。动态 automation 是未来扩展层，不得在实现前写成当前功能。

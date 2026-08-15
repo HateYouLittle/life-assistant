@@ -1,10 +1,11 @@
 ---
 name: life-assistant
-description: "Use for weather, oil prices, Profile-private schedules and reminders, pending notification recovery, or switching the Hermes notification platform."
-summary: "天气、油价、确定性生活简报与 Profile 私有日程；主动通知统一经 Hermes Webhook。"
+description: "Use for weather, oil prices, mainland China statutory holidays and workdays, Profile-private schedules and reminders, pending notification recovery, or switching the Hermes notification platform."
+summary: "天气、油价、确定性生活简报、中国大陆节假日/工作日与 Profile 私有日程；主动通知统一经 Hermes Webhook。"
 read_when:
   - 用户询问天气、气温、穿衣、降水或气象预警
   - 用户询问油价、加油、调价、涨价或降价
+  - 用户询问放假、节假日、调休、补班、工作日或放假倒计时
   - 用户提到待办、提醒、日程、生日、纪念日或农历日期
   - 用户要求切换 QQ、微信、飞书等主动通知平台
   - 会话开始，需要恢复未成功主动投递的通知
@@ -40,11 +41,21 @@ Hermes 将 MCP 工具注册为 `mcp_life_assistant_<tool>`，点号转换为下�
 
 天气、油价、预警和生活简报是公共事件，会按已配置的 Profile route 各生成一份隔离投递。位置与 Provider 数据共享，但每个 Profile 独立接收和标记通知。
 
+## 节假日与工作日
+
+中国大陆法定节假日数据是共享数据，由 scheduler 自动获取，不要向用户索取或自行编造安排。
+
+- 距离下次放假还有多久 → `holiday.next`；返回 ongoing 时说明正在假期中并给出剩余天数，返回 unknown 时说明安排尚未获取、会稍后自动更新。
+- 某年完整安排 → `holiday.list(year)`；判断某天是否上班 → `holiday.is_workday(date?)`。
+- 法定工作日 = 周一至周五 − 法定节假日 + 调休上班的周末；法定节假日休假日不含普通周末。回答时把调休上班日一并说明。
+- 数据缺失且工具报错时，如实告知「官方安排尚未获取，scheduler 会在发布窗口自动更新」；必要时用 `holiday.refresh` 补抓，不要用周一至周五的普通周历去猜节假日。
+
 ## 日程
 
 - 创建、查询、修改、完成和删除使用 `schedule.*`；不要传 `profileId`。
 - 普通待办默认公历。生日或纪念日若使用农历，传 `calendar: "lunar"`、`lunarMonth`、`lunarDay`。
 - 创建前确认用户说的是公历还是农历。`leapMonthPolicy: "leap"` 的事件仅在对应闰月年份触发。
+- 中国大陆法定工作日重复提醒用 `recurrence: "workday"`（如「每个法定工作日 09:00」）；仅放假日的提醒用 `recurrence: "holiday"`。两者只支持公历和 `Asia/Shanghai` 时区，不支持 interval/byWeekday/byMonthDay。
 - 日程和日程通知只属于当前 Profile。不得因为天气/油价公共 fan-out 而扩大日程作用域。
 
 ## 定时任务边界

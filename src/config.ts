@@ -102,5 +102,6 @@ export const config = {
     dailyWeatherBrief: nonBlankOrDefault(process.env.DAILY_WEATHER_BRIEF_CRON, "0 7 * * *"),
     oilWatch: "0 9 * * *",
     expressPoll: "0 * * * *",
+    holidayRefresh: nonBlankOrDefault(process.env.HOLIDAY_REFRESH_CRON, "0 2 * * *"),
   },
 };
