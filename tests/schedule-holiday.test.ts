@@ -13,6 +13,7 @@ delete process.env.PROFILE_PUSH_ROUTES_JSON;
 const { getDatabase, resetDatabaseForTests } = await import("../src/core/database.js");
 const { requireProfileContext } = await import("../src/core/profile.js");
 const {
+  completeSchedule,
   createSchedule,
   findOccurrence,
   getSchedule,
@@ -115,6 +116,55 @@ test("workday/holiday recurrence rejects unsupported calendar/timezone/rule opti
     () => createWorkday({ recurrence: { frequency: "workday", byWeekday: ["MO"] } }),
     /does not support byWeekday\/byMonthDay/,
   );
+});
+
+test("S3: workday and ordinary RRule reject until dates that are not real calendar days", () => {
+  const year = FIXED_TEST_YEAR;
+  assert.throws(
+    () => createSchedule(profile, {
+      title: "bad workday until",
+      calendar: "solar",
+      date: `${year}-01-05`,
+      time: "09:00",
+      timezone: "Asia/Shanghai",
+      recurrence: { frequency: "workday", until: "2026-02-30" },
+    }),
+    /until must be a valid calendar date/,
+  );
+  assert.throws(
+    () => createSchedule(profile, {
+      title: "bad daily until",
+      calendar: "solar",
+      date: `${year}-01-05`,
+      time: "09:00",
+      timezone: "Asia/Shanghai",
+      recurrence: { frequency: "daily", until: "2026-02-30" },
+    }),
+    /until must be a valid calendar date/,
+  );
+
+  const item = createSchedule(profile, {
+    title: "workday until update",
+    calendar: "solar",
+    date: `${year}-01-05`,
+    time: "09:00",
+    timezone: "Asia/Shanghai",
+    recurrence: "workday",
+  });
+  assert.throws(
+    () => updateSchedule(profile, item.id, {
+      recurrence: { frequency: "workday", until: "2026-02-30" },
+    }),
+    /until must be a valid calendar date/,
+  );
+  assert.equal(getSchedule(profile, item.id).recurrence.until, undefined);
+  assert.equal(
+    (db.prepare(
+      "SELECT COUNT(*) AS count FROM schedules WHERE profile_id = ? AND title IN (?, ?)",
+    ).get(profile.id, "bad workday until", "bad daily until") as { count: number }).count,
+    0,
+  );
+  db.prepare("DELETE FROM schedules WHERE profile_id = ? AND id = ?").run(profile.id, item.id);
 });
 
 test("workday recurrence skips statutory holidays and weekends", () => {
@@ -492,6 +542,59 @@ test("T4: archived exhausted workday schedules stay archived instead of becoming
   const row = db.prepare("SELECT status, enabled FROM schedules WHERE profile_id = ? AND id = ?")
     .get(profile.id, item.id) as Record<string, unknown>;
   assert.deepEqual({ ...row }, { status: "archived", enabled: 0 });
+});
+
+test("S6: completeSchedule advances a workday schedule past the completed occurrence immediately", () => {
+  const year = FIXED_TEST_YEAR;
+  ingestYear(year);
+  const item = createSchedule(profile, {
+    title: "complete advances workday",
+    calendar: "solar",
+    date: `${year}-01-05`,
+    time: "09:00",
+    timezone: "Asia/Shanghai",
+    recurrence: "workday",
+  });
+  assert.ok(item.nextRunAt);
+  const before = item.nextRunAt!;
+  const completed = completeSchedule(profile, item.id);
+  assert.equal(completed.status, "active");
+  assert.ok(completed.nextRunAt);
+  assert.notEqual(completed.nextRunAt, before);
+  assert.equal(completed.nextRunAt, "2026-08-18T01:00:00.000Z");
+  const fresh = getSchedule(profile, item.id);
+  assert.equal(fresh.nextRunAt, completed.nextRunAt);
+  assert.equal(fresh.enabled, true);
+  db.prepare("DELETE FROM schedules WHERE profile_id = ? AND id = ?").run(profile.id, item.id);
+});
+
+test("S6: reconcileHolidaySchedules skips a completed future occurrence when recalculating", () => {
+  const year = FIXED_TEST_YEAR;
+  ingestYear(year);
+  const item = createSchedule(profile, {
+    title: "reconcile skips completed workday",
+    calendar: "solar",
+    date: `${year}-01-05`,
+    time: "09:00",
+    timezone: "Asia/Shanghai",
+    recurrence: "workday",
+  });
+  const first = item.nextRunAt!;
+  assert.equal(first, "2026-08-17T01:00:00.000Z");
+  db.prepare(
+    "INSERT OR REPLACE INTO schedule_occurrences(profile_id, schedule_id, occurrence_key, occurrence_at, status) VALUES(?, ?, ?, ?, 'completed')",
+  ).run(profile.id, item.id, first, first);
+  db.prepare(
+    "UPDATE schedules SET next_run_at = ?, enabled = 1 WHERE profile_id = ? AND id = ?",
+  ).run(first, profile.id, item.id);
+
+  reconcileHolidaySchedules(new Date());
+
+  const fresh = getSchedule(profile, item.id);
+  assert.notEqual(fresh.nextRunAt, first);
+  assert.equal(fresh.nextRunAt, "2026-08-18T01:00:00.000Z");
+  assert.equal(fresh.enabled, true);
+  db.prepare("DELETE FROM schedules WHERE profile_id = ? AND id = ?").run(profile.id, item.id);
 });
 
 // ---------------------------------------------------------------------------

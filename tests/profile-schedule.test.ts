@@ -841,7 +841,8 @@ test("QQ webhook delivery uses HMAC V2 and marks the outbox sent", async () => {
   assert.deepEqual(summary, { attempted: 1, sent: 1, failed: 0 });
   assert.equal(requests.length, 1);
   assert.equal(requests[0].url, "http://127.0.0.1:8645/webhooks/life-assistant-reminder");
-  assert.equal(requests[0].init.redirect, "error");
+  // 与 src/core/notifier.ts 当前实现一致：重定向按 manual 处理（N8：3xx 视为已确认失败）。
+  assert.equal(requests[0].init.redirect, "manual");
   assert.ok(requests[0].init.signal instanceof AbortSignal);
 
   const headers = new Headers(requests[0].init.headers);
@@ -1924,8 +1925,10 @@ test("hydration tolerates malformed recurrence_json and reminders_json without t
     assert.deepEqual(getSchedule(a, "hydrate-null-reminders").reminders, [
       { id: "reminder-1", minutesBefore: 0, target: "occurrence" },
     ]);
-    // reminders_json='[]'：合法空数组，保持空提醒集合。
-    assert.deepEqual(getSchedule(a, "hydrate-empty-reminders").reminders, []);
+    // S4：合法空数组也回退默认提醒；空提醒集合会让日程永不触发，读取侧不再保留。
+    assert.deepEqual(getSchedule(a, "hydrate-empty-reminders").reminders, [
+      { id: "reminder-1", minutesBefore: 0, target: "occurrence" },
+    ]);
     // frequency 非法/interval 非法 → 整体回退；reminder 非对象项被过滤、非法字段归零。
     const badShape = getSchedule(a, "hydrate-bad-shape");
     assert.deepEqual(badShape.recurrence, { frequency: "once", interval: 1, calendar: "solar" });
@@ -2336,6 +2339,143 @@ test("updateSchedule reads the current row and raw version from a single snapsho
     }
   } finally {
     db.prepare("DELETE FROM schedules WHERE profile_id = ? AND id = ?").run(a.id, item.id);
+  }
+});
+
+test("S1: deleteSchedule cancels pending schedule reminders and deletes unread notification rows", async () => {
+  const a = requireProfileContext("profile-a");
+  const item = createSchedule(a, {
+    title: "delete cancels pending reminder",
+    calendar: "solar",
+    date: "2099-12-01",
+    time: "09:00",
+    timezone: "Asia/Shanghai",
+  });
+  const occurrenceAt = "2099-12-01T01:00:00.000Z";
+  const dedupeKey = `schedule:${a.id}:${item.id}:${occurrenceAt}:reminder-1`;
+  await publishProfile(a.id, "schedule", "delete me", "body", dedupeKey);
+
+  const pending = db.prepare(`
+    SELECT d.status
+    FROM profile_notification_deliveries d
+    JOIN profile_notifications n ON n.id = d.notification_id AND n.profile_id = d.profile_id
+    WHERE n.dedupe_key = ?
+  `).get(dedupeKey) as Record<string, unknown>;
+  assert.equal(pending.status, "pending");
+
+  deleteSchedule(a, item.id);
+
+  assert.equal(
+    (db.prepare("SELECT COUNT(*) AS count FROM schedules WHERE profile_id = ? AND id = ?").get(a.id, item.id) as { count: number }).count,
+    0,
+  );
+  assert.equal(
+    (db.prepare("SELECT COUNT(*) AS count FROM profile_notifications WHERE profile_id = ? AND dedupe_key = ?").get(a.id, dedupeKey) as { count: number }).count,
+    0,
+  );
+  assert.equal(
+    (db.prepare(`
+      SELECT COUNT(*) AS count
+      FROM profile_notification_deliveries d
+      JOIN profile_notifications n ON n.id = d.notification_id AND n.profile_id = d.profile_id
+      WHERE n.dedupe_key = ?
+    `).get(dedupeKey) as { count: number }).count,
+    0,
+  );
+});
+
+test("S1: deleteSchedule keeps read schedule notifications but cancels their pending deliveries", async () => {
+  const a = requireProfileContext("profile-a");
+  const item = createSchedule(a, {
+    title: "delete keeps read reminder",
+    calendar: "solar",
+    date: "2099-12-02",
+    time: "09:00",
+    timezone: "Asia/Shanghai",
+  });
+  const occurrenceAt = "2099-12-02T01:00:00.000Z";
+  const dedupeKey = `schedule:${a.id}:${item.id}:${occurrenceAt}:reminder-1`;
+  await publishProfile(a.id, "schedule", "read me", "body", dedupeKey);
+  const notification = db.prepare(
+    "SELECT id FROM profile_notifications WHERE profile_id = ? AND dedupe_key = ?",
+  ).get(a.id, dedupeKey) as { id: number };
+  db.prepare(
+    "INSERT INTO profile_notification_reads(profile_id, notification_id, read_at) VALUES(?, ?, ?)",
+  ).run(a.id, notification.id, "2099-12-03T00:00:00.000Z");
+
+  deleteSchedule(a, item.id);
+
+  assert.equal(
+    (db.prepare("SELECT COUNT(*) AS count FROM schedules WHERE profile_id = ? AND id = ?").get(a.id, item.id) as { count: number }).count,
+    0,
+  );
+  assert.equal(
+    (db.prepare("SELECT COUNT(*) AS count FROM profile_notifications WHERE profile_id = ? AND dedupe_key = ?").get(a.id, dedupeKey) as { count: number }).count,
+    1,
+  );
+  const delivery = db.prepare(
+    "SELECT status FROM profile_notification_deliveries WHERE profile_id = ? AND notification_id = ?",
+  ).get(a.id, notification.id) as { status: string };
+  assert.equal(delivery.status, "cancelled");
+});
+
+test("S2: exhausted ordinary RRule schedules are created and updated as completed instead of active zombies", () => {
+  const a = requireProfileContext("profile-a");
+  const created = createSchedule(a, {
+    title: "exhausted daily create",
+    calendar: "solar",
+    date: "2020-01-01",
+    time: "09:00",
+    timezone: "Asia/Shanghai",
+    recurrence: { frequency: "daily", until: "2020-01-10" },
+  });
+  assert.equal(created.status, "completed");
+  assert.equal(created.enabled, false);
+  assert.equal(created.nextRunAt, undefined);
+
+  const active = createSchedule(a, {
+    title: "exhausted daily update",
+    calendar: "solar",
+    date: "2099-01-01",
+    time: "09:00",
+    timezone: "Asia/Shanghai",
+    recurrence: "daily",
+  });
+  assert.equal(active.status, "active");
+  assert.equal(active.enabled, true);
+  const updated = updateSchedule(a, active.id, {
+    recurrence: { frequency: "daily", until: "2020-01-10" },
+  });
+  assert.equal(updated.status, "completed");
+  assert.equal(updated.enabled, false);
+  assert.equal(updated.nextRunAt, undefined);
+
+  const rowFor = (id: string) => db.prepare(
+    "SELECT status, enabled, next_run_at FROM schedules WHERE profile_id = ? AND id = ?",
+  ).get(a.id, id) as Record<string, unknown>;
+  assert.deepEqual({ ...rowFor(created.id) }, { status: "completed", enabled: 0, next_run_at: null });
+  assert.deepEqual({ ...rowFor(active.id) }, { status: "completed", enabled: 0, next_run_at: null });
+  db.prepare("DELETE FROM schedules WHERE profile_id = ? AND id IN (?, ?)").run(a.id, created.id, active.id);
+});
+
+test("S5: hydration repairs a row with an invalid next_run_at in the database", () => {
+  const a = requireProfileContext("profile-a");
+  const stamp = "2099-01-01T00:00:00.000Z";
+  db.prepare(`
+    INSERT INTO schedules(profile_id, id, type, title, priority, status, calendar, date, time, all_day, timezone, recurrence_json, reminders_json, enabled, next_run_at, version, created_at, updated_at)
+    VALUES(?, 'bad-next-run-repair', 'todo', 'bad next run repair', 'normal', 'active', 'solar', '2099-01-02', '09:00', 1, 'Asia/Shanghai',
+      '{"frequency":"daily","interval":1,"calendar":"solar"}',
+      '[{"minutesBefore":0,"id":"reminder-1","target":"occurrence"}]', 1, 'not-a-date', 1, ?, ?)
+  `).run(a.id, stamp, stamp);
+  try {
+    const item = getSchedule(a, "bad-next-run-repair");
+    assert.equal(item.nextRunAt, undefined);
+    const row = db.prepare(
+      "SELECT next_run_at, enabled FROM schedules WHERE profile_id = ? AND id = ?",
+    ).get(a.id, "bad-next-run-repair") as Record<string, unknown>;
+    assert.deepEqual({ ...row }, { next_run_at: null, enabled: 0 });
+  } finally {
+    db.prepare("DELETE FROM schedules WHERE profile_id = ? AND id = ?").run(a.id, "bad-next-run-repair");
   }
 });
 

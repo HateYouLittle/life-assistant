@@ -104,12 +104,13 @@ function sanitizeRecurrence(raw: unknown, calendar: CalendarType): RecurrenceRul
 
 /** hydration 兜底：reminders_json 非数组时给默认提醒；数组内逐条过滤非对象项并归一化（P1-07）。 */
 function sanitizeReminders(raw: unknown): ReminderInput[] {
-  if (!Array.isArray(raw)) return [{ minutesBefore: 0, id: "reminder-1", target: "occurrence" }];
+  const fallback: ReminderInput[] = [{ minutesBefore: 0, id: "reminder-1", target: "occurrence" }];
+  if (!Array.isArray(raw)) return fallback;
   const seen = new Set<string>();
-  return raw
+  const normalized: ReminderInput[] = raw
     .filter((entry): entry is Record<string, unknown> =>
       typeof entry === "object" && entry !== null && !Array.isArray(entry))
-    .map((entry, index) => {
+    .map((entry, index): ReminderInput => {
       const rawId = typeof entry.id === "string" && entry.id ? entry.id : undefined;
       // 旧行可能含重复 id（输入路径已拒绝，此处兜底）：重复时回退为位置 id。
       // 自动生成的位置 id 同样占位去重集合（N1），避免与后续显式 id 撞车被静默折叠。
@@ -132,6 +133,8 @@ function sanitizeReminders(raw: unknown): ReminderInput[] {
         target: entry.target === "deadline" ? "deadline" : "occurrence",
       };
     });
+  // S4：合法空数组或数组内全部非法时，回退默认提醒；空提醒集合会让日程永远不触发。
+  return normalized.length > 0 ? normalized : fallback;
 }
 
 function assertDate(value: string | undefined, field: string): void {
@@ -189,6 +192,17 @@ function normalizeRecurrence(input: ScheduleInput, calendar: CalendarType, type:
   if (holidayAware && Number(raw.interval ?? 1) !== 1) throw new Error("workday/holiday recurrence does not support interval");
   if (holidayAware && (raw.byWeekday !== undefined || raw.byMonthDay !== undefined)) {
     throw new Error("workday/holiday recurrence does not support byWeekday/byMonthDay");
+  }
+  // S3：until 必须是真实日历日（如 2026-02-30 非法），所有频率统一校验，
+  // 避免非法 until 被持久化后在 RRule/localDate 路径打挂。
+  if (raw.until !== undefined) {
+    if (typeof raw.until !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(raw.until)) {
+      throw new Error("until must be a valid calendar date");
+    }
+    const until = DateTime.fromISO(raw.until, { zone: "utc" });
+    if (!until.isValid || until.toISODate() !== raw.until) {
+      throw new Error("until must be a valid calendar date");
+    }
   }
   // P2-11：count 与 until 互斥，避免 RRule 语义歧义。
   if (raw.count !== undefined && raw.until !== undefined) {
@@ -457,6 +471,33 @@ export function findOccurrence(item: ScheduleItem, from: ValidDateTime = DateTim
   return item.calendar === "lunar" ? lunarEventAt(item, from, inclusive) : solarEventAt(item, from, inclusive);
 }
 
+/** 与 scheduler 的 occurrenceCompleted 保持同一判断口径：occurrence_key 精确或前缀匹配 completed 行。 */
+function isScheduleOccurrenceCompleted(profileId: string, scheduleId: string, occurrenceAt: string): boolean {
+  return Boolean(getDatabase().prepare(`
+    SELECT 1 FROM schedule_occurrences
+    WHERE profile_id = ? AND schedule_id = ? AND status = 'completed'
+      AND (occurrence_key = ? OR occurrence_key LIKE ?)
+    LIMIT 1
+  `).get(profileId, scheduleId, occurrenceAt, `${occurrenceAt}:%`));
+}
+
+/** 从 from 开始找下一个未完成 occurrence；已完成则从其下一毫秒继续，绝不原地打转。 */
+function findIncompleteOccurrence(
+  item: ScheduleItem,
+  from: ValidDateTime,
+  inclusive: boolean,
+): ValidDateTime | null {
+  let cursor = from;
+  while (true) {
+    const occurrence = findOccurrence(item, cursor, inclusive);
+    if (!occurrence) return null;
+    const occurrenceAt = occurrence.toISO();
+    if (!occurrenceAt) return null;
+    if (!isScheduleOccurrenceCompleted(item.profileId, item.id, occurrenceAt)) return occurrence;
+    cursor = occurrence.plus({ milliseconds: 1 }) as ValidDateTime;
+  }
+}
+
 export function deadlineForOccurrence(item: ScheduleItem, occurrence: ValidDateTime): ValidDateTime | null {
   if (item.deadlineAt !== undefined) {
     const parsed = DateTime.fromISO(item.deadlineAt, { zone: item.timezone });
@@ -546,7 +587,7 @@ function initialCatchUpTriggers(item: ScheduleItem, from: ValidDateTime): ValidD
     const targetOffset = target === "deadline" && item.deadlineOffsetMinutes !== undefined
       ? item.deadlineOffsetMinutes
       : 0;
-    const occurrenceAt = findOccurrence(
+    const occurrenceAt = findIncompleteOccurrence(
       item,
       from.minus({ minutes: targetOffset }) as ValidDateTime,
       true,
@@ -574,6 +615,25 @@ function calculateInitialNextRun(
   }
   // recurring：允许窗口内补发，见 initialCatchUpTriggers。
   return initialCatchUpTriggers(item, from)[0] ?? null;
+}
+
+/** S2：创建/更新后的启用态。once 保持既有语义（事件已过也允许补发）；其余频率没有 nextRunAt 即停用。 */
+function derivedEnabled(status: ScheduleStatus, frequency: Frequency, nextRunAt: string | undefined): boolean {
+  if (status === "archived") return false;
+  if (frequency === "once") return true;
+  return nextRunAt !== undefined;
+}
+
+/** S2/T4：创建/更新后的状态。非 once 且 nextRunAt 为 undefined 时，真正耗尽 → completed；
+ * holiday/workday 只有在 holidayAwareRuleFinished 确认耗尽才置 completed，否则保持 active 等待数据。 */
+function derivedStatus(item: ScheduleItem, nextRunAt: string | undefined, now: ValidDateTime): ScheduleStatus {
+  if (item.status !== "active" || item.recurrence.frequency === "once" || nextRunAt !== undefined) {
+    return item.status;
+  }
+  if (HOLIDAY_AWARE_FREQUENCIES.includes(item.recurrence.frequency)) {
+    return holidayAwareRuleFinished(item, now) ? "completed" : item.status;
+  }
+  return "completed";
 }
 
 /** 标量列校验助手（N4/D2-A）：非法时按默认值兜底，不让单行毒化整个查询。 */
@@ -711,7 +771,12 @@ function rowToItem(
     try {
       triggerAt = fromUtc(item.nextRunAt);
     } catch {
+      // S5：非法 next_run_at 不仅内存清空，还要自愈 schedules 行，避免坏行每 tick 被重复选中。
       item.nextRunAt = undefined;
+      getDatabase().prepare(`
+        UPDATE schedules SET next_run_at = NULL, enabled = 0, updated_at = ?
+        WHERE profile_id = ? AND id = ?
+      `).run(nowIso(), item.profileId, item.id);
       return item;
     }
     try {
@@ -791,17 +856,10 @@ export function createSchedule(value: ProfileContext | string, input: ScheduleIn
   const now = DateTime.utc();
   const event = findOccurrence(base, now, true);
   base.nextRunAt = calculateInitialNextRun(base, event, now)?.toISO() ?? undefined;
-  // workday/holiday：数据缺失算不出 next run 时创建为停用，等节假日数据入库后由 reconcile 复活。
-  base.enabled = normalized.status !== "archived"
-    && (base.nextRunAt !== undefined || !HOLIDAY_AWARE_FREQUENCIES.includes(normalized.recurrence.frequency));
-  // 真正耗尽（until/count 已用完）与「无数据暂不可算」必须区分：
-  // 前者落 completed 终态，后者保持 active 等待数据；archived 等其他状态不被覆盖。
-  if (HOLIDAY_AWARE_FREQUENCIES.includes(normalized.recurrence.frequency)
-    && base.status === "active"
-    && base.nextRunAt === undefined
-    && holidayAwareRuleFinished(base, now)) {
-    base.status = "completed";
-  }
+  // S2/T4：普通 RRule 耗尽（nextRunAt 为 undefined）时落 completed 并停用，避免僵尸 active；
+  // workday/holiday 仅在真正耗尽时落 completed，数据缺失仍保持 active 等 reconcile 复活。
+  base.enabled = derivedEnabled(base.status, base.recurrence.frequency, base.nextRunAt);
+  base.status = derivedStatus(base, base.nextRunAt, now);
   base.nextOccurrenceSolar = event?.toISO() ?? undefined;
   insertSchedule(profile, base);
   return base;
@@ -882,16 +940,10 @@ export function updateSchedule(value: ProfileContext | string, id: string, chang
   const now = DateTime.utc();
   const event = findOccurrence(next, now, true);
   next.nextRunAt = calculateInitialNextRun(next, event, now)?.toISO() ?? undefined;
-  next.enabled = normalized.status !== "archived"
-    && (next.nextRunAt !== undefined || !HOLIDAY_AWARE_FREQUENCIES.includes(normalized.recurrence.frequency));
-  // T4：真正耗尽落 completed 终态；无数据暂不可算保持 active 等待 reconcile 复活；
-  // archived 等其他状态不被覆盖。
-  if (HOLIDAY_AWARE_FREQUENCIES.includes(normalized.recurrence.frequency)
-    && next.status === "active"
-    && next.nextRunAt === undefined
-    && holidayAwareRuleFinished(next, now)) {
-    next.status = "completed";
-  }
+  // S2/T4：普通 RRule 耗尽（nextRunAt 为 undefined）时落 completed 并停用，避免僵尸 active；
+  // workday/holiday 仅在真正耗尽时落 completed，数据缺失仍保持 active 等 reconcile 复活。
+  next.enabled = derivedEnabled(next.status, next.recurrence.frequency, next.nextRunAt);
+  next.status = derivedStatus(next, next.nextRunAt, now);
   next.nextOccurrenceSolar = event?.toISO() ?? undefined;
   const result = getDatabase().prepare(`
     UPDATE schedules SET type=?, title=?, note=?, priority=?, status=?, calendar=?, date=?, lunar_month=?, lunar_day=?, leap_month_policy=?, time=?, all_day=?, timezone=?, recurrence_json=?, reminders_json=?, deadline_at=?, deadline_offset_minutes=?, enabled=?, next_run_at=?, version=?, updated_at=?
@@ -907,8 +959,47 @@ export function updateSchedule(value: ProfileContext | string, id: string, chang
 
 export function deleteSchedule(value: ProfileContext | string, id: string): void {
   const profile = context(value);
-  const result = getDatabase().prepare("DELETE FROM schedules WHERE profile_id = ? AND id = ?").run(profile.id, id) as { changes: number };
-  if (!result.changes) throw new Error("schedule not found");
+  const db = getDatabase();
+  const prefix = `schedule:${profile.id}:${id}:%`;
+  const updatedAt = nowIso();
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    // S1.1：先取消该日程所有未投递的 reminder delivery（保留已 sent/sending 的历史行）。
+    db.prepare(`
+      UPDATE profile_notification_deliveries
+      SET status = 'cancelled', updated_at = ?
+      WHERE profile_id = ?
+        AND notification_id IN (
+          SELECT id FROM profile_notifications
+          WHERE profile_id = ? AND source = 'schedule' AND dedupe_key LIKE ?
+        )
+        AND status IN ('pending', 'failed', 'fallback')
+    `).run(updatedAt, profile.id, profile.id, prefix);
+    // S1.2：删除该日程未读、且没有 sent/sending delivery 的通知行；
+    // profile_notification_deliveries/reads 通过外键级联删除。
+    db.prepare(`
+      DELETE FROM profile_notifications
+      WHERE profile_id = ? AND source = 'schedule' AND dedupe_key LIKE ?
+        AND NOT EXISTS (
+          SELECT 1 FROM profile_notification_reads r
+          WHERE r.profile_id = profile_notifications.profile_id
+            AND r.notification_id = profile_notifications.id
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM profile_notification_deliveries d
+          WHERE d.profile_id = profile_notifications.profile_id
+            AND d.notification_id = profile_notifications.id
+            AND d.status IN ('sent', 'sending')
+        )
+    `).run(profile.id, prefix);
+    // S1.3：最后删除日程本身；不存在则回滚并报错。
+    const result = db.prepare("DELETE FROM schedules WHERE profile_id = ? AND id = ?").run(profile.id, id) as { changes: number };
+    if (!result.changes) throw new Error("schedule not found");
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
 }
 
 export interface HolidayScheduleReconcileResult {
@@ -966,7 +1057,15 @@ export function reconcileHolidaySchedules(at = new Date()): HolidayScheduleRecon
 
 export function completeSchedule(value: ProfileContext | string, id: string, occurrenceKey?: string): ScheduleItem {
   const profile = context(value);
-  const item = getSchedule(profile, id);
+  const db = getDatabase();
+  // 与 updateSchedule 相同：current 与乐观锁 WHERE 使用的原始 version 来自同一次快照，
+  // 避免先 getSchedule 再取 version 的 TOCTOU 窗口（S6）。
+  const rawRow = db.prepare(
+    "SELECT * FROM schedules WHERE profile_id = ? AND id = ?",
+  ).get(profile.id, id) as Record<string, unknown> | undefined;
+  if (!rawRow) throw new Error("schedule not found");
+  const item = rowToItem(rawRow);
+  const rawVersion = rawRow.version as number | null;
   let occurrenceAt = occurrenceKey?.match(/^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z)(?::.*)?$/)?.[1];
   if (!occurrenceAt && item.nextRunAt) {
     const triggerAt = fromUtc(item.nextRunAt);
@@ -976,8 +1075,33 @@ export function completeSchedule(value: ProfileContext | string, id: string, occ
       ?.occurrenceAt.toISO() ?? undefined;
   }
   occurrenceAt ??= item.nextRunAt ?? nowIso();
-  getDatabase().prepare("INSERT OR REPLACE INTO schedule_occurrences(profile_id, schedule_id, occurrence_key, occurrence_at, status) VALUES(?, ?, ?, ?, 'completed')").run(profile.id, id, occurrenceAt, occurrenceAt);
+  db.prepare("INSERT OR REPLACE INTO schedule_occurrences(profile_id, schedule_id, occurrence_key, occurrence_at, status) VALUES(?, ?, ?, ?, 'completed')").run(profile.id, id, occurrenceAt, occurrenceAt);
   if (item.recurrence.frequency === "once") return updateSchedule(profile, id, { status: "completed" });
+
+  // S6：recurring 完成当前 occurrence 后立即重算 next_run_at/enabled/status，
+  // 不再等下一个 scheduler tick；findIncompleteOccurrence 会跳过刚写入的 completed occurrence。
+  const now = DateTime.utc();
+  const nextRunAt = calculateInitialNextRun(item, null, now)?.toISO() ?? null;
+  let desiredStatus = item.status;
+  if (item.status === "active") {
+    if (HOLIDAY_AWARE_FREQUENCIES.includes(item.recurrence.frequency)) {
+      if (nextRunAt === null && holidayAwareRuleFinished(item, now)) desiredStatus = "completed";
+    } else if (nextRunAt === null) {
+      // S2：非 once、非 holiday-aware 的 recurring 没有下一触发即耗尽。
+      desiredStatus = "completed";
+    }
+  }
+  const desiredEnabled = desiredStatus === "active" && nextRunAt !== null ? 1 : 0;
+  const updatedAt = nowIso();
+  const result = db.prepare(`
+    UPDATE schedules SET next_run_at = ?, enabled = ?, status = ?, updated_at = ?
+    WHERE profile_id = ? AND id = ? AND version IS ?
+  `).run(nextRunAt, desiredEnabled, desiredStatus, updatedAt, profile.id, id, rawVersion) as { changes: number };
+  if (result.changes !== 1) throw new Error("schedule update conflict");
+  item.nextRunAt = nextRunAt ?? undefined;
+  item.enabled = desiredEnabled === 1;
+  item.status = desiredStatus;
+  item.updatedAt = updatedAt;
   return item;
 }
 
