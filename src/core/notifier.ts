@@ -225,6 +225,35 @@ export async function deliverPendingProfileNotifications(options: {
   const expiredClaimAt = new Date(at.getTime() - 55 * 60 * 1000).toISOString();
   const profileIdFilter = options.profileId ? requireProfileContext(options.profileId).id : undefined;
 
+  // 幂等窗口 fallback 必须先于 route-drift 标记执行：超过 55 分钟的
+  // transport-failed/sending 行直接进入终态 fallback，避免被 ROUTE_MISSING
+  // 抢占后在 route 恢复时以新 Request-ID 重复投递。
+  if (profileIdFilter) {
+    db.prepare(`
+      UPDATE profile_notification_deliveries
+      SET request_started_at = COALESCE(request_started_at, claimed_at, updated_at)
+      WHERE profile_id = ? AND status = 'sending' AND request_started_at IS NULL
+    `).run(profileIdFilter);
+    db.prepare(`
+      UPDATE profile_notification_deliveries
+      SET status = 'fallback', claim_token = NULL, claimed_at = NULL,
+          last_error = 'uncertain delivery exceeded webhook idempotency window', updated_at = ?
+      WHERE profile_id = ? AND status IN ('sending', 'failed') AND request_started_at <= ?
+    `).run(dueAt, profileIdFilter, expiredClaimAt);
+  } else {
+    db.prepare(`
+      UPDATE profile_notification_deliveries
+      SET request_started_at = COALESCE(request_started_at, claimed_at, updated_at)
+      WHERE status = 'sending' AND request_started_at IS NULL
+    `).run();
+    db.prepare(`
+      UPDATE profile_notification_deliveries
+      SET status = 'fallback', claim_token = NULL, claimed_at = NULL,
+          last_error = 'uncertain delivery exceeded webhook idempotency window', updated_at = ?
+      WHERE status IN ('sending', 'failed') AND request_started_at <= ?
+    `).run(dueAt, expiredClaimAt);
+  }
+
   const routeCandidates = (profileIdFilter
     ? db.prepare(`
         SELECT DISTINCT profile_id, route FROM profile_notification_deliveries
@@ -280,32 +309,6 @@ export async function deliverPendingProfileNotifications(options: {
     );
   }
 
-  if (profileIdFilter) {
-    db.prepare(`
-      UPDATE profile_notification_deliveries
-      SET request_started_at = COALESCE(request_started_at, claimed_at, updated_at)
-      WHERE profile_id = ? AND status = 'sending' AND request_started_at IS NULL
-    `).run(profileIdFilter);
-    db.prepare(`
-      UPDATE profile_notification_deliveries
-      SET status = 'fallback', claim_token = NULL, claimed_at = NULL,
-          last_error = 'uncertain delivery exceeded webhook idempotency window', updated_at = ?
-      WHERE profile_id = ? AND status IN ('sending', 'failed') AND request_started_at <= ?
-    `).run(dueAt, profileIdFilter, expiredClaimAt);
-  } else {
-    db.prepare(`
-      UPDATE profile_notification_deliveries
-      SET request_started_at = COALESCE(request_started_at, claimed_at, updated_at)
-      WHERE status = 'sending' AND request_started_at IS NULL
-    `).run();
-    db.prepare(`
-      UPDATE profile_notification_deliveries
-      SET status = 'fallback', claim_token = NULL, claimed_at = NULL,
-          last_error = 'uncertain delivery exceeded webhook idempotency window', updated_at = ?
-      WHERE status IN ('sending', 'failed') AND request_started_at <= ?
-    `).run(dueAt, expiredClaimAt);
-  }
-
   const params: unknown[] = [dueAt, staleClaimAt];
   const profileClause = profileIdFilter ? "AND d.profile_id = ?" : "";
   if (profileIdFilter) params.push(profileIdFilter);
@@ -319,19 +322,29 @@ export async function deliverPendingProfileNotifications(options: {
       (d.status IN ('pending', 'failed') AND d.next_attempt_at <= ?)
       OR (d.status = 'sending' AND d.claimed_at <= ?)
     ) ${profileClause}
+      AND NOT EXISTS (
+        SELECT 1 FROM profile_notification_reads r
+        WHERE r.profile_id = d.profile_id AND r.notification_id = d.notification_id
+      )
     ORDER BY d.next_attempt_at, d.notification_id
     LIMIT 100
   `).all(...params as any[]) as Array<Record<string, unknown>>;
   const summary: DeliverySummary = { attempted: 0, sent: 0, failed: 0 };
 
-  for (const row of rows) {
+  // 有界并发投递：最多 5 个 worker，避免逐条 10s 超时叠加成 100×10s。
+  // claim 仍通过 WHERE 原子完成；每个 worker 只处理自己取到的 row。
+  const DELIVERY_BUDGET_MS = 45_000;
+  const startedAt = Date.now();
+
+  async function processRow(row: Record<string, unknown>): Promise<DeliverySummary> {
+    const result: DeliverySummary = { attempted: 0, sent: 0, failed: 0 };
     const profileId = String(row.profile_id);
     const notificationId = Number(row.notification_id);
     const routeName = String(row.route);
     const route = Object.prototype.hasOwnProperty.call(config.profilePushRoutes, profileId)
       ? config.profilePushRoutes[profileId]
       : undefined;
-    if (!route || route.route !== routeName) continue;
+    if (!route || route.route !== routeName) return result;
     const requestAt = clock();
     const claimToken = crypto.randomUUID();
     const claimed = db.prepare(`
@@ -353,8 +366,8 @@ export async function deliverPendingProfileNotifications(options: {
       dueAt,
       staleClaimAt,
     ) as { changes: number };
-    if (claimed.changes !== 1) continue;
-    summary.attempted += 1;
+    if (claimed.changes !== 1) return result;
+    result.attempted += 1;
 
     const body = JSON.stringify({
       event_type: "life_assistant.reminder",
@@ -375,7 +388,7 @@ export async function deliverPendingProfileNotifications(options: {
     try {
       const response = await fetchImpl(route.url, {
         method: "POST",
-        redirect: "error",
+        redirect: "manual",
         signal: AbortSignal.timeout(10_000),
         headers: {
           "Content-Type": "application/json",
@@ -417,7 +430,7 @@ export async function deliverPendingProfileNotifications(options: {
         db.exec("ROLLBACK");
         throw error;
       }
-      if (completed.changes === 1) summary.sent += 1;
+      if (completed.changes === 1) result.sent += 1;
     } catch (error) {
       const attempts = Number(row.attempts) + 1;
       const transportFailures = confirmedHttpFailure ? 0 : Number(row.transport_failures) + 1;
@@ -451,9 +464,30 @@ export async function deliverPendingProfileNotifications(options: {
         routeName,
         claimToken,
       ) as { changes: number };
-      if (completed.changes === 1) summary.failed += 1;
+      if (completed.changes === 1) result.failed += 1;
     }
+    return result;
   }
+
+  let nextIndex = 0;
+  const workerCount = Math.min(5, rows.length);
+  const workers: Promise<void>[] = [];
+  for (let worker = 0; worker < workerCount; worker += 1) {
+    workers.push((async () => {
+      while (true) {
+        if (Date.now() - startedAt >= DELIVERY_BUDGET_MS) return;
+        const index = nextIndex;
+        nextIndex += 1;
+        if (index >= rows.length) return;
+        const result = await processRow(rows[index]);
+        summary.attempted += result.attempted;
+        summary.sent += result.sent;
+        summary.failed += result.failed;
+      }
+    })());
+  }
+  await Promise.all(workers);
+
   return summary;
 }
 
@@ -467,6 +501,7 @@ export function pullPending(value: ProfileContext | string): Notice[] {
   const profile = asContext(value);
   const db = getDatabase();
   const time = now();
+  const staleClaimAt = new Date(new Date(time).getTime() - 2 * 60 * 1000).toISOString();
   const activeRoute = Object.prototype.hasOwnProperty.call(config.profilePushRoutes, profile.id)
     ? config.profilePushRoutes[profile.id].route
     : undefined;
@@ -487,12 +522,12 @@ export function pullPending(value: ProfileContext | string): Notice[] {
           SELECT 1 FROM profile_notification_deliveries d
           WHERE d.notification_id = n.id AND d.profile_id = n.profile_id
             AND (
-              (? IS NOT NULL AND d.route = ? AND d.status IN ('sent', 'sending'))
-              OR (? IS NULL AND d.status = 'sending')
+              (? IS NOT NULL AND d.route = ? AND (d.status = 'sent' OR (d.status = 'sending' AND d.claimed_at > ?)))
+              OR (? IS NULL AND d.status = 'sending' AND d.claimed_at > ?)
             )
         )
       ORDER BY n.id ASC LIMIT 100
-    `).all(profile.id, profile.id, activeRoute ?? null, activeRoute ?? null, activeRoute ?? null) as Record<string, unknown>[];
+    `).all(profile.id, profile.id, activeRoute ?? null, activeRoute ?? null, staleClaimAt, activeRoute ?? null, staleClaimAt) as Record<string, unknown>[];
     const notices = [
       ...globalRows.map((row) => noticeFromRow(row, "global")),
       ...profileRows.map((row) => noticeFromRow(row, "profile")),
