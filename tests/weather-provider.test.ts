@@ -6,7 +6,7 @@ import { config } from "../src/config.js";
 import { httpJson, redactUrl } from "../src/core/http.js";
 import { WMO, fetchAlerts, fetchCurrent, fetchForecast } from "../src/modules/weather/provider.js";
 
-test("QWeather forecast maps daily precip as millimeter amount", async (t) => {
+test("QWeather forecast maps daily precip as probability percent", async (t) => {
   const originalKey = config.qweatherKey;
   const originalFetch = globalThis.fetch;
   config.qweatherKey = "test-key";
@@ -35,7 +35,7 @@ test("QWeather forecast maps daily precip as millimeter amount", async (t) => {
     tMax: 31,
     tMin: 24,
     weatherText: "中雨",
-    precipAmountMm: 12.7,
+    precipProb: 12.7,
   }]);
 });
 
@@ -64,7 +64,7 @@ test("QWeather current passes lon,lat order and maps now fields", async (t) => {
   });
 });
 
-test("QWeather forecast drops zero precip amount instead of emitting 0mm", async (t) => {
+test("QWeather forecast drops zero precip probability instead of emitting 0%", async (t) => {
   const originalKey = config.qweatherKey;
   const originalFetch = globalThis.fetch;
   config.qweatherKey = "test-key";
@@ -91,7 +91,7 @@ test("QWeather forecast drops zero precip amount instead of emitting 0mm", async
     tMax: 31,
     tMin: 24,
     weatherText: "晴",
-    precipAmountMm: undefined,
+    precipProb: undefined,
   }]);
 });
 

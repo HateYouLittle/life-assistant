@@ -265,8 +265,10 @@ export async function fetchForecast(lat: number, lon: number, days = 3, city?: s
             tMax,
             tMin,
             weatherText: d.textDay || (QW_TEXT[d.iconDay] ?? `code ${d.iconDay}`),
-            // Number("")/Number("0")/NaN 一律折叠为 undefined，避免 "预计0mm" 噪音
-            precipAmountMm: Number(d.precip) || undefined,
+            // 和风 v7 daily 的 precip 是「降水概率百分比」（0~100），不是降水量 mm；
+            // 实测多云天返回 6.9/7.6/1.4，按 mm 解释会导致任何非零概率都触发带伞建议。
+            // Number("")/Number("0")/NaN 一律折叠为 undefined，避免 "预计0%" 噪音
+            precipProb: Number(d.precip) || undefined,
           };
         });
       }

@@ -63,6 +63,21 @@ function ingestYear(year: number): void {
   ingestHolidayYear(parseDataset("holiday-cn", syntheticRaw(year)));
 }
 
+// 动态推算某一次运行后的「下一个工作日 09:00（Asia/Shanghai）」。
+// 与 service 的 workday 推进语义一致：跳过周末与已摄入的法定假日。
+// 绝不能写死绝对日期——运行日期一旦越过写死的值就会产生日期炸弹。
+function nextWorkdayAfterIso(iso: string): string {
+  const offDays = new Set(
+    (db.prepare("SELECT date FROM cn_holiday_days WHERE year = ?").all(FIXED_TEST_YEAR) as Array<{ date: string }>)
+      .map((row) => row.date),
+  );
+  let cursor = DateTime.fromISO(iso, { zone: "Asia/Shanghai" }).plus({ days: 1 });
+  while (offDays.has(cursor.toFormat("yyyy-MM-dd")) || cursor.weekday >= 6) {
+    cursor = cursor.plus({ days: 1 });
+  }
+  return cursor.startOf("day").set({ hour: 9 }).toUTC().toISO();
+}
+
 function clearYear(year: number): void {
   db.prepare("DELETE FROM cn_holiday_year_meta WHERE year = ?").run(year);
   db.prepare("DELETE FROM cn_holiday_days WHERE year = ?").run(year);
@@ -561,7 +576,8 @@ test("S6: completeSchedule advances a workday schedule past the completed occurr
   assert.equal(completed.status, "active");
   assert.ok(completed.nextRunAt);
   assert.notEqual(completed.nextRunAt, before);
-  assert.equal(completed.nextRunAt, "2026-08-18T01:00:00.000Z");
+  // 动态推算下一个工作日，而不是写死绝对日期（避免日期炸弹）
+  assert.equal(completed.nextRunAt, nextWorkdayAfterIso(before));
   const fresh = getSchedule(profile, item.id);
   assert.equal(fresh.nextRunAt, completed.nextRunAt);
   assert.equal(fresh.enabled, true);
@@ -580,7 +596,11 @@ test("S6: reconcileHolidaySchedules skips a completed future occurrence when rec
     recurrence: "workday",
   });
   const first = item.nextRunAt!;
-  assert.equal(first, "2026-08-17T01:00:00.000Z");
+  // 不写死 first 的绝对日期（日期炸弹）；只校验它确是 Asia/Shanghai 09:00 的合法工作日触发点
+  const firstLocal = DateTime.fromISO(first, { zone: "Asia/Shanghai" });
+  assert.ok(firstLocal.isValid, "nextRunAt 应为合法 ISO 时间");
+  assert.equal(firstLocal.hour, 9);
+  assert.equal(firstLocal.minute, 0);
   db.prepare(
     "INSERT OR REPLACE INTO schedule_occurrences(profile_id, schedule_id, occurrence_key, occurrence_at, status) VALUES(?, ?, ?, ?, 'completed')",
   ).run(profile.id, item.id, first, first);
@@ -592,7 +612,8 @@ test("S6: reconcileHolidaySchedules skips a completed future occurrence when rec
 
   const fresh = getSchedule(profile, item.id);
   assert.notEqual(fresh.nextRunAt, first);
-  assert.equal(fresh.nextRunAt, "2026-08-18T01:00:00.000Z");
+  // 跳过已完成的 first，推进到其后的下一个工作日（动态推算，不写死日期）
+  assert.equal(fresh.nextRunAt, nextWorkdayAfterIso(first));
   assert.equal(fresh.enabled, true);
   db.prepare("DELETE FROM schedules WHERE profile_id = ? AND id = ?").run(profile.id, item.id);
 });
