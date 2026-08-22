@@ -22,8 +22,7 @@ export const locationSetSchema = z.object({
   lon: z.number().min(-180).max(180),
 });
 
-/** 获取已确认位置；未确认返回 null */
-export function currentLocation(): Location | null {
+/** 获取已确认位置；未确认返回 null */export function currentLocation(): Location | null {
   const saved = store.get<Location>(KEY);
   if (saved) {
     // 旧 schema 允许脏数据（空 city、越界/Infinity 坐标）：读取侧校验，
@@ -50,6 +49,14 @@ export function currentLocation(): Location | null {
     }
   }
   return null;
+}
+
+/** 导入备份时写入共享位置（覆盖式，视为用户手动确认）。 */
+export function saveImportedLocation(loc: { city: string; province?: string; lat: number; lon: number }): Location {
+  const parsed = locationSetSchema.parse(loc);
+  const saved: Location = { ...parsed, source: "manual", confirmedAt: new Date().toISOString() };
+  store.set(KEY, saved);
+  return saved;
 }
 
 /** IP 自动探测（ip-api.com，免费、无 Key、45 次/分钟，仅供建议值） */

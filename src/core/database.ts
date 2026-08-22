@@ -142,6 +142,29 @@ export function migrateDatabaseSchema(db: DatabaseSync): void {
       last_attempt_at TEXT,
       last_error TEXT
     );
+    CREATE TABLE IF NOT EXISTS profile_settings (
+      profile_id TEXT PRIMARY KEY,
+      quiet_start TEXT,
+      quiet_end TEXT,
+      timezone TEXT,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS automations (
+      profile_id TEXT NOT NULL,
+      id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      action TEXT NOT NULL,
+      params_json TEXT NOT NULL DEFAULT '{}',
+      condition_json TEXT,
+      schedule_json TEXT NOT NULL,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      last_run_at TEXT,
+      last_result TEXT,
+      last_error TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (profile_id, id)
+    );
     CREATE INDEX IF NOT EXISTS idx_schedules_due ON schedules(enabled, next_run_at);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_profile_notifications_composite ON profile_notifications(profile_id, id);
     CREATE INDEX IF NOT EXISTS idx_profile_deliveries_due ON profile_notification_deliveries(status, next_attempt_at);
@@ -152,8 +175,8 @@ export function migrateDatabaseSchema(db: DatabaseSync): void {
     const versionRow = db.prepare("SELECT value FROM schema_meta WHERE key = 'version'").get() as { value?: string } | undefined;
     if (versionRow?.value !== undefined) {
       const existingVersion = Number(versionRow.value);
-      if (Number.isFinite(existingVersion) && existingVersion > 4) {
-        throw new Error(`database schema version ${versionRow.value} is newer than supported version 4`);
+      if (Number.isFinite(existingVersion) && existingVersion > 5) {
+        throw new Error(`database schema version ${versionRow.value} is newer than supported version 5`);
       }
     }
 
@@ -169,8 +192,10 @@ export function migrateDatabaseSchema(db: DatabaseSync): void {
     ensureColumn(db, "profile_notification_deliveries", "transport_failures", "INTEGER NOT NULL DEFAULT 0");
     ensureColumn(db, "profile_notification_deliveries", "claim_token", "TEXT");
     ensureColumn(db, "profile_notification_deliveries", "claimed_at", "TEXT");
+    // v5：snooze/延迟投递生效点；NULL 表示不延迟。
+    ensureColumn(db, "profile_notification_deliveries", "not_before", "TEXT");
 
-    db.prepare("INSERT OR REPLACE INTO schema_meta(key, value) VALUES('version', '4')").run();
+    db.prepare("INSERT OR REPLACE INTO schema_meta(key, value) VALUES('version', '5')").run();
     db.exec("COMMIT");
   } catch (error) {
     db.exec("ROLLBACK");

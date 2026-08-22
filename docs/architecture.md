@@ -41,6 +41,8 @@ src/scheduler.ts -> module cron + schedule scan + outbox delivery
 | 中国大陆节假日/工作日历法 | 共享 | scheduler 自动抓取并按数据集日期范围入库；MCP 查询工具不跑 cron，但 `holiday.list`/`holiday.is_workday`/`holiday.refresh` 在缺数据时会按冷却窗口补抓 |
 | 天气预警、油价预通知、每日生活简报 | 公共事件 | 为每个已配置 route 的 Profile 独立 materialize、去重和投递 |
 | 日程、occurrence、日程通知 | Profile 私有 | 所有读写均带 `profile_id`，不会跨 Profile 查询或投递 |
+| 自动任务 automation | Profile 私有 | `automations` 表按 `(profile_id, id)` 主键隔离；扫描覆盖全部 Profile，执行与通知严格按所属 Profile |
+| 静默时段（profile_settings） | Profile 私有 | 每 Profile 独立窗口；只影响主动投递，不影响 `notify.pull` |
 | notification read、outbox delivery | Profile 私有 | 每个 Profile 独立确认、取消和 fallback |
 
 MCP 日程工具不接受调用者提供的 `profileId`。进程边界中的 `HERMES_PROFILE` 必须满足格式要求，缺失或非法时服务拒绝启动，不能静默回退到 `default`。
@@ -75,8 +77,8 @@ interface JobDef {
 定时需求分为三个层级：
 
 1. `schedule` reminder：静态或重复个人提醒，存储于 SQLite，严格属于创建它的 Profile。recurrence 除 RRule 频率外还支持 `workday`（中国大陆法定工作日）与 `holiday`（仅法定节假日休假日），两者基于共享节假日数据计算，见「中国大陆节假日历法」。
-2. code-defined module job：需要运行时天气、油价或其他实时数据的固定任务，由 scheduler 执行并通过标准通知接口发布。
-3. planned automation：通用自然语言动态信息推送。当前尚未实现；规划设计为 SQLite 配置、白名单 action、scheduler 无 LLM 执行。
+2. automation：用户可配置的动态任务，存储于 `automations` 表（Profile 私有）。白名单 action（`src/modules/automation/actions.ts`，全部复用模块 Provider）+ 条件 DSL（`{field, op, value}`，dot-path 取值，数值/字符串比较，字段缺失视为不满足）+ 调度（daily 带时区 / interval ≥5 分钟）。scheduler 按 `AUTOMATION_SCAN_CRON`（默认每 10 分钟）扫描到期任务并确定性执行，不调用 LLM。通知走 Profile 私有发布通道，dedupe key 含任务本地日期，同一任务每个本地日期最多主动提醒一次；到期即记 `last_run_at`（含失败），避免失败任务每个扫描周期重试；`automation.run` 手动执行不推进 `last_run_at`。
+3. code-defined module job：白名单之外的实时数据固定任务，由 scheduler 执行并通过标准通知接口发布。
 
 循环日程在提醒窗口内创建或更新时，只要目标时刻（occurrence 或 deadline）仍在未来，错过窗口的触发时刻会立即在下一次扫描补发（与一次性日程的补发语义一致）。
 
@@ -104,6 +106,13 @@ Profile notification 与对应 delivery 在同一个 SQLite 事务中创建。SQ
 Webhook 成功后，delivery 标记为 `sent`，并在同一事务中写入 `profile_notification_reads`，因此后续 `notify.pull` 不会重复返回。若用户先通过 `notify.pull` 读取通知，系统写入 read 并取消仍处于 `pending`、`failed` 或 `fallback` 的未发送 delivery，避免稍后重复推送。
 
 route 缺失或变化时，旧的未完成 delivery 会转为 `fallback`；同名 route 恢复后，因 route 配置漂移进入 `fallback` 且未被 `notify.pull` 读取的行会重新入队投递，而 transport 失败或幂等窗口超期进入 `fallback` 的行保持终态，避免重复投递。已 sent/read 的通知不会因 route 漂移重新入队。旧直连通知环境变量和 stdout fan-out 均不在当前投递路径中。
+
+## 4b. 静默时段、snooze 与通知管理
+
+- **静默时段**：`profile_settings` 表按 Profile 存储 `quiet_start/quiet_end/timezone`（`notify.quiet_hours` 工具读写）。投递循环每轮计算处于静默窗口的 Profile 集合（支持跨午夜窗口，如 22:00–07:00），这些 Profile 本轮完全不尝试主动投递；已排队 delivery 保持 pending，窗口结束后下一 tick 自动补投。`notify.pull` 是用户主动拉取，不受静默时段限制。
+- **snooze（notify.snooze）**：`profile_notification_deliveries.not_before` 列（v5 迁移新增）为推迟投递的生效点；claim 条件同时要求 `next_attempt_at` 与 `not_before` 均到期。snooze 只作用于 pending/failed/fallback 行；对 `request_started_at` 落在 55 分钟幂等窗口内的不确定失败拒绝 snooze，避免以新 Request-ID 重复投递。snooze 重置 attempts/transport_failures 但保持 request_generation（不确定路径复用同一 X-Request-ID）。
+- **cancel（notify.cancel）**：把 pending/failed/fallback 行置为终态 `cancelled` 并写入 read，防止 route 漂移恢复重新入队，也让 `notify.pull` 不再复述。
+- **list（notify.list）**：只读列出最近 Profile 通知及各 route 投递状态，用于排查与挑选 snooze/cancel 目标。
 
 ## 5. 确定性每日生活简报
 
@@ -161,6 +170,8 @@ secret 只来自环境变量或权限受限的配置文件，不得打印到日�
 |---|---|---|
 | 实时天气/预报 | QWeather（配置 Key 时） | Open-Meteo |
 | 天气预警 | QWeather 官方预警 | Open-Meteo 阈值推断 |
+| 生活指数 | QWeather indices/1d（type=0，需 Key） | Open-Meteo 紫外线指数 + 确定性等级映射（degraded 标注） |
+| 空气质量 | QWeather air/now（国标 AQI，需 Key） | Open-Meteo air-quality（美标 AQI；两种量表不可直接比较，返回 scale 标注） |
 | 当前油价 | TianAPI | JUHE；均不可用时返回说明 |
 | 调价窗口 | 本地年度窗口表 | 无 |
 | 节假日安排 | holiday-cn（jsDelivr + raw 镜像） | chinese-days（npm/jsDelivr） |
@@ -169,4 +180,4 @@ secret 只来自环境变量或权限受限的配置文件，不得打印到日�
 
 ## 9. 演进原则
 
-迁移保持 additive，并保留旧数据读取兼容。新增模块不得直绑消息平台；新增私有数据必须带 Profile 所有权；新增公共 job 必须接受按配置 Profile 独立 materialize 的语义。动态 automation 是未来扩展层，不得在实现前写成当前功能。
+迁移保持 additive，并保留旧数据读取兼容（当前 schema version 5：新增 `profile_settings`、`automations` 表与 deliveries 的 `not_before` 列）。新增模块不得直绑消息平台；新增私有数据必须带 Profile 所有权；新增公共 job 必须接受按配置 Profile 独立 materialize 的语义。automation 的 action 白名单是唯一扩展动态任务能力的入口，新增 action 必须复用模块 Provider 并保持无 LLM、确定性执行。

@@ -128,11 +128,20 @@ test("schema v3 additively upgrades legacy schedules without touching protected 
 
   assert.equal(
     (legacy.prepare("SELECT value FROM schema_meta WHERE key = 'version'").get() as { value: string }).value,
-    "4",
+    "5",
   );
   assert.ok(columnNames(legacy, "schedules").includes("deadline_at"));
   assert.ok(columnNames(legacy, "schedules").includes("deadline_offset_minutes"));
-  for (const table of protectedTables) assert.deepEqual(columnNames(legacy, table), protectedColumns[table]);
+  // v5 对 deliveries 的 additive 新列：只允许在表尾追加，不得改动既有列。
+  const additiveColumns: Record<string, string[]> = {
+    profile_notification_deliveries: ["not_before"],
+  };
+  for (const table of protectedTables) {
+    assert.deepEqual(
+      columnNames(legacy, table),
+      [...protectedColumns[table], ...(additiveColumns[table] ?? [])],
+    );
+  }
   assert.deepEqual(legacy.prepare("PRAGMA foreign_key_check").all(), []);
   assert.equal((legacy.prepare("SELECT COUNT(*) AS count FROM profiles").get() as { count: number }).count, 1);
   assert.equal((legacy.prepare("SELECT COUNT(*) AS count FROM schedule_occurrences").get() as { count: number }).count, 1);
