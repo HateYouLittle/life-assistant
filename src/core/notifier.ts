@@ -592,6 +592,10 @@ export function cancelProfileNotificationDelivery(
   }
   const profile = asContext(value);
   const db = getDatabase();
+  const exists = db.prepare(
+    "SELECT 1 FROM profile_notifications WHERE profile_id = ? AND id = ?",
+  ).get(profile.id, notificationId);
+  if (!exists) throw new Error(`通知 ${notificationId} 不存在或不属于当前 Profile`);
   const time = now();
   db.exec("BEGIN IMMEDIATE");
   try {

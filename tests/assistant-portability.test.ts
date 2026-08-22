@@ -160,4 +160,42 @@ test("invalid entries are counted and malformed payloads are rejected", () => {
   assert.equal(summary.automations.invalid, 1);
 
   assert.throws(() => importAssistantExport(profile, { format: "something.else", version: 1, data: {} }));
+  // 未来快照版本必须显式拒绝，不能被当成 v1 静默导入。
+  assert.throws(
+    () => importAssistantExport(profile, { format: "life-assistant.export", version: 2, data: {} }),
+    /不支持的快照版本 2/,
+  );
+  assert.throws(() => importAssistantExport(profile, "not-an-object"), /不是有效的快照对象/);
+});
+
+test("export marks truncation when the row limit is reached", () => {
+  const seed = createSchedule(profile, {
+    title: "截断种子",
+    calendar: "solar",
+    date: "2099-09-01",
+    time: "09:00",
+    timezone: "Asia/Shanghai",
+  });
+  const row = db.prepare("SELECT * FROM schedules WHERE profile_id = ? AND id = ?").get(profile.id, seed.id) as Record<string, unknown>;
+  const columns = Object.keys(row);
+  const insert = db.prepare(
+    `INSERT INTO schedules(${columns.join(",")}) VALUES(${columns.map(() => "?").join(",")})`,
+  );
+  const bulkCount = 1000; // 种子 + 1000 条 bulk，确保触达上限
+  const tx = db.prepare("BEGIN");
+  tx.run();
+  for (let index = 0; index < bulkCount; index += 1) {
+    insert.run(...columns.map((column) => (column === "id" ? `bulk-${index}` : row[column])) as never);
+  }
+  db.prepare("COMMIT").run();
+  try {
+    const snapshot = buildAssistantExport(profile);
+    assert.equal(snapshot.data.schedules.length, 1000);
+    assert.equal(snapshot.data.truncated, true);
+  } finally {
+    db.prepare("DELETE FROM schedules WHERE profile_id = ? AND id LIKE 'bulk-%'").run(profile.id);
+    db.prepare("DELETE FROM schedules WHERE profile_id = ? AND id = ?").run(profile.id, seed.id);
+  }
+  // 清理后回到未截断状态。
+  assert.equal(buildAssistantExport(profile).data.truncated, false);
 });

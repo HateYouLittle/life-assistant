@@ -206,6 +206,13 @@ test("cancel stops pending delivery and keeps the notification out of notify.pul
   assert.equal(repeat.cancelled, 0);
 });
 
+test("cancel rejects a notification that does not exist or belongs to another profile", () => {
+  assert.throws(
+    () => cancelProfileNotificationDelivery("profile-a", 999_999),
+    /不存在或不属于当前 Profile/,
+  );
+});
+
 test("listProfileNotifications returns recent entries with delivery status", async () => {
   await publishProfile("profile-a", "schedule", "列表通知A", "正文A", "mgmt:list:a");
   await publishProfile("profile-a", "schedule", "列表通知B", "正文B", "mgmt:list:b");

@@ -290,7 +290,7 @@ systemctl status --no-pager life-assistant-scheduler.service
 
 ## 备份与迁移
 
-`assistant.export` 导出当前 Profile 的 JSON 快照（日程全量含完成/归档状态、自动任务、静默时段和共享位置），`assistant.import` 按 ID 幂等导入：已存在的条目跳过不覆盖，非法条目跳过并计数；共享位置仅在 `applyLocation: true` 时覆盖（位置是全 Profile 共享数据）。快照不含通知历史与 Webhook secret。
+`assistant.export` 导出当前 Profile 的 JSON 快照（日程全量含完成/归档状态、自动任务、静默时段和共享位置），`assistant.import` 按 ID 幂等导入：已存在的条目跳过不覆盖，非法条目跳过并计数；共享位置仅在 `applyLocation: true` 时覆盖（位置是全 Profile 共享数据）。快照不含通知历史与 Webhook secret；仅接受当前支持的快照版本，未来版本会显式拒绝；单类条目超过 1000 条时快照带 `truncated: true`（不完整，需分批处理）。
 
 ## 平台切换
 

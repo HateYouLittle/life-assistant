@@ -16,6 +16,8 @@ import { automationScheduleSchema } from "../automation/service.js";
 
 export const EXPORT_FORMAT = "life-assistant.export";
 export const EXPORT_VERSION = 1;
+/** 单类条目导出上限；超出时快照带 truncated 标记，导入方应提示用户分批处理。 */
+export const EXPORT_ROW_LIMIT = 1000;
 
 /** 可移植日程条目：ScheduleItem 去掉运行时派生字段（profileId/version/enabled/nextRunAt 等）。 */
 export interface PortableSchedule {
@@ -74,17 +76,19 @@ export interface AssistantExport {
     automations: Array<Omit<AutomationCreateInput, "schedule"> & { schedule: AutomationCreateInput["schedule"] }>;
     quietHours: { start: string; end: string; timezone: string } | null;
     location: { city: string; province?: string; lat: number; lon: number } | null;
+    /** 任一类条目达到导出上限时为 true：快照不完整，导入方应提示 */
+    truncated?: boolean;
   };
 }
 
 export function buildAssistantExport(profile: ProfileContext): AssistantExport {
   const db = getDatabase();
   const rows = db.prepare(
-    "SELECT * FROM schedules WHERE profile_id = ? ORDER BY created_at, id LIMIT 1000",
-  ).all(profile.id) as Array<Record<string, unknown>>;
+    "SELECT * FROM schedules WHERE profile_id = ? ORDER BY created_at, id LIMIT ?",
+  ).all(profile.id, EXPORT_ROW_LIMIT) as Array<Record<string, unknown>>;
   const automations = db.prepare(
-    "SELECT * FROM automations WHERE profile_id = ? ORDER BY created_at, id LIMIT 1000",
-  ).all(profile.id) as Array<Record<string, unknown>>;
+    "SELECT * FROM automations WHERE profile_id = ? ORDER BY created_at, id LIMIT ?",
+  ).all(profile.id, EXPORT_ROW_LIMIT) as Array<Record<string, unknown>>;
   const quiet = getQuietHours(profile.id);
   const loc = currentLocation();
   return {
@@ -107,6 +111,7 @@ export function buildAssistantExport(profile: ProfileContext): AssistantExport {
       })),
       quietHours: quiet ? { start: quiet.start, end: quiet.end, timezone: quiet.timezone } : null,
       location: loc ? { city: loc.city, province: loc.province, lat: loc.lat, lon: loc.lon } : null,
+      truncated: rows.length >= EXPORT_ROW_LIMIT || automations.length >= EXPORT_ROW_LIMIT,
     },
   };
 }
@@ -153,7 +158,7 @@ const portableAutomationSchema = z.object({
 
 const exportPayloadSchema = z.object({
   format: z.literal(EXPORT_FORMAT),
-  version: z.number(),
+  version: z.literal(EXPORT_VERSION),
   data: z.object({
     schedules: z.array(z.unknown()).optional(),
     automations: z.array(z.unknown()).optional(),
@@ -168,6 +173,7 @@ const exportPayloadSchema = z.object({
       lat: z.number().min(-90).max(90),
       lon: z.number().min(-180).max(180),
     }).nullable().optional(),
+    truncated: z.boolean().optional(),
   }),
 });
 
@@ -183,6 +189,17 @@ export function importAssistantExport(
   payload: unknown,
   options: { applyLocation?: boolean } = {},
 ): ImportSummary {
+  if (typeof payload !== "object" || payload === null) {
+    throw new Error("导入内容不是有效的快照对象");
+  }
+  const head = payload as { format?: unknown; version?: unknown };
+  if (head.format !== EXPORT_FORMAT) {
+    throw new Error(`导入内容不是 ${EXPORT_FORMAT} 快照`);
+  }
+  // 前置版本检查给出可读错误；schema 的 z.literal 再做一层防御。
+  if (head.version !== EXPORT_VERSION) {
+    throw new Error(`不支持的快照版本 ${String(head.version)}（当前支持版本 ${EXPORT_VERSION}）`);
+  }
   const parsed = exportPayloadSchema.parse(payload);
   const summary: ImportSummary = {
     schedules: { imported: 0, skipped: 0, invalid: 0 },
@@ -258,7 +275,7 @@ const assistantModule: AssistantModule = {
   tools: [
     {
       name: "export",
-      description: "导出当前 Profile 的数据快照（日程全量含状态、自动任务、静默时段和共享位置）为 JSON，用于备份或迁移。返回的 JSON 可原样传给 assistant.import。导出不包含通知历史与 Webhook secret。",
+      description: "导出当前 Profile 的数据快照（日程全量含状态、自动任务、静默时段和共享位置）为 JSON，用于备份或迁移。返回的 JSON 可原样传给 assistant.import。导出不包含通知历史与 Webhook secret。单类条目超过 1000 条时 truncated=true，快照不完整，应提示用户。",
       schema: {},
       handler: async (_args, context) => {
         try {
@@ -270,7 +287,7 @@ const assistantModule: AssistantModule = {
     },
     {
       name: "import",
-      description: "导入 assistant.export 生成的快照：日程/自动任务按 ID 幂等导入（已存在的跳过，不覆盖），静默时段直接应用；applyLocation=true 时才覆盖共享位置（多 Profile 共享位置，默认不动）。非法条目跳过并计入 invalid。",
+      description: "导入 assistant.export 生成的快照（仅支持当前导出版本）：日程/自动任务按 ID 幂等导入（已存在的跳过，不覆盖），静默时段直接应用；applyLocation=true 时才覆盖共享位置（多 Profile 共享位置，默认不动）。非法条目跳过并计入 invalid；快照带 truncated=true 时应向用户说明数据不完整。",
       schema: {
         data: z.unknown().describe("assistant.export 返回的快照对象"),
         applyLocation: z.boolean().optional().describe("是否用快照中的位置覆盖当前共享位置，默认 false"),
