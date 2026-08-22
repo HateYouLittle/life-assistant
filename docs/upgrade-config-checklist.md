@@ -33,7 +33,7 @@ npm run build
 npm test
 ```
 
-基线应为：`npm test` 370/370 全绿，`npm run build` 零错误。
+基线应为：`npm test` 406/406 全绿，`npm run build` 零错误。
 
 ## 3. 必检项
 
@@ -48,7 +48,7 @@ npm test
 | 7 | secret | 每 Profile 独立 64 位十六进制；与创建 Hermes subscription 时相同 | 签名校验失败或配置被拒绝 |
 | 8 | `renderTarget` | 缺省或 `plain` / `qq-markdown` / `feishu-markdown` / `wechat-markdown` | 非目标平台渲染 |
 | 9 | `LIFE_ASSISTANT_TIMEZONE` | 合法 IANA 时区；注意它同时是 scheduler 简报/预警时区和 schedule 默认时区 | 简报/日程时间错误 |
-| 10 | cron 配置 | `DAILY_WEATHER_BRIEF_CRON`、`HOLIDAY_REFRESH_CRON` 为合法 cron | scheduler 注册 job 时抛错 |
+| 10 | cron 配置 | `DAILY_WEATHER_BRIEF_CRON`、`HOLIDAY_REFRESH_CRON` 为合法 cron；`AUTOMATION_SCAN_CRON`（v0.3 新增，默认 `*/10 * * * *`）可按需覆盖 | scheduler 注册 job 时抛错 / automation 扫描周期不合预期 |
 | 11 | Gateway | 目标 Profile Gateway 正在运行，且 `platforms.webhook.extra.port` 已显式保存 | Webhook 连接被拒 |
 | 12 | 可选 Provider Key | `QWEATHER_KEY`、`TIANAPI_KEY`、`JUHE_KEY` 按需要配置，值不得提交 Git | 对应查询降级/失败 |
 
@@ -109,9 +109,11 @@ console.log('deliveries:', db.prepare('SELECT status, COUNT(*) c FROM profile_no
 EOF
 ```
 
-- `schema version` 应为 `4`。
-- 若旧库中有历史 `profile_notifications`/deliveries，升级会自动 additive 迁移，不应报外键错误。
-- 若数据库版本 > 4，说明是未来版本库被旧程序打开，应立即停止并用对应新版本程序处理。
+- `schema version` 应为 `5`（v0.3 起：新增 `profile_settings`、`automations` 表与 `profile_notification_deliveries.not_before` 列）。
+- 若旧库中有历史 `profile_notifications`/deliveries，升级会自动迁移，不应报外键错误。
+- 若数据库版本 > 5，说明是未来版本库被旧程序打开，应立即停止并用对应新版本程序处理。
+
+> **v0.3 起迁移语义变化**：v4→v5 迁移是单向的（旧代码打开 v5 库会直接拒绝启动）。回滚必须连库一起处理：停服务 → 还原升级前的 v4 备份 → 部署旧代码。见本仓库 `docs/v0.3-capabilities-acceptance.md` 第 5 节。
 
 ## 5. 正确的 `.env` 示例（占位符）
 
@@ -162,7 +164,7 @@ JUHE_KEY=
    systemctl --user restart hermes-gateway.service   # 或各 Profile 的 gateway 服务
    npm run start:scheduler
    ```
-   日志应出现 `holiday.refresh_calendar` 注册、scheduler started；重复启动第二个
+   日志应出现 `holiday.refresh_calendar` 注册（v0.3 起共 6 个 job，含 `automation.scan`）、scheduler started；重复启动第二个
    scheduler 应以退出码 1 早退。
 
 3. **节假日抓取**
@@ -217,7 +219,7 @@ JUHE_KEY=
 | `PROFILE_PUSH_ROUTES_JSON is set but produced no valid routes` | JSON 非法、secret 非 64 hex、URL 非 loopback、route 名/Profile 名非法 | 按第 5 节修正 |
 | `notify.pull` 没有公共天气/油价通知 | 公共事件只为配置了 route 的 Profile materialize | 确认该 Profile 在 `PROFILE_PUSH_ROUTES_JSON` 中有合法条目 |
 | delivery 一直 `failed`/`fallback` | Gateway 未运行、端口错误、route 名不匹配、secret 不一致 | 执行 4.2 逐项核对 |
-| `database schema version X is newer than supported version 4` | 新库被旧程序打开 | 停止旧进程，使用当前版本 |
+| `database schema version X is newer than supported version 5` | 新库被旧程序打开 | 停止旧进程，使用当前版本 |
 | `HERMES_PROFILE is required...` | MCP 进程未注入 Profile 身份 | 在 `hermes mcp add --env` 或 `.env` 中显式设置 |
 | workday/holiday 日程创建后 `enabled=0` | 当年节假日数据未 ready | 先执行第 6 节第 3 步，或调用 `holiday.refresh` |
 
@@ -232,16 +234,19 @@ npm install
 npm run build
 ```
 
-SQLite 使用 additive 迁移，回滚代码通常可继续读取旧数据；若已写入新表数据，旧版本
-会忽略对应表，不影响既有日程/通知。
+**v0.3 之前（schema ≤ 4）**：SQLite 使用 additive 迁移，回滚代码通常可继续读取旧数据；
+若已写入新表数据，旧版本会忽略对应表，不影响既有日程/通知。
+
+**v0.3 及以后（schema 5）**：v4→v5 迁移单向，旧代码打开 v5 库会被拒绝启动。若库已升级到
+v5，回滚必须：停服务 → 从升级前备份还原 v4 库 → 部署旧代码 → 确认 `version == 4`。
 
 ## 9. 验收签字
 
 - [ ] 4.1 route 解析输出包含全部目标 Profile
 - [ ] 4.2 Hermes subscription 与 `.env` 逐字段一致
-- [ ] 4.3 schema version=4、旧数据可读
+- [ ] 4.3 schema version=5、旧数据可读
 - [ ] 6.3 节假日 ready
 - [ ] 6.4 workday 日程 nextRunAt 正确
 - [ ] 6.5 Webhook delivery=sent、pull 不重复返回
 - [ ] 6.6 smoke 数据已清理
-- [ ] `npm test` 370/370、`npm run build` 零错误
+- [ ] `npm test` 406/406、`npm run build` 零错误
