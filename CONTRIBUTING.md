@@ -4,10 +4,10 @@ Life Assistant 的核心边界是模块产生日程或公共事件，SQLite 持�
 
 ## 高价值方向
 
-- 新生活信息模块，例如空气质量、限行或话费提醒。
-- weather / oilprice 的新 Provider，以及年度油价调价窗口校准。
+- 新生活信息模块，例如限行或话费提醒。
+- weather / oilprice / airquality 的新 Provider，以及年度油价调价窗口校准。
+- automation 白名单 action 扩展（在 `src/modules/automation/actions.ts` 注册，必须复用模块 Provider、无 LLM）与条件组合能力（多条件 AND/OR）。
 - 日程、outbox、Profile 隔离、静默时段和 snooze 的可靠性改进。
-- planned automation：SQLite 配置、白名单 action、scheduler 无 LLM 执行。该能力尚未实现，设计和 PR 不得假设已有通用 automation API。
 
 快递模块已封存，不作为当前 Provider 扩展方向。
 
@@ -55,7 +55,7 @@ git diff --check
 - 明确事件是公共还是 Profile 私有，并覆盖相应隔离测试；
 - 通过 `ctx.notify` 或明确的 Profile 发布接口进入持久 outbox。
 
-静态或重复个人提醒应优先使用现有 `schedule`，无需增加模块 job。实时数据驱动的固定任务适合 code-defined job。通用动态任务属于 planned automation，在实现前不得对外暴露虚假工具。
+静态或重复个人提醒应优先使用现有 `schedule`，无需增加模块 job。白名单数据源上的条件触发提醒应使用现有 `automation`，无需增加模块 job。白名单之外数据源的实时固定任务适合 code-defined job；把数据源加进 automation 白名单前，先确认它适合按 10 分钟级扫描的确定性执行语义。
 
 ## Commit 规范
 

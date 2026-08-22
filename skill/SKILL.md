@@ -1,12 +1,15 @@
 ---
 name: life-assistant
-description: "Use for weather, oil prices, mainland China statutory holidays and workdays, Profile-private schedules and reminders, pending notification recovery, or switching the Hermes notification platform."
-summary: "天气、油价、确定性生活简报、中国大陆节假日/工作日与 Profile 私有日程；主动通知统一经 Hermes Webhook。"
+description: "Use for weather, air quality, life indices, oil prices, mainland China statutory holidays and workdays, Profile-private schedules, dynamic automations, notification management (quiet hours, snooze, cancel), backup/migration, pending notification recovery, or switching the Hermes notification platform."
+summary: "天气、空气质量、生活指数、油价、节假日/工作日、Profile 私有日程与自动任务、静默时段等通知管理、备份迁移；主动通知统一经 Hermes Webhook。"
 read_when:
-  - 用户询问天气、气温、穿衣、降水或气象预警
+  - 用户询问天气、气温、穿衣、降水、气象预警、空气质量、AQI、雾霾或紫外线
   - 用户询问油价、加油、调价、涨价或降价
   - 用户询问放假、节假日、调休、补班、工作日或放假倒计时
   - 用户提到待办、提醒、日程、生日、纪念日或农历日期
+  - 用户想要条件触发的动态提醒（如「明天下雨早上提醒我」「空气差了叫我」）
+  - 用户要求免打扰、静默时段、稍后提醒、取消提醒或排查没收到的通知
+  - 用户要求备份、导出或迁移生活助理数据
   - 用户要求切换 QQ、微信、飞书等主动通知平台
   - 会话开始，需要恢复未成功主动投递的通知
 ---
@@ -31,9 +34,10 @@ Hermes 将 MCP 工具注册为 `mcp_life_assistant_<tool>`，点号转换为下�
 
 用户只查询其他城市时，直接给天气工具传 `city`，不要修改已保存位置，也不要要求用户提供经纬度。
 
-## 天气与油价
+## 天气、空气与油价
 
-- 当前天气用 `weather.current`，未来天气用 `weather.forecast(days)`，当前预警用 `weather.alerts`。
+- 当前天气用 `weather.current`，未来天气用 `weather.forecast(days)`，当前预警用 `weather.alerts`，穿衣/洗车/紫外线等生活指数用 `weather.indices`。
+- 空气质量用 `airquality.current`；注意返回的 `scale`（CN 国标 / US 美标），两种量表数值不可直接比较；未配置和风 Key 时为美标兜底，回答时应带量表说明。
 - 回答应包含地点、单位和有用的穿衣、降水或出行建议，不只复述字段。
 - 当前油价用 `oilprice.current`；调价时间和是否提前加油用 `oilprice.next_adjustment`。
 - 油价 Provider 优先 TianAPI，失败且配置 JUHE 时回退 JUHE。两者均未配置或不可用时，按工具返回的说明告知用户，不要假定只需要某一个 Key。
@@ -58,11 +62,33 @@ Hermes 将 MCP 工具注册为 `mcp_life_assistant_<tool>`，点号转换为下�
 - 中国大陆法定工作日重复提醒用 `recurrence: "workday"`（如「每个法定工作日 09:00」）；仅放假日的提醒用 `recurrence: "holiday"`。两者只支持公历和 `Asia/Shanghai` 时区，不支持 interval/byWeekday/byMonthDay。
 - 日程和日程通知只属于当前 Profile。不得因为天气/油价公共 fan-out 而扩大日程作用域。
 
+## 自动任务 automation
+
+用户想要条件触发的动态提醒（「明天下雨就提醒我」「AQI 超过 150 叫我」「油价破 8 通知」）时使用 `automation.*`，不要把它们建成一堆静态日程：
+
+- 用 `automation.create` 创建：`action` 限白名单（`weather.current` / `weather.forecast` / `airquality.current` / `oilprice.current`），`condition` 是 `{field, op, value}`（field 用 dot-path，如 `today.precipProb`、`aqi`、`p92`），`schedule` 是 daily（可带时区）或 interval（≥5 分钟）。
+- 无条件表示到点必提醒；条件不满足则本轮静默。同一任务每个本地日期最多主动提醒一次。
+- 创建后用 `automation.run` 立即执行一次验证配置，把结果如实反馈给用户；`automation.list` 查看运行状态与最近错误。
+- 修改用 `automation.update`（condition 传 null 清除），删除用 `automation.delete`。任务和通知只属于当前 Profile。
+- 白名单之外的数据源需求当前无法配置为 automation，如实说明即可，不要伪造任务。
+
 ## 定时任务边界
 
 - 静态或重复个人提醒：使用 `schedule.create`。
-- 需要实时天气、油价或其他动态数据的固定推送：当前必须由项目实现 code-defined `AssistantModule` job，并通过标准通知接口发布。
-- 通用自然语言 automation 当前未实现。面对这类需求，应明确说明需要新增模块 job 或等待 planned automation，禁止假装已创建可执行的动态任务。
+- 条件触发的动态提醒（基于天气/空气/油价等白名单数据源）：使用 `automation.*`。
+- 白名单之外数据源的固定推送：需要项目实现 code-defined `AssistantModule` job；当前没有通用自然语言 automation，不要假装已创建可执行的动态任务。
+
+## 通知管理（静默时段 / 稍后提醒 / 取消）
+
+- 免打扰：`notify.quiet_hours` 设置（如 22:00–07:00，支持跨午夜与自定义时区）；窗口内不主动投递，窗口结束自动补投，`notify.pull` 不受影响。无参查询，`clear: true` 清除。
+- 「这个提醒晚点再说」：`notify.snooze`（1–1440 分钟），只对未成功投递的通知有效，已 sent/已取消的会返回错误说明。
+- 「这条提醒不要了」：`notify.cancel`；已 sent 的不受影响，取消后 pull 也不再复述。
+- 排查「为什么没收到通知」：`notify.list` 查看通知与投递状态（sent/pending/failed/fallback/cancelled），再决定 snooze、cancel 还是等待补投。
+
+## 备份与迁移
+
+- `assistant.export` 导出当前 Profile 快照（日程全量、自动任务、静默时段、位置），让用户保存 JSON 文件。
+- `assistant.import` 导入：按 ID 幂等（已存在跳过），位置是共享数据，只有用户明确同意时才传 `applyLocation: true`。
 
 ## 通知平台切换
 

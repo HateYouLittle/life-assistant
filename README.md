@@ -1,16 +1,19 @@
 # Life Assistant - Hermes 个人生活助理
 
-Life Assistant 是面向 Hermes Agent 的 Skill + MCP 服务，提供天气、油价和 Profile 私有日程，并通过可靠 outbox 将主动通知交给 Hermes Gateway 投递。
+Life Assistant 是面向 Hermes Agent 的 Skill + MCP 服务，提供天气、空气质量、生活指数、油价、Profile 私有日程和自动任务，并通过可靠 outbox 将主动通知交给 Hermes Gateway 投递。
 
 | 能力 | 当前行为 |
 |---|---|
-| 天气 | 实时天气、7 日预报、气象预警、确定性每日生活简报 |
+| 天气 | 实时天气、7 日预报、气象预警、生活指数（穿衣/紫外线/洗车等）、确定性每日生活简报 |
+| 空气质量 | 实时 AQI、等级与污染物浓度；和风国标优先，Open-Meteo 美标兜底；每日简报 best-effort 并入空气行 |
 | 油价 | 当前 92#/95#/0# 油价、下一次调价窗口与提前通知 |
 | 日程 | 待办、生日、纪念日；支持公历、中国农历、重复提醒和法定节假日/工作日频率 |
 | 节假日 | 中国大陆法定节假日与调休上班日历法；scheduler 每年自动获取下一年安排；放假倒计时查询 |
-| 通知 | Profile SQLite outbox、Hermes HMAC V2 `deliver-only` Webhook、`notify.pull` 失败兜底 |
+| 自动任务 | Profile 私有 automation：白名单 action（天气/预报/空气/油价）+ 条件 DSL，scheduler 无 LLM 执行 |
+| 通知 | Profile SQLite outbox、Hermes HMAC V2 `deliver-only` Webhook、`notify.pull` 失败兜底；静默时段、snooze、取消与通知列表 |
+| 备份 | `assistant.export` / `assistant.import`：日程、自动任务、静默时段与位置的 JSON 快照，按 ID 幂等导入 |
 
-当前共注册 19 个 MCP 工具。快递追踪已经封存，未注册到运行时。
+当前共注册 32 个 MCP 工具。快递追踪已经封存，未注册到运行时。
 
 ## 架构概览
 
@@ -250,6 +253,7 @@ systemctl status --no-pager life-assistant-scheduler.service
 | `LIFE_ASSISTANT_TIMEZONE` | scheduler 简报/预警渲染时区，以及 schedule 创建/更新时未显式指定 timezone 的默认时区 |
 | `DAILY_WEATHER_BRIEF_CRON` | 每日生活简报 cron，默认 `0 7 * * *` |
 | `HOLIDAY_REFRESH_CRON` | 节假日安排每日刷新 cron（Asia/Shanghai），默认 `0 2 * * *` |
+| `AUTOMATION_SCAN_CRON` | 自动任务扫描 cron，默认 `*/10 * * * *`；单任务调度在其 schedule 中定义 |
 | `LOCATION_CITY/LAT/LON` | 可选预置共享位置；未设置时由 Agent 首次确认 |
 | `QWEATHER_KEY` | 可选，和风天气实时/预报/官方预警和 GeoAPI |
 | `QWEATHER_API_HOST` | 可选，和风天气 API host |
@@ -260,9 +264,33 @@ systemctl status --no-pager life-assistant-scheduler.service
 
 ## 07:00 确定性生活简报
 
-`weather.daily_brief` 的默认时间是配置时区每天 07:00，可分别通过 `DAILY_WEATHER_BRIEF_CRON` 和 `LIFE_ASSISTANT_TIMEZONE` 调整。内容仅由当前天气与当日预报确定性生成，不包含油价，也不调用 LLM；单个天气源失败时使用另一个结果继续，两个天气源都不可用时本轮不发送。
+`weather.daily_brief` 的默认时间是配置时区每天 07:00，可分别通过 `DAILY_WEATHER_BRIEF_CRON` 和 `LIFE_ASSISTANT_TIMEZONE` 调整。内容仅由当前天气、当日预报与空气质量（best-effort，单源失败时省略空气行）确定性生成，不包含油价，也不调用 LLM；单个天气源失败时使用另一个结果继续，两个天气源都不可用时本轮不发送。
 
 迁移旧部署时，如果 Hermes 中仍存在外部 LLM 天气 cron，应先端到端验证内置简报，再暂停或删除旧任务；验证期间两者并存会产生重复通知。
+
+## 静默时段与通知管理
+
+每个 Profile 可用 `notify.quiet_hours` 设置静默时段（如 `22:00–07:00`，支持跨午夜和自定义时区）。窗口内 scheduler 不尝试主动投递，已排队的 delivery 保持 pending，窗口结束后自动补投；`notify.pull` 是用户主动拉取，不受静默时段影响。
+
+配套管理工具：
+
+- `notify.list`：查看最近通知与各 route 投递状态（sent/pending/failed/fallback/cancelled），用于排查「为什么没收到」；
+- `notify.snooze`：把未成功投递的通知推迟 1–1440 分钟再投递；幂等窗口内的不确定失败会被拒绝，避免重复推送；
+- `notify.cancel`：取消未投递通知的后续投递，取消后 `notify.pull` 也不再复述。
+
+## 自动任务 automation
+
+`automation.*` 提供 Profile 私有、确定性执行的动态任务（原 planned automation 已落地）：
+
+- **白名单 action**：`weather.current`、`weather.forecast`（days 1–7）、`airquality.current`、`oilprice.current`，全部复用模块 Provider，不调用 LLM；
+- **条件 DSL**：`{ field, op, value }`，field 是 action 结果的 dot-path（如 `today.precipProb`、`aqi`、`p92`），支持 `> >= < <= == !=`；字段缺失视为不满足；缺省条件表示到点必提醒；
+- **调度**：`daily`（每天 HH:mm，可带 IANA 时区）或 `interval`（每 N 分钟，最小 5）；scheduler 按 `AUTOMATION_SCAN_CRON`（默认每 10 分钟）扫描到期任务；
+- **投递**：条件满足时走 Profile 私有通知通道（静默时段、outbox、`notify.pull` 兜底全部适用）；dedupe key 含任务本地日期，同一任务每个本地日期最多主动提醒一次；
+- **工具**：`automation.create / list / update / delete / run`；`run` 立即手动执行一次用于验证配置，不影响既定调度节奏；单任务失败只记录 `last_error`，不阻断其它任务。
+
+## 备份与迁移
+
+`assistant.export` 导出当前 Profile 的 JSON 快照（日程全量含完成/归档状态、自动任务、静默时段和共享位置），`assistant.import` 按 ID 幂等导入：已存在的条目跳过不覆盖，非法条目跳过并计数；共享位置仅在 `applyLocation: true` 时覆盖（位置是全 Profile 共享数据）。快照不含通知历史与 Webhook secret。
 
 ## 平台切换
 
@@ -321,7 +349,7 @@ hermes -p "<profile>" webhook subscribe "<route-name>" \
 
 ## 工具一览
 
-`location.get` · `location.set` · `location.detect` · `weather.current` · `weather.forecast` · `weather.alerts` · `oilprice.current` · `oilprice.next_adjustment` · `schedule.create` · `schedule.list` · `schedule.get` · `schedule.update` · `schedule.complete` · `schedule.delete` · `holiday.next` · `holiday.list` · `holiday.is_workday` · `holiday.refresh` · `notify.pull`
+`location.get` · `location.set` · `location.detect` · `weather.current` · `weather.forecast` · `weather.alerts` · `weather.indices` · `airquality.current` · `oilprice.current` · `oilprice.next_adjustment` · `schedule.create` · `schedule.list` · `schedule.get` · `schedule.update` · `schedule.complete` · `schedule.delete` · `holiday.next` · `holiday.list` · `holiday.is_workday` · `holiday.refresh` · `notify.pull` · `notify.list` · `notify.snooze` · `notify.cancel` · `notify.quiet_hours` · `automation.create` · `automation.list` · `automation.update` · `automation.delete` · `automation.run` · `assistant.export` · `assistant.import`
 
 日程工具不接受 `profileId`，而是绑定启动 MCP 时显式注入的 `HERMES_PROFILE`。农历生日或纪念日使用 `calendar: "lunar"`、`lunarMonth`、`lunarDay`；`leapMonthPolicy: "leap"` 仅在对应闰月年份触发。法定节假日/工作日频率使用 `recurrence.frequency: "workday"` 或 `"holiday"`，见上文。
 
@@ -330,20 +358,19 @@ hermes -p "<profile>" webhook subscribe "<route-name>" \
 选择与需求匹配的层级：
 
 1. 静态或重复的个人提醒：使用现有 `schedule.*`，数据和通知属于当前 Profile。
-2. 需要实时天气、油价或其他外部数据的固定任务：实现 `AssistantModule` job，在指定 timezone 下运行，并通过 `ctx.notify` 发布。公共 job 会按配置 Profile fan-out；私有事件必须显式使用 Profile 发布路径。
-3. 通用自然语言动态信息推送：当前尚未实现。规划中的 automation 将使用 SQLite 配置、白名单 action，并由 scheduler 在无需 LLM 的情况下执行。不要把它当作现有能力。
+2. 需要实时天气、油价或其他外部数据的用户可配置任务：优先使用 `automation.*`（白名单 action + 条件 DSL，无需写代码）。白名单之外的实时数据需求：实现 `AssistantModule` job，在指定 timezone 下运行，并通过 `ctx.notify` 发布。公共 job 会按配置 Profile fan-out；私有事件必须显式使用 Profile 发布路径。
+3. 新的白名单 action：在 `src/modules/automation/actions.ts` 注册（复用模块 Provider），即自动对全部 Profile 的 automation 开放。
 
 模块、job、Provider 和通知作用域的贡献要求见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
 ## 当前状态与计划
 
-已完成：SQLite 存储与旧数据迁移、Profile 私有日程、Profile notification/outbox、统一 Hermes HMAC V2 Webhook、`notify.pull` fallback、确定性生活简报、scheduler 单实例租约、中国大陆法定节假日/工作日历法（自动抓取 + workday/holiday 日程频率 + 放假倒计时查询）。
+已完成：SQLite 存储与旧数据迁移、Profile 私有日程、Profile notification/outbox、统一 Hermes HMAC V2 Webhook、`notify.pull` fallback、确定性生活简报（含空气质量行）、scheduler 单实例租约、中国大陆法定节假日/工作日历法（自动抓取 + workday/holiday 日程频率 + 放假倒计时查询）、静默时段与通知管理（list/snooze/cancel/quiet_hours）、动态自动任务 automation（白名单 action + 条件 DSL，无 LLM）、生活指数查询、Profile 数据导出/导入。
 
 计划中：
 
-- 动态信息推送 automation：SQLite 配置、白名单 action、scheduler 无 LLM 执行。
-- 静默时段、snooze 和更完整的通知管理。
 - 多位置支持与配置界面。
+- 白名单 action 扩展（如限行、电价）与更丰富的条件组合（多条件 AND/OR）。
 
 ## 归档能力
 
