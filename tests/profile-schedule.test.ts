@@ -322,6 +322,7 @@ test("the deterministic daily brief publishes once per local date through every 
   const options = {
     timezone: "Asia/Shanghai",
     getLocation: () => ({ city: "北京", lat: 39.9, lon: 116.4 }),
+    getAirQuality: async () => { throw new Error("aqi provider unavailable"); },
     getCurrent: async () => ({
       temperature: 28,
       apparent: 30,
@@ -377,6 +378,7 @@ test("the daily brief labels probability percent and precipitation amount millim
   const common = {
     timezone: "Asia/Shanghai",
     getLocation: () => ({ city: "北京", lat: 39.9, lon: 116.4 }),
+    getAirQuality: async () => { throw new Error("aqi provider unavailable"); },
     getCurrent: async () => { throw new Error("current unavailable"); },
     publish: async (_source: string, _title: string, body: string) => {
       bodies.push(body);
@@ -418,6 +420,7 @@ test("the daily brief survives a forecast provider failure", async () => {
     at: new Date("2026-08-05T00:00:00.000Z"),
     timezone: "Asia/Shanghai",
     getLocation: () => ({ city: "上海", lat: 31.2, lon: 121.5 }),
+    getAirQuality: async () => { throw new Error("aqi provider unavailable"); },
     getCurrent: async () => ({
       temperature: 30,
       apparent: 33,
@@ -1546,7 +1549,7 @@ test("schema v2 upgrades to a valid v4 delivery outbox", () => {
   migrateDatabaseSchema(legacy);
   const version = legacy.prepare("SELECT value FROM schema_meta WHERE key = 'version'").get() as { value: string };
   const columns = legacy.prepare("PRAGMA table_info(profile_notification_deliveries)").all() as Array<{ name: string }>;
-  assert.equal(version.value, "4");
+  assert.equal(version.value, "5");
   assert.equal(columns.some((column) => column.name === "claim_token"), true);
   assert.equal(columns.some((column) => column.name === "transport_failures"), true);
   assert.equal(columns.some((column) => column.name === "request_started_at"), true);
@@ -2034,6 +2037,7 @@ test("the daily brief reuses the legacy same-day key so an upgrade-day run does 
   const options = {
     timezone: "Asia/Shanghai",
     getLocation: () => ({ city: "北京", lat: 39.9, lon: 116.4 }),
+    getAirQuality: async () => { throw new Error("aqi provider unavailable"); },
     getCurrent: async () => ({
       temperature: 28,
       apparent: 30,

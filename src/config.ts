@@ -109,5 +109,6 @@ export const config = {
     oilWatch: "0 9 * * *",
     expressPoll: "0 * * * *",
     holidayRefresh: nonBlankOrDefault(process.env.HOLIDAY_REFRESH_CRON, "0 2 * * *"),
+    automationScan: nonBlankOrDefault(process.env.AUTOMATION_SCAN_CRON, "*/10 * * * *"),
   },
 };

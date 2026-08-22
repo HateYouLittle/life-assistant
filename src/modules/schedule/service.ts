@@ -827,7 +827,12 @@ export function createSchedule(value: ProfileContext | string, input: ScheduleIn
   const profile = context(value);
   const normalized = normalizeInput(input);
   const createdAt = nowIso();
-  const id = crypto.randomUUID();
+  // 导入场景允许保留导出时的 ID（幂等重放、跨机迁移）；非法/缺省时回退 UUID。
+  const importedId = typeof input.id === "string" ? input.id.trim() : "";
+  if (importedId && !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(importedId)) {
+    throw new Error(`invalid schedule id: ${importedId}`);
+  }
+  const id = importedId || crypto.randomUUID();
   const base: ScheduleItem = {
     id,
     profileId: profile.id,

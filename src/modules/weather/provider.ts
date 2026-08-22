@@ -48,6 +48,83 @@ export interface InferredWeatherRisk {
 
 export type WeatherAlert = OfficialWeatherAlert | InferredWeatherRisk;
 
+export interface LifeIndex {
+  /** 指数名，如 穿衣指数 / 紫外线指数 / 洗车指数 */
+  name: string;
+  /** 等级表述，如 较冷 / 强 */
+  category: string;
+  /** 和风返回的原始等级数字（1 起），紫外线兜底无此字段 */
+  level?: string;
+  text?: string;
+}
+
+/** 紫外线指数等级（确定性映射，Open-Meteo 兜底用） */
+export function uvIndexCategory(uvIndex: number): { category: string; text: string } {
+  if (uvIndex < 3) return { category: "弱", text: "紫外线较弱，外出可适当防护。" };
+  if (uvIndex < 5) return { category: "中等", text: "外出建议涂防晒霜、戴遮阳帽。" };
+  if (uvIndex < 7) return { category: "强", text: "注意防晒，尽量避免午间长时间暴晒。" };
+  if (uvIndex < 10) return { category: "很强", text: "紫外线很强，减少户外活动并做好防护。" };
+  return { category: "极强", text: "紫外线极强，尽量避免外出，务必做好防护。" };
+}
+
+/** 和风生活指数解析（纯函数，便于测试）；type=0 返回全部指数 */
+export function parseQweatherIndices(raw: unknown): LifeIndex[] {
+  const body = raw as {
+    code?: string | number;
+    daily?: Array<{ date?: string; type?: string; name?: string; level?: string; category?: string; text?: string }>;
+  };
+  if (body.code !== undefined && body.code !== null && String(body.code) !== "200") {
+    throw new Error(`QWeather indices error code ${body.code}`);
+  }
+  if (!Array.isArray(body.daily)) throw new Error("weather provider: QWeather indices response is missing daily");
+  return body.daily
+    .filter((entry) => typeof entry.name === "string" && entry.name.length > 0 && typeof entry.category === "string")
+    .map((entry) => ({
+      name: entry.name!,
+      category: entry.category!,
+      level: typeof entry.level === "string" && entry.level.length > 0 ? entry.level : undefined,
+      text: typeof entry.text === "string" && entry.text.length > 0 ? entry.text : undefined,
+    }));
+}
+
+/**
+ * 生活指数：优先和风 v7 indices/1d（type=0 全部指数，需 Key）；
+ * 无 Key 或失败时降级 Open-Meteo 紫外线指数（确定性等级映射），仅覆盖紫外线。
+ */
+export async function fetchIndices(city: string, lat: number, lon: number): Promise<{ indices: LifeIndex[]; source: string; degraded: boolean }> {
+  if (config.qweatherKey) {
+    try {
+      // 和风 v7 location 查询参数格式为 "经度,纬度"（lon,lat）
+      const raw = await httpJson<unknown>(
+        `https://${config.qweatherApiHost}/v7/indices/1d?type=0&location=${lon.toFixed(2)},${lat.toFixed(2)}&key=${config.qweatherKey}`,
+      );
+      const indices = parseQweatherIndices(raw);
+      if (indices.length > 0) return { indices, source: "和风天气", degraded: false };
+      throw new Error("QWeather indices returned empty daily");
+    } catch (e) {
+      console.error(`[weather] QWeather indices failed, fallback to Open-Meteo UV: ${(e as Error).message}`);
+    }
+  }
+  const r = await httpJson<{ daily?: Record<string, unknown> }>(
+    `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}` +
+      `&daily=uv_index_max&forecast_days=1&timezone=auto`,
+  );
+  const d = r.daily;
+  if (!d || typeof d !== "object") {
+    throw new Error("weather provider: Open-Meteo indices response is missing daily");
+  }
+  if (!Array.isArray(d.uv_index_max) || d.uv_index_max.length === 0) {
+    throw new Error("weather provider: Open-Meteo indices response is missing daily.uv_index_max");
+  }
+  const uv = requireFiniteNumber(d.uv_index_max[0], "daily.uv_index_max[0]");
+  const { category, text } = uvIndexCategory(uv);
+  return {
+    indices: [{ name: "紫外线指数", category, text: `今日紫外线指数最大值约 ${uv}。${text}` }],
+    source: "Open-Meteo",
+    degraded: true,
+  };
+}
+
 export const WMO: Record<number, string> = {
   0: "晴", 1: "大部晴朗", 2: "多云", 3: "阴",
   45: "雾", 48: "雾凇",

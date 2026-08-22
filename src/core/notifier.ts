@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import { config } from "../config.js";
 import { getDatabase } from "./database.js";
+import { quietProfileIds } from "./notification-settings.js";
 import { requireProfileContext, type ProfileContext } from "./profile.js";
 
 export interface Notice {
@@ -225,6 +226,20 @@ export async function deliverPendingProfileNotifications(options: {
   const expiredClaimAt = new Date(at.getTime() - 55 * 60 * 1000).toISOString();
   const profileIdFilter = options.profileId ? requireProfileContext(options.profileId).id : undefined;
 
+  // 静默时段内的 Profile 本轮完全不尝试主动投递；行保持 pending，窗口结束后由下一 tick 恢复。
+  // notify.pull 不受静默时段限制（用户主动拉取）。
+  const quiet = quietProfileIds(at);
+  if (profileIdFilter && quiet.has(profileIdFilter)) {
+    return { attempted: 0, sent: 0, failed: 0 };
+  }
+  const quietIds = [...quiet];
+  const quietClause = quietIds.length > 0
+    ? `AND profile_id NOT IN (${quietIds.map(() => "?").join(",")})`
+    : "";
+  const quietClauseAliased = quietIds.length > 0
+    ? `AND d.profile_id NOT IN (${quietIds.map(() => "?").join(",")})`
+    : "";
+
   // 幂等窗口 fallback 必须先于 route-drift 标记执行：超过 55 分钟的
   // transport-failed/sending 行直接进入终态 fallback，避免被 ROUTE_MISSING
   // 抢占后在 route 恢复时以新 Request-ID 重复投递。
@@ -259,12 +274,12 @@ export async function deliverPendingProfileNotifications(options: {
         SELECT DISTINCT profile_id, route FROM profile_notification_deliveries
         WHERE profile_id = ? AND (
           status IN ('pending', 'failed') OR (status = 'sending' AND claimed_at <= ?)
-        )
-      `).all(profileIdFilter, staleClaimAt)
+        ) ${quietClause}
+      `).all(profileIdFilter, staleClaimAt, ...quietIds)
     : db.prepare(`
         SELECT DISTINCT profile_id, route FROM profile_notification_deliveries
-        WHERE status IN ('pending', 'failed') OR (status = 'sending' AND claimed_at <= ?)
-      `).all(staleClaimAt)) as Array<{ profile_id: string; route: string }>;
+        WHERE (status IN ('pending', 'failed') OR (status = 'sending' AND claimed_at <= ?)) ${quietClause}
+      `).all(staleClaimAt, ...quietIds)) as Array<{ profile_id: string; route: string }>;
   for (const candidate of routeCandidates) {
     const configuredRoute = Object.prototype.hasOwnProperty.call(config.profilePushRoutes, candidate.profile_id)
       ? config.profilePushRoutes[candidate.profile_id]
@@ -309,7 +324,7 @@ export async function deliverPendingProfileNotifications(options: {
     );
   }
 
-  const params: unknown[] = [dueAt, staleClaimAt];
+  const params: unknown[] = [dueAt, dueAt, staleClaimAt, ...quietIds];
   const profileClause = profileIdFilter ? "AND d.profile_id = ?" : "";
   if (profileIdFilter) params.push(profileIdFilter);
   const rows = db.prepare(`
@@ -319,9 +334,9 @@ export async function deliverPendingProfileNotifications(options: {
     FROM profile_notification_deliveries d
     JOIN profile_notifications n ON n.id = d.notification_id AND n.profile_id = d.profile_id
     WHERE (
-      (d.status IN ('pending', 'failed') AND d.next_attempt_at <= ?)
+      (d.status IN ('pending', 'failed') AND d.next_attempt_at <= ? AND (d.not_before IS NULL OR d.not_before <= ?))
       OR (d.status = 'sending' AND d.claimed_at <= ?)
-    ) ${profileClause}
+    ) ${quietClauseAliased} ${profileClause}
       AND NOT EXISTS (
         SELECT 1 FROM profile_notification_reads r
         WHERE r.profile_id = d.profile_id AND r.notification_id = d.notification_id
@@ -345,6 +360,7 @@ export async function deliverPendingProfileNotifications(options: {
       ? config.profilePushRoutes[profileId]
       : undefined;
     if (!route || route.route !== routeName) return result;
+    if (quiet.has(profileId)) return result;
     const requestAt = clock();
     const claimToken = crypto.randomUUID();
     const claimed = db.prepare(`
@@ -352,7 +368,7 @@ export async function deliverPendingProfileNotifications(options: {
       SET status = 'sending', claim_token = ?, claimed_at = ?,
           request_started_at = COALESCE(request_started_at, ?), updated_at = ?
       WHERE profile_id = ? AND notification_id = ? AND route = ? AND (
-        (status IN ('pending', 'failed') AND next_attempt_at <= ?)
+        (status IN ('pending', 'failed') AND next_attempt_at <= ? AND (not_before IS NULL OR not_before <= ?))
         OR (status = 'sending' AND claimed_at <= ?)
       )
     `).run(
@@ -363,6 +379,7 @@ export async function deliverPendingProfileNotifications(options: {
       profileId,
       notificationId,
       routeName,
+      dueAt,
       dueAt,
       staleClaimAt,
     ) as { changes: number };
@@ -496,6 +513,152 @@ export const notify = (title: string, body: string, dedupeKey?: string): Promise
   dedupeKey === undefined
     ? publishGlobal(title, body)
     : publishGlobal("general", title, body, dedupeKey);
+
+export interface SnoozeSummary {
+  notificationId: number;
+  snoozedUntil: string;
+  routes: string[];
+}
+
+/** 与 deliverPendingProfileNotifications 的幂等窗口保持一致的保守口径。 */
+const UNCERTAIN_WINDOW_MS = 55 * 60 * 1000;
+
+/**
+ * 稍后提醒：把未成功投递的通知的下次投递时间推迟 minutes 分钟。
+ * 只作用于 pending/failed/fallback；幂等窗口内的不确定失败（request_started_at 较新）
+ * 拒绝 snooze，避免换新 Request-ID 重复投递。
+ */
+export function snoozeProfileNotificationDelivery(
+  value: ProfileContext | string,
+  notificationId: number,
+  minutes: number,
+  at = new Date(),
+): SnoozeSummary {
+  if (!Number.isInteger(notificationId) || notificationId <= 0) {
+    throw new Error("notificationId 必须是正整数");
+  }
+  if (!Number.isInteger(minutes) || minutes < 1 || minutes > 1440) {
+    throw new Error("minutes 必须是 1–1440 之间的整数分钟");
+  }
+  const profile = asContext(value);
+  const db = getDatabase();
+  const exists = db.prepare(
+    "SELECT 1 FROM profile_notifications WHERE profile_id = ? AND id = ?",
+  ).get(profile.id, notificationId);
+  if (!exists) throw new Error(`通知 ${notificationId} 不存在或不属于当前 Profile`);
+  const rows = db.prepare(`
+    SELECT route, status, request_started_at FROM profile_notification_deliveries
+    WHERE profile_id = ? AND notification_id = ? AND status IN ('pending', 'failed', 'fallback')
+  `).all(profile.id, notificationId) as Array<{
+    route: string;
+    status: string;
+    request_started_at: string | null;
+  }>;
+  if (rows.length === 0) {
+    throw new Error(`通知 ${notificationId} 没有可推迟的投递（可能已投递成功、已取消或正在投递）`);
+  }
+  const cutoff = new Date(at.getTime() - UNCERTAIN_WINDOW_MS).toISOString();
+  for (const row of rows) {
+    if (row.status !== "pending" && row.request_started_at != null && row.request_started_at > cutoff) {
+      throw new Error(
+        `通知 ${notificationId} 的上一次投递结果不确定（可能仍在途），为避免重复推送暂不能推迟；请稍后再试`,
+      );
+    }
+  }
+  const snoozedUntil = new Date(at.getTime() + minutes * 60_000).toISOString();
+  const updated = db.prepare(`
+    UPDATE profile_notification_deliveries
+    SET status = 'pending', attempts = 0, transport_failures = 0,
+        next_attempt_at = ?, not_before = ?, last_error = NULL,
+        claim_token = NULL, claimed_at = NULL, updated_at = ?
+    WHERE profile_id = ? AND notification_id = ? AND status IN ('pending', 'failed', 'fallback')
+  `).run(snoozedUntil, snoozedUntil, at.toISOString(), profile.id, notificationId) as { changes: number };
+  if (updated.changes === 0) throw new Error("推迟失败：投递状态刚被并发修改，请重试");
+  return { notificationId, snoozedUntil, routes: rows.map((row) => row.route) };
+}
+
+export interface CancelSummary {
+  notificationId: number;
+  cancelled: number;
+}
+
+/** 取消未投递的通知：pending/failed/fallback → cancelled（终态，不再被 route 恢复重新入队）。 */
+export function cancelProfileNotificationDelivery(
+  value: ProfileContext | string,
+  notificationId: number,
+): CancelSummary {
+  if (!Number.isInteger(notificationId) || notificationId <= 0) {
+    throw new Error("notificationId 必须是正整数");
+  }
+  const profile = asContext(value);
+  const db = getDatabase();
+  const time = now();
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const updated = db.prepare(`
+      UPDATE profile_notification_deliveries
+      SET status = 'cancelled', claim_token = NULL, claimed_at = NULL, updated_at = ?
+      WHERE profile_id = ? AND notification_id = ? AND status IN ('pending', 'failed', 'fallback')
+    `).run(time, profile.id, notificationId) as { changes: number };
+    // 同时标记已读：用户已明确知晓并决定取消，避免 notify.pull 再把它作为未读兜底复述。
+    db.prepare(
+      "INSERT OR IGNORE INTO profile_notification_reads(profile_id, notification_id, read_at) VALUES(?, ?, ?)",
+    ).run(profile.id, notificationId, time);
+    db.exec("COMMIT");
+    return { notificationId, cancelled: updated.changes };
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+}
+
+export interface NotificationDeliveryView {
+  route: string;
+  status: string;
+}
+
+export interface NotificationListEntry {
+  id: number;
+  source: string;
+  title: string;
+  body: string;
+  createdAt: string;
+  readAt?: string;
+  deliveries: NotificationDeliveryView[];
+}
+
+/** 列出当前 Profile 最近的通知及投递状态（含已读，只读操作）。 */
+export function listProfileNotifications(value: ProfileContext | string, limit = 20): NotificationListEntry[] {
+  const profile = asContext(value);
+  const bounded = Math.min(Math.max(Math.trunc(limit) || 20, 1), 100);
+  const rows = getDatabase().prepare(`
+    SELECT n.id, n.source, n.title, n.body, n.created_at,
+      (SELECT r.read_at FROM profile_notification_reads r
+        WHERE r.profile_id = n.profile_id AND r.notification_id = n.id) AS read_at,
+      (SELECT GROUP_CONCAT(route || '=' || status, ',') FROM profile_notification_deliveries d
+        WHERE d.profile_id = n.profile_id AND d.notification_id = n.id) AS deliveries
+    FROM profile_notifications n
+    WHERE n.profile_id = ?
+    ORDER BY n.id DESC
+    LIMIT ?
+  `).all(profile.id, bounded) as Array<Record<string, unknown>>;
+  return rows.map((row) => ({
+    id: Number(row.id),
+    source: String(row.source),
+    title: String(row.title),
+    body: String(row.body),
+    createdAt: String(row.created_at),
+    readAt: row.read_at == null ? undefined : String(row.read_at),
+    deliveries: typeof row.deliveries === "string" && row.deliveries.length > 0
+      ? row.deliveries.split(",").map((pair) => {
+          const separator = pair.indexOf("=");
+          return separator === -1
+            ? { route: pair, status: "unknown" }
+            : { route: pair.slice(0, separator), status: pair.slice(separator + 1) };
+        })
+      : [],
+  }));
+}
 
 export function pullPending(value: ProfileContext | string): Notice[] {
   const profile = asContext(value);

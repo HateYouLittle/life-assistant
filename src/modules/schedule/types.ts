@@ -24,6 +24,8 @@ export interface RecurrenceRule {
 }
 
 export interface ScheduleInput {
+  /** 导入场景保留原 ID；常规创建忽略 */
+  id?: string;
   type?: ScheduleType;
   title: string;
   note?: string;

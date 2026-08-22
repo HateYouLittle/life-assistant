@@ -26,6 +26,11 @@ export interface DailyWeatherPayload {
     probabilityPercent?: number;
     amountMm?: number;
   };
+  airQuality?: {
+    scale: "CN" | "US";
+    aqi: number;
+    category: string;
+  };
   advice?: string;
 }
 
@@ -82,6 +87,15 @@ export interface ScheduleReminderPayload {
   generatedAt?: string;
 }
 
+export interface AutomationResultPayload {
+  name: string;
+  action: string;
+  schedule: string;
+  timezone: string;
+  condition?: { field: string; op: string; value: number | string };
+  fields: Array<{ label: string; value: string }>;
+}
+
 interface NotificationCore {
   identity: string;
   source: string;
@@ -99,6 +113,7 @@ export type NotificationEnvelope = NotificationCore & (
   | { kind: "oilprice.advance_notice"; payload: OilPriceAdvanceNoticePayload }
   | { kind: "oilprice.official_result"; payload: OilPriceOfficialResultPayload }
   | { kind: "schedule.reminder"; payload: ScheduleReminderPayload }
+  | { kind: "automation.result"; payload: AutomationResultPayload }
 );
 
 export interface RenderedNotification {
@@ -153,6 +168,14 @@ function dailyWeatherBlocks(payload: DailyWeatherPayload): RenderBlock[] {
     blocks.push({ type: "label", label: "降水", value: `最高概率${payload.precipitation.probabilityPercent}%` });
   } else if (payload.precipitation?.amountMm !== undefined) {
     blocks.push({ type: "label", label: "降水", value: `预计${payload.precipitation.amountMm}mm` });
+  }
+  if (payload.airQuality) {
+    const scale = payload.airQuality.scale === "CN" ? "国标" : "美标";
+    blocks.push({
+      type: "label",
+      label: "空气",
+      value: `AQI ${payload.airQuality.aqi}，${payload.airQuality.category}（${scale}）`,
+    });
   }
   if (payload.advice) blocks.push({ type: "label", label: "建议", value: payload.advice });
   return blocks;
@@ -306,12 +329,41 @@ function scheduleReminderBlocks(payload: ScheduleReminderPayload): RenderBlock[]
   return blocks;
 }
 
+const AUTOMATION_OP_LABEL: Record<string, string> = {
+  ">": "大于",
+  ">=": "大于等于",
+  "<": "小于",
+  "<=": "小于等于",
+  "==": "等于",
+  "!=": "不等于",
+};
+
+function automationResultBlocks(payload: AutomationResultPayload): RenderBlock[] {
+  const blocks: RenderBlock[] = [
+    { type: "line", text: `自动提醒 · ${payload.name}` },
+  ];
+  if (payload.condition) {
+    const opLabel = AUTOMATION_OP_LABEL[payload.condition.op] ?? payload.condition.op;
+    blocks.push({
+      type: "label",
+      label: "触发条件",
+      value: `${payload.condition.field} ${opLabel} ${payload.condition.value}`,
+    });
+  }
+  for (const field of payload.fields) {
+    blocks.push({ type: "label", label: field.label, value: field.value });
+  }
+  blocks.push({ type: "label", label: "任务", value: `${payload.action}，${payload.schedule}` });
+  return blocks;
+}
+
 function renderBlocks(notification: NotificationEnvelope): RenderBlock[] {
   if (notification.kind === "weather.daily_brief") return dailyWeatherBlocks(notification.payload);
   if (notification.kind === "weather.official_alert") return officialAlertBlocks(notification);
   if (notification.kind === "weather.inferred_alert") return inferredAlertBlocks(notification.payload);
   if (notification.kind === "oilprice.advance_notice") return oilPriceAdvanceBlocks(notification.payload);
   if (notification.kind === "oilprice.official_result") return oilPriceResultBlocks(notification);
+  if (notification.kind === "automation.result") return automationResultBlocks(notification.payload);
   return scheduleReminderBlocks(notification.payload);
 }
 

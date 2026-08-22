@@ -11,11 +11,13 @@ import {
   fetchCurrent,
   fetchForecast,
   fetchAlerts,
+  fetchIndices,
   qweatherGeo,
   type CurrentWeather,
   type ForecastDay,
   type WeatherAlert,
 } from "./provider.js";
+import { fetchAirQuality, type AirQuality } from "../airquality/provider.js";
 import { inferredAlertNotification, legacyWeatherAlertDedupeKeys, officialAlertNotification } from "./notification.js";
 
 export interface DailyWeatherBriefOptions {
@@ -24,6 +26,7 @@ export interface DailyWeatherBriefOptions {
   getLocation?: () => { city: string; lat: number; lon: number } | null;
   getCurrent?: (lat: number, lon: number, city: string) => Promise<CurrentWeather>;
   getForecast?: (lat: number, lon: number, days: number, city: string) => Promise<ForecastDay[]>;
+  getAirQuality?: (city: string, lat: number, lon: number) => Promise<AirQuality>;
   publish?: (
     source: string,
     title: string,
@@ -62,9 +65,12 @@ export async function runDailyWeatherBrief(options: DailyWeatherBriefOptions = {
 
   const getCurrent = options.getCurrent ?? fetchCurrent;
   const getForecast = options.getForecast ?? fetchForecast;
-  const [current, forecast] = await Promise.allSettled([
+  const getAirQuality = options.getAirQuality ?? fetchAirQuality;
+  const [current, forecast, airQuality] = await Promise.allSettled([
     getCurrent(location.lat, location.lon, location.city),
     getForecast(location.lat, location.lon, 1, location.city),
+    // 空气质量 best-effort：单源失败不阻断简报，仅在两侧天气可用时并入一行。
+    getAirQuality(location.city, location.lat, location.lon),
   ]);
   if (current.status === "rejected" && (forecast.status === "rejected" || forecast.value.length === 0)) {
     const forecastFailure = forecast.status === "rejected"
@@ -75,6 +81,7 @@ export async function runDailyWeatherBrief(options: DailyWeatherBriefOptions = {
 
   const currentValue = current.status === "fulfilled" ? current.value : undefined;
   const today = forecast.status === "fulfilled" ? forecast.value[0] : undefined;
+  const aqi = airQuality.status === "fulfilled" ? airQuality.value : undefined;
   const precipitation = today?.precipProb !== undefined
     ? { probabilityPercent: today.precipProb }
     : today?.precipAmountMm !== undefined
@@ -94,6 +101,11 @@ export async function runDailyWeatherBrief(options: DailyWeatherBriefOptions = {
       maxTemperatureC: today.tMax,
     } : undefined,
     precipitation,
+    airQuality: aqi ? {
+      scale: aqi.scale,
+      aqi: aqi.aqi,
+      category: aqi.category,
+    } : undefined,
     advice: dailyAdvice(today),
   };
   const notification: NotificationEnvelope = {
@@ -177,7 +189,7 @@ function requireLocation() {
  * - 有 city → 走和风 GeoAPI（对中文区县支持好，如"朔城区"），失败则回退 Open-Meteo；
  *   只做临时查询，绝不写入 location:current（多 profile 共享 store 时避免互相污染）
  */
-async function resolveLocation(city?: string): Promise<{ city: string; lat: number; lon: number }> {
+export async function resolveLocation(city?: string): Promise<{ city: string; lat: number; lon: number }> {
   if (!city) {
     const loc = requireLocation();
     return { city: loc.city, lat: loc.lat, lon: loc.lon };
@@ -245,6 +257,21 @@ const weatherModule: AssistantModule = {
           const loc = await resolveLocation(city);
           const alerts = await fetchAlerts(loc.city, loc.lat, loc.lon);
           return ok({ city: loc.city, count: alerts.length, alerts });
+        } catch (e) {
+          return fail((e as Error).message);
+        }
+      },
+    },
+    {
+      name: "indices",
+      description: "查询今日生活指数（穿衣/紫外线/洗车/运动/感冒等）。和风生活指数需 QWEATHER_KEY；未配置时降级为 Open-Meteo 紫外线指数（degraded=true 标注）。默认查询已保存位置；也可传 city 查询任意城市，临时查询不改变已保存位置。",
+      schema: { city: z.string().optional().describe("城市名（可选），如 朔城区/北京；不传则查已保存位置") },
+      handler: async (args) => {
+        try {
+          const { city } = z.object({ city: z.string().optional() }).parse(args ?? {});
+          const loc = await resolveLocation(city);
+          const result = await fetchIndices(loc.city, loc.lat, loc.lon);
+          return ok({ city: loc.city, ...result });
         } catch (e) {
           return fail((e as Error).message);
         }
