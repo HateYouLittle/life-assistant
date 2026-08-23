@@ -339,9 +339,11 @@ export async function runAutomationScan(options: AutomationScanOptions = {}): Pr
     .all() as Array<Record<string, unknown>>;
   const outcomes: AutomationRunOutcome[] = [];
   for (const row of rows) {
-    const item = rowToItem(row);
-    if (!isAutomationDue(item, at)) continue;
+    // hydration/到期判定同样在 per-item 容错内：一行损坏的 automations 数据
+    // （如截断的 JSON 列）不得让整个扫描循环抛出、停掉所有 Profile 的任务。
     try {
+      const item = rowToItem(row);
+      if (!isAutomationDue(item, at)) continue;
       const outcome = await executeAutomation(item, options);
       outcomes.push(outcome);
       recordRun(item.profileId, item.id, at, {
@@ -350,13 +352,19 @@ export async function runAutomationScan(options: AutomationScanOptions = {}): Pr
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      console.error(`[automation] ${item.profileId}/${item.id} failed: ${message}`);
+      const identity = rowToItemId(row);
+      console.error(`[automation] ${String(row.profile_id)}/${identity} failed: ${message}`);
       // 到期即记 last_run_at，避免失败任务每个扫描周期重试放大故障。
-      recordRun(item.profileId, item.id, at, { lastError: message });
-      outcomes.push({ id: item.id, profileId: item.profileId, ran: false, published: false, error: message });
+      recordRun(String(row.profile_id), identity, at, { lastError: message });
+      outcomes.push({ id: identity, profileId: String(row.profile_id), ran: false, published: false, error: message });
     }
   }
   return outcomes;
+}
+
+/** 损坏行的降级标识：rowToItem 抛错时仍要在结果里定位到具体条目。 */
+function rowToItemId(row: Record<string, unknown>): string {
+  return typeof row.id === "string" && row.id.length > 0 ? row.id : "unknown-id";
 }
 
 /** 手动执行一次（用于配置验证）：不推进 last_run_at，不影响既定调度节奏。 */

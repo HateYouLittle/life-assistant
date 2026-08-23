@@ -322,3 +322,46 @@ test("automation tools reject cross-profile access and invalid payloads", async 
   };
   assert.ok(listPayload.automations.every((entry) => entry.profileId === "automation-profile"));
 });
+
+test("scan isolates a corrupted automation row instead of halting the whole loop", async () => {
+  const good = createAutomation(profile, {
+    name: "损坏行隔离探针",
+    action: "weather.current",
+    params: {},
+    schedule: { type: "daily", time: "07:00", timezone: "UTC" },
+  });
+  // 隔离本测试：停用此前用例遗留的其他任务，保证 publisher 计数只来自本测试的两行。
+  db.prepare("UPDATE automations SET enabled = 0 WHERE profile_id = ? AND id <> ?")
+    .run(profile.id, good.id);
+  // 直接落一行损坏数据（截断的 schedule_json），created_at 排在探针之前：
+  // 修复前 rowToItem 在 per-item try 之外抛出，会让整个扫描循环停摆。
+  db.prepare(`
+    INSERT INTO automations(profile_id, id, name, action, params_json, condition_json, schedule_json, enabled, created_at, updated_at)
+    VALUES(?, 'corrupt-row', '损坏行', 'weather.current', '{}', NULL, '{"type":"daily","time":', 1,
+      '2020-01-01T00:00:00.000Z', '2020-01-01T00:00:00.000Z')
+  `).run(profile.id);
+
+  const actions = {
+    "weather.current": { run: async () => ({ temperature: 20 }) },
+  };
+  const publisher = capture();
+  const at = new Date("2027-04-01T07:05:00Z");
+  const outcomes = await runAutomationScan({ at, actions, publishProfile: publisher.publishProfile });
+
+  const corruptOutcome = outcomes.find((outcome) => outcome.id === "corrupt-row");
+  assert.ok(corruptOutcome, "损坏行应出现在结果里而不是炸掉扫描");
+  assert.equal(corruptOutcome.ran, false);
+  assert.ok(corruptOutcome.error);
+  const goodOutcome = outcomes.find((outcome) => outcome.id === good.id);
+  assert.ok(goodOutcome, "排在损坏行之后的正常任务仍应被执行");
+  assert.equal(goodOutcome.published, true);
+  assert.equal(publisher.calls.length, 1);
+
+  const corruptRow = db.prepare(
+    "SELECT last_error FROM automations WHERE profile_id = ? AND id = 'corrupt-row'",
+  ).get(profile.id) as { last_error: string | null };
+  assert.ok(corruptRow.last_error, "损坏原因应落库到 last_error 供 automation.list 排查");
+
+  deleteAutomation(profile, good.id);
+  db.prepare("DELETE FROM automations WHERE profile_id = ? AND id = ?").run(profile.id, "corrupt-row");
+});

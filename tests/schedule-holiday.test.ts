@@ -28,10 +28,11 @@ const { runDueSchedules } = await import("../src/scheduler.js");
 const db = getDatabase();
 const profile = requireProfileContext("schedule-holiday");
 
-// P3 固定年份注入：下面 T4 系列用例的锚点固定为 2026，并假定测试运行在 2026 年内
-// （createSchedule/updateSchedule 内部使用真实当前时间）。跨年后运行本文件时，
-// 请同步推进该常量，而不是让断言语义随真实年份漂移。
+// P3 固定年份注入：下面 T4 系列用例的锚点固定为 2026。create/update/complete/reconcile
+// 均接受可注入时钟，测试统一钉在 2026 年中：断言语义不随真实年份漂移，也没有逐年
+// 推进常量的人工负担（2027 年及以后运行本文件依然全绿）。
 const FIXED_TEST_YEAR = 2026;
+const FIXED_TEST_AT = () => new Date(`${FIXED_TEST_YEAR}-07-01T00:00:00.000Z`);
 
 test.after(() => {
   resetDatabaseForTests();
@@ -327,12 +328,12 @@ test("reconcileHolidaySchedules revives workday schedules once a year becomes re
     time: "09:00",
     timezone: "Asia/Shanghai",
     recurrence: "workday",
-  });
+  }, FIXED_TEST_AT());
   assert.equal(item.enabled, false);
 
   ingestYear(year);
   ingestYear(year + 1);
-  const summary = reconcileHolidaySchedules(new Date());
+  const summary = reconcileHolidaySchedules(FIXED_TEST_AT());
   assert.equal(summary.scanned >= 1, true);
   assert.equal(summary.updated >= 1, true);
 
@@ -355,7 +356,7 @@ test("reconcileHolidaySchedules repairs workday schedules across profiles", () =
     time: "09:00",
     timezone: "Asia/Shanghai",
     recurrence: "workday",
-  });
+  }, FIXED_TEST_AT());
   const second = createSchedule(other, {
     title: "profile b workday",
     calendar: "solar",
@@ -363,13 +364,13 @@ test("reconcileHolidaySchedules repairs workday schedules across profiles", () =
     time: "09:00",
     timezone: "Asia/Shanghai",
     recurrence: "workday",
-  });
+  }, FIXED_TEST_AT());
   assert.equal(first.enabled, false);
   assert.equal(second.enabled, false);
 
   ingestYear(year);
   ingestYear(year + 1);
-  reconcileHolidaySchedules(new Date());
+  reconcileHolidaySchedules(FIXED_TEST_AT());
   assert.equal(getSchedule(profile, first.id).enabled, true);
   assert.equal(getSchedule(other, second.id).enabled, true);
 });
@@ -456,7 +457,7 @@ test("T4: createSchedule marks an exhausted count workday recurrence as complete
     time: "09:00",
     timezone: "Asia/Shanghai",
     recurrence: { frequency: "workday", count: 1 },
-  });
+  }, FIXED_TEST_AT());
   assert.equal(item.status, "completed");
   assert.equal(item.enabled, false);
   const row = db.prepare("SELECT status, enabled FROM schedules WHERE profile_id = ? AND id = ?")
@@ -490,7 +491,7 @@ test("T4: createSchedule keeps active-but-disabled when until is future but data
     time: "09:00",
     timezone: "Asia/Shanghai",
     recurrence: { frequency: "workday", until: `${year + 1}-12-31` },
-  });
+  }, FIXED_TEST_AT());
   assert.equal(item.status, "active");
   assert.equal(item.enabled, false);
 });
@@ -505,13 +506,13 @@ test("T4: reconcile transitions an exhausted-but-pending workday schedule to com
     time: "09:00",
     timezone: "Asia/Shanghai",
     recurrence: { frequency: "workday", count: 1 },
-  });
+  }, FIXED_TEST_AT());
   assert.equal(item.status, "completed");
 
   // 模拟修复前落库的僵尸态：active + 停用 + 无 next_run_at。
   db.prepare("UPDATE schedules SET status = 'active', enabled = 0, next_run_at = NULL WHERE profile_id = ? AND id = ?")
     .run(profile.id, item.id);
-  const summary = reconcileHolidaySchedules(new Date());
+  const summary = reconcileHolidaySchedules(FIXED_TEST_AT());
   assert.equal(summary.updated >= 1, true);
 
   const row = db.prepare("SELECT status, enabled, next_run_at FROM schedules WHERE profile_id = ? AND id = ?")
@@ -529,13 +530,13 @@ test("T4: updateSchedule marks an exhausted until workday recurrence as complete
     time: "09:00",
     timezone: "Asia/Shanghai",
     recurrence: "workday",
-  });
+  }, FIXED_TEST_AT());
   assert.equal(item.status, "active");
   assert.equal(item.enabled, true);
 
   const updated = updateSchedule(profile, item.id, {
     recurrence: { frequency: "workday", until: `${year}-01-10` },
-  });
+  }, FIXED_TEST_AT());
   assert.equal(updated.status, "completed");
   assert.equal(updated.enabled, false);
 });
@@ -569,10 +570,10 @@ test("S6: completeSchedule advances a workday schedule past the completed occurr
     time: "09:00",
     timezone: "Asia/Shanghai",
     recurrence: "workday",
-  });
+  }, FIXED_TEST_AT());
   assert.ok(item.nextRunAt);
   const before = item.nextRunAt!;
-  const completed = completeSchedule(profile, item.id);
+  const completed = completeSchedule(profile, item.id, undefined, FIXED_TEST_AT());
   assert.equal(completed.status, "active");
   assert.ok(completed.nextRunAt);
   assert.notEqual(completed.nextRunAt, before);
@@ -594,7 +595,7 @@ test("S6: reconcileHolidaySchedules skips a completed future occurrence when rec
     time: "09:00",
     timezone: "Asia/Shanghai",
     recurrence: "workday",
-  });
+  }, FIXED_TEST_AT());
   const first = item.nextRunAt!;
   // 不写死 first 的绝对日期（日期炸弹）；只校验它确是 Asia/Shanghai 09:00 的合法工作日触发点
   const firstLocal = DateTime.fromISO(first, { zone: "Asia/Shanghai" });
@@ -608,7 +609,7 @@ test("S6: reconcileHolidaySchedules skips a completed future occurrence when rec
     "UPDATE schedules SET next_run_at = ?, enabled = 1 WHERE profile_id = ? AND id = ?",
   ).run(first, profile.id, item.id);
 
-  reconcileHolidaySchedules(new Date());
+  reconcileHolidaySchedules(FIXED_TEST_AT());
 
   const fresh = getSchedule(profile, item.id);
   assert.notEqual(fresh.nextRunAt, first);

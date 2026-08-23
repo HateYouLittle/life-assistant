@@ -199,3 +199,17 @@ test("export marks truncation when the row limit is reached", () => {
   // 清理后回到未截断状态。
   assert.equal(buildAssistantExport(profile).data.truncated, false);
 });
+
+test("import rejects snapshots exceeding 1000 entries per type", () => {
+  // 导出侧单类型截断到 1000 条；导入侧同样封顶，超大/恶意快照直接拒绝
+  // 而不是长时间占住 MCP 调用逐条 SELECT+INSERT。
+  const snapshot = {
+    format: "life-assistant.export",
+    version: 1,
+    data: { schedules: new Array(1001).fill({}) },
+  };
+  assert.throws(
+    () => importAssistantExport(profile, snapshot),
+    /Too many|array|schedules/i,
+  );
+});

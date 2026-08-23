@@ -160,8 +160,10 @@ const exportPayloadSchema = z.object({
   format: z.literal(EXPORT_FORMAT),
   version: z.literal(EXPORT_VERSION),
   data: z.object({
-    schedules: z.array(z.unknown()).optional(),
-    automations: z.array(z.unknown()).optional(),
+    // 导出侧单类型截断到 1000 条，导入侧同样封顶：防止超大/恶意快照长时间
+    // 占住 MCP 调用（每条都有 SELECT+INSERT）并膨胀共享 SQLite。
+    schedules: z.array(z.unknown()).max(1000).optional(),
+    automations: z.array(z.unknown()).max(1000).optional(),
     quietHours: z.object({
       start: z.string(),
       end: z.string(),

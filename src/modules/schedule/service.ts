@@ -823,7 +823,7 @@ function insertSchedule(profile: ProfileContext, item: ScheduleItem): void {
   );
 }
 
-export function createSchedule(value: ProfileContext | string, input: ScheduleInput): ScheduleItem {
+export function createSchedule(value: ProfileContext | string, input: ScheduleInput, at: Date = new Date()): ScheduleItem {
   const profile = context(value);
   const normalized = normalizeInput(input);
   const createdAt = nowIso();
@@ -858,7 +858,8 @@ export function createSchedule(value: ProfileContext | string, input: ScheduleIn
     createdAt,
     updatedAt: createdAt,
   };
-  const now = DateTime.utc();
+  // at 可注入（测试定死时钟）；created_at/updated_at 仍用真实时间戳。
+  const now = DateTime.fromJSDate(at, { zone: "utc" }) as DateTime<true>;
   const event = findOccurrence(base, now, true);
   base.nextRunAt = calculateInitialNextRun(base, event, now)?.toISO() ?? undefined;
   // S2/T4：普通 RRule 耗尽（nextRunAt 为 undefined）时落 completed 并停用，避免僵尸 active；
@@ -890,7 +891,7 @@ export function getSchedule(value: ProfileContext | string, id: string): Schedul
   return rowToItem(row);
 }
 
-export function updateSchedule(value: ProfileContext | string, id: string, changes: Partial<ScheduleInput>): ScheduleItem {
+export function updateSchedule(value: ProfileContext | string, id: string, changes: Partial<ScheduleInput>, at: Date = new Date()): ScheduleItem {
   const profile = context(value);
   // N1：current（经 rowToItem hydration 归一化）与乐观锁 WHERE 用的原始 version
   // 来自同一次 SELECT 快照，消除 getSchedule+rawVersion 两次独立读取的 TOCTOU 窗口；
@@ -942,7 +943,7 @@ export function updateSchedule(value: ProfileContext | string, id: string, chang
     version: current.version + 1,
     enabled: normalized.status !== "archived",
   };
-  const now = DateTime.utc();
+  const now = DateTime.fromJSDate(at, { zone: "utc" }) as DateTime<true>;
   const event = findOccurrence(next, now, true);
   next.nextRunAt = calculateInitialNextRun(next, event, now)?.toISO() ?? undefined;
   // S2/T4：普通 RRule 耗尽（nextRunAt 为 undefined）时落 completed 并停用，避免僵尸 active；
@@ -1060,7 +1061,7 @@ export function reconcileHolidaySchedules(at = new Date()): HolidayScheduleRecon
   return summary;
 }
 
-export function completeSchedule(value: ProfileContext | string, id: string, occurrenceKey?: string): ScheduleItem {
+export function completeSchedule(value: ProfileContext | string, id: string, occurrenceKey?: string, at: Date = new Date()): ScheduleItem {
   const profile = context(value);
   const db = getDatabase();
   // 与 updateSchedule 相同：current 与乐观锁 WHERE 使用的原始 version 来自同一次快照，
@@ -1081,11 +1082,11 @@ export function completeSchedule(value: ProfileContext | string, id: string, occ
   }
   occurrenceAt ??= item.nextRunAt ?? nowIso();
   db.prepare("INSERT OR REPLACE INTO schedule_occurrences(profile_id, schedule_id, occurrence_key, occurrence_at, status) VALUES(?, ?, ?, ?, 'completed')").run(profile.id, id, occurrenceAt, occurrenceAt);
-  if (item.recurrence.frequency === "once") return updateSchedule(profile, id, { status: "completed" });
+  if (item.recurrence.frequency === "once") return updateSchedule(profile, id, { status: "completed" }, at);
 
   // S6：recurring 完成当前 occurrence 后立即重算 next_run_at/enabled/status，
   // 不再等下一个 scheduler tick；findIncompleteOccurrence 会跳过刚写入的 completed occurrence。
-  const now = DateTime.utc();
+  const now = DateTime.fromJSDate(at, { zone: "utc" }) as DateTime<true>;
   const nextRunAt = calculateInitialNextRun(item, null, now)?.toISO() ?? null;
   let desiredStatus = item.status;
   if (item.status === "active") {
