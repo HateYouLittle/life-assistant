@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import test from "node:test";
+import test, { afterEach } from "node:test";
 
 // F2：动态 automation（白名单 action + 条件 DSL + scheduler 扫描）。
 const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "life-assistant-automation-"));
@@ -48,6 +48,13 @@ function capture(): { calls: Captured[]; publishProfile: (profileId: string, sou
 test.after(() => {
   db.close();
   fs.rmSync(dataDir, { recursive: true, force: true });
+});
+
+// 每个用例结束后清空本 Profile 的 automations：断言失败时测试会在自己的
+// deleteAutomation 清理之前中止，残留的启用行会污染后续 scan 用例的计数
+// （曾导致"scan 隔离失败"、"scan 跳过停用"随"scan 执行"一起连锁失败）。
+afterEach(() => {
+  db.prepare("DELETE FROM automations WHERE profile_id = ?").run(profile.id);
 });
 
 test("create persists a normalized daily automation and validates inputs", () => {
@@ -172,8 +179,14 @@ test("scan executes due automations, publishes per-day deduped notifications and
   const at = new Date("2027-02-01T07:05:00Z");
   const outcomes = await runAutomationScan({ at, actions, publishProfile: publisher.publishProfile });
   assert.equal(outcomes.length, 2);
-  assert.equal(outcomes[0].published, true);
-  assert.equal(outcomes[1].published, false);
+  // 按 id 定位结果而不是依赖数组下标：两个任务常在同一个毫秒内创建，
+  // created_at 相同，排序 tie-break 历史上是随机 UUID，outcomes[0] 不恒等于 cold。
+  const coldOutcome = outcomes.find((outcome) => outcome.id === cold.id);
+  assert.ok(coldOutcome, "冷到提醒应在扫描结果中");
+  assert.equal(coldOutcome.published, true);
+  const goodAirOutcome = outcomes.find((outcome) => outcome.id === goodAir.id);
+  assert.ok(goodAirOutcome, "空气太好应在扫描结果中");
+  assert.equal(goodAirOutcome.published, false);
 
   assert.equal(publisher.calls.length, 1);
   assert.equal(publisher.calls[0].profileId, "automation-profile");
@@ -273,6 +286,39 @@ test("scan skips disabled automations", async () => {
   assert.equal(publisher.calls.length, 0);
   assert.equal(getAutomation(profile, item.id).lastRunAt, undefined);
   deleteAutomation(profile, item.id);
+});
+
+test("list and scan order rows with identical created_at by insertion order, not random id", async () => {
+  // 直接落两条 created_at 完全相同的行（模拟批量导入/同毫秒创建），
+  // id 词法序与插入序相反：若 tie-break 用随机 id，顺序不稳定（曾导致
+  // "scan executes" 用例 ~45% 概率失败并连锁污染后续 scan 用例）。
+  const time = "2027-07-01T00:00:00.000Z";
+  const scheduleJson = JSON.stringify({ type: "interval", minutes: 5 });
+  db.prepare(`
+    INSERT INTO automations(profile_id, id, name, action, params_json, condition_json, schedule_json, enabled, created_at, updated_at)
+    VALUES(?, 'zzz-inserted-first', '先插入', 'weather.current', '{}', NULL, ?, 1, ?, ?)
+  `).run(profile.id, scheduleJson, time, time);
+  db.prepare(`
+    INSERT INTO automations(profile_id, id, name, action, params_json, condition_json, schedule_json, enabled, created_at, updated_at)
+    VALUES(?, 'aaa-inserted-second', '后插入', 'weather.current', '{}', NULL, ?, 1, ?, ?)
+  `).run(profile.id, scheduleJson, time, time);
+
+  assert.deepEqual(
+    listAutomations(profile).map((entry) => entry.id),
+    ["zzz-inserted-first", "aaa-inserted-second"],
+    "同 created_at 应按插入顺序（rowid）而不是随机 id",
+  );
+  const at = new Date("2027-07-01T08:00:00Z");
+  const outcomes = await runAutomationScan({
+    at,
+    actions: { "weather.current": { run: async () => ({ temperature: 1 }) } },
+    publishProfile: capture().publishProfile,
+  });
+  assert.deepEqual(
+    outcomes.map((outcome) => outcome.id),
+    ["zzz-inserted-first", "aaa-inserted-second"],
+    "scan 执行顺序同样应按插入顺序",
+  );
 });
 
 test("runAutomationNow executes immediately without advancing the schedule", async () => {
