@@ -38,7 +38,7 @@ export const automationActions: Record<string, AutomationActionDef> = {
   },
   "weather.forecast": {
     name: "weather.forecast",
-    description: "未来 N 天预报（N 1-7，默认 1）。结果字段：days 数组与 today（首日别名）；条件可用字段如 today.precipProb（降水概率%）、today.tMax、today.tMin。",
+    description: "未来 N 天预报（N 1-7，默认 1）。结果字段：days 数组与 today（首日别名）；条件可用字段如 today.precipAmountMm（当日降水量 mm，和风路径）、today.precipProb（降水概率%，仅 Open-Meteo 路径有值）、today.tMax、today.tMin。",
     paramsSchema: z.object({
       city: z.string().min(1).max(64).optional(),
       days: z.number().int().min(1).max(7).default(1),

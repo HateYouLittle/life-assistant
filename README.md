@@ -256,7 +256,7 @@ systemctl status --no-pager life-assistant-scheduler.service
 | `AUTOMATION_SCAN_CRON` | 自动任务扫描 cron，默认 `*/10 * * * *`；单任务调度在其 schedule 中定义 |
 | `LOCATION_CITY/LAT/LON` | 可选预置共享位置；未设置时由 Agent 首次确认 |
 | `QWEATHER_KEY` | 可选，和风天气实时/预报/官方预警和 GeoAPI |
-| `QWEATHER_API_HOST` | 可选，和风天气 API host |
+| `QWEATHER_API_HOST` | 可选，和风天气 API host；**新式 API Key 绑定专属 host（如 `xxx.re.qweatherapi.com`），必须配置，否则全部 403 Invalid Host 静默降级 Open-Meteo（官方预警也不可用）**；旧订阅 key 保持默认 `devapi.qweather.com` |
 | `TIANAPI_KEY` | 可选，油价首选数据源 |
 | `JUHE_KEY` | 可选，油价兜底数据源 |
 
@@ -283,7 +283,7 @@ systemctl status --no-pager life-assistant-scheduler.service
 `automation.*` 提供 Profile 私有、确定性执行的动态任务（原 planned automation 已落地）：
 
 - **白名单 action**：`weather.current`、`weather.forecast`（days 1–7）、`airquality.current`、`oilprice.current`，全部复用模块 Provider，不调用 LLM；
-- **条件 DSL**：`{ field, op, value }`，field 是 action 结果的 dot-path（如 `today.precipProb`、`aqi`、`p92`），支持 `> >= < <= == !=`；字段缺失视为不满足；缺省条件表示到点必提醒；
+- **条件 DSL**：`{ field, op, value }`，field 是 action 结果的 dot-path（如 `today.precipAmountMm`、`aqi`、`p92`；注意 `today.precipProb` 仅 Open-Meteo 数据源有值，和风路径用 `precipAmountMm`），支持 `> >= < <= == !=`；字段缺失视为不满足；缺省条件表示到点必提醒；
 - **调度**：`daily`（每天 HH:mm，可带 IANA 时区）或 `interval`（每 N 分钟，最小 5）；scheduler 按 `AUTOMATION_SCAN_CRON`（默认每 10 分钟）扫描到期任务；
 - **投递**：条件满足时走 Profile 私有通知通道（静默时段、outbox、`notify.pull` 兜底全部适用）；dedupe key 含任务本地日期，同一任务每个本地日期最多主动提醒一次；
 - **工具**：`automation.create / list / update / delete / run`；`run` 立即手动执行一次用于验证配置，不影响既定调度节奏；单任务失败只记录 `last_error`，不阻断其它任务。

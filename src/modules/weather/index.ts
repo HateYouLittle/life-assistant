@@ -36,11 +36,19 @@ export interface DailyWeatherBriefOptions {
   ) => Promise<void>;
 }
 
-function dailyAdvice(today: ForecastDay | undefined): string | undefined {
+/** 带伞建议：概率（Open-Meteo）、量级（和风，1mm 起滤掉痕量）、天气现象三信号任一命中。 */
+export function umbrellaWarranted(today: ForecastDay): boolean {
+  if ((today.precipProb ?? 0) >= 60) return true;
+  if ((today.precipAmountMm ?? 0) >= 1) return true;
+  // 天气现象文本含"雨"（阵雨/雷阵雨/毛毛雨/冻雨…）：WMO 映射的雪类不含"雨"，天然排除。
+  return /雨/.test(today.weatherText);
+}
+
+export function dailyAdvice(today: ForecastDay | undefined): string | undefined {
   if (!today) return undefined;
   const advice: string[] = [];
   if (today.tMax >= 35) advice.push("减少午后长时间户外活动");
-  if ((today.precipProb ?? 0) >= 60 || (today.precipAmountMm ?? 0) > 0) advice.push("外出记得带伞");
+  if (umbrellaWarranted(today)) advice.push("外出记得带伞");
   return advice.length > 0 ? advice.join("，") : undefined;
 }
 

@@ -4,9 +4,9 @@ import test from "node:test";
 
 import { config } from "../src/config.js";
 import { httpJson, redactUrl } from "../src/core/http.js";
-import { WMO, fetchAlerts, fetchCurrent, fetchForecast } from "../src/modules/weather/provider.js";
+import { WMO, fetchAlerts, fetchCurrent, fetchForecast, fetchIndices } from "../src/modules/weather/provider.js";
 
-test("QWeather forecast maps daily precip as probability percent", async (t) => {
+test("QWeather forecast maps daily precip as precipitation amount in mm", async (t) => {
   const originalKey = config.qweatherKey;
   const originalFetch = globalThis.fetch;
   config.qweatherKey = "test-key";
@@ -30,12 +30,14 @@ test("QWeather forecast maps daily precip as probability percent", async (t) => 
     globalThis.fetch = originalFetch;
   });
 
+  // precip 是当日累计降水量（mm）（2026-08 实测专属 host 响应无 precipProb 字段）；
+  // 按概率解释会把 12.7mm 中雨显示成"概率 12.7%"并漏掉带伞建议。
   assert.deepEqual(await fetchForecast(39.9, 116.4, 1), [{
     date: "2026-08-03",
     tMax: 31,
     tMin: 24,
     weatherText: "中雨",
-    precipProb: 12.7,
+    precipAmountMm: 12.7,
   }]);
 });
 
@@ -64,7 +66,7 @@ test("QWeather current passes lon,lat order and maps now fields", async (t) => {
   });
 });
 
-test("QWeather forecast drops zero precip probability instead of emitting 0%", async (t) => {
+test("QWeather forecast drops zero precip amount instead of emitting 0mm", async (t) => {
   const originalKey = config.qweatherKey;
   const originalFetch = globalThis.fetch;
   config.qweatherKey = "test-key";
@@ -91,7 +93,7 @@ test("QWeather forecast drops zero precip probability instead of emitting 0%", a
     tMax: 31,
     tMin: 24,
     weatherText: "晴",
-    precipProb: undefined,
+    precipAmountMm: undefined,
   }]);
 });
 
@@ -460,4 +462,78 @@ test("Open-Meteo forecast maps WMO weather code 55 to 密集毛毛雨", async (t
 
   const [today] = await fetchForecast(27.62, 113.85, 1);
   assert.equal(today.weatherText, "密集毛毛雨");
+});
+
+test("Open-Meteo forecast tolerates null precipitation probability per day", async (t) => {
+  const originalKey = config.qweatherKey;
+  const originalFetch = globalThis.fetch;
+  config.qweatherKey = "";
+  globalThis.fetch = (async () => {
+    return Response.json({
+      daily: {
+        time: ["2026-08-03", "2026-08-04"],
+        temperature_2m_max: [30, 31],
+        temperature_2m_min: [23, 24],
+        weather_code: [80, 80],
+        // 集合预报未覆盖的地区逐日返回 null：按元素降级为 undefined，不拖垮整条预报。
+        precipitation_probability_max: [null, 65],
+      },
+    });
+  }) as typeof fetch;
+  t.after(() => {
+    config.qweatherKey = originalKey;
+    globalThis.fetch = originalFetch;
+  });
+
+  const days = await fetchForecast(39.9, 116.4, 2);
+  assert.equal(days[0].precipProb, undefined);
+  assert.equal(days[1].precipProb, 65);
+});
+
+test("Open-Meteo wind speed requests m/s in current and inferred-alert queries", async (t) => {
+  const originalKey = config.qweatherKey;
+  const originalFetch = globalThis.fetch;
+  config.qweatherKey = "";
+  const urls: string[] = [];
+  globalThis.fetch = (async (input) => {
+    urls.push(String(input));
+    if (String(input).includes("current=")) {
+      return Response.json({
+        current: { temperature_2m: 25, relative_humidity_2m: 60, apparent_temperature: 27, weather_code: 0, wind_speed_10m: 3.2 },
+      });
+    }
+    return Response.json({
+      hourly: { temperature_2m: [20], precipitation: [0], wind_speed_10m: [5] },
+    });
+  }) as typeof fetch;
+  t.after(() => {
+    config.qweatherKey = originalKey;
+    globalThis.fetch = originalFetch;
+  });
+
+  const current = await fetchCurrent(39.9, 116.4);
+  assert.equal(current.windSpeedUnit, "m/s");
+  assert.ok(urls[0].includes("windspeed_unit=ms"), "current 查询必须显式请求 m/s（默认 km/h）");
+
+  const alerts = await fetchAlerts("北京", 39.9, 116.4);
+  assert.deepEqual(alerts, []);
+  assert.ok(urls[1].includes("windspeed_unit=ms"), "推断预警必须显式请求 m/s（17.2 阈值是 m/s 口径）");
+});
+
+test("Open-Meteo indices degrade to empty when uv_index_max is null", async (t) => {
+  const originalKey = config.qweatherKey;
+  const originalFetch = globalThis.fetch;
+  config.qweatherKey = "";
+  globalThis.fetch = (async () => {
+    return Response.json({ daily: { uv_index_max: [null] } });
+  }) as typeof fetch;
+  t.after(() => {
+    config.qweatherKey = originalKey;
+    globalThis.fetch = originalFetch;
+  });
+
+  const result = await fetchIndices("北京", 39.9, 116.4);
+  assert.deepEqual(result.indices, []);
+  assert.equal(result.degraded, true);
+  assert.equal(result.source, "Open-Meteo");
 });

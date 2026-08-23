@@ -66,7 +66,7 @@ Hermes 将 MCP 工具注册为 `mcp_life_assistant_<tool>`，点号转换为下�
 
 用户想要条件触发的动态提醒（「明天下雨就提醒我」「AQI 超过 150 叫我」「油价破 8 通知」）时使用 `automation.*`，不要把它们建成一堆静态日程：
 
-- 用 `automation.create` 创建：`action` 限白名单（`weather.current` / `weather.forecast` / `airquality.current` / `oilprice.current`），`condition` 是 `{field, op, value}`（field 用 dot-path，如 `today.precipProb`、`aqi`、`p92`），`schedule` 是 daily（可带时区）或 interval（≥5 分钟）。
+- 用 `automation.create` 创建：`action` 限白名单（`weather.current` / `weather.forecast` / `airquality.current` / `oilprice.current`），`condition` 是 `{field, op, value}`（field 用 dot-path，如 `today.precipAmountMm`、`aqi`、`p92`；`today.precipProb` 仅 Open-Meteo 数据源有值，和风路径用 `precipAmountMm`），`schedule` 是 daily（可带时区）或 interval（≥5 分钟）。
 - 无条件表示到点必提醒；条件不满足则本轮静默。同一任务每个本地日期最多主动提醒一次。
 - 创建后用 `automation.run` 立即执行一次验证配置，把结果如实反馈给用户；`automation.list` 查看运行状态与最近错误。
 - 修改用 `automation.update`（condition 传 null 清除），删除用 `automation.delete`。任务和通知只属于当前 Profile。

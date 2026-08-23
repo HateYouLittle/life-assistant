@@ -99,6 +99,28 @@ export function parseQweatherAqi(city: string, raw: unknown): AirQuality {
   };
 }
 
+/** US EPA PM2.5 断点表（μg/m³ → AQI 分段线性插值）。us_aqi 为 null 时的降级近似。 */
+const US_PM25_BREAKPOINTS: ReadonlyArray<readonly [number, number, number, number]> = [
+  [0.0, 9.0, 0, 50],
+  [9.1, 35.4, 51, 100],
+  [35.5, 55.4, 101, 150],
+  [55.5, 125.4, 151, 200],
+  [125.5, 225.1, 201, 300],
+  [225.2, 500.4, 301, 500],
+];
+
+export function usAqiFromPm25(pm25: number): number {
+  if (!Number.isFinite(pm25)) throw new Error("pm25 must be a finite number");
+  // EPA 参考方法先把浓度截断到 1 位小数（9.05 → 9.0），负的近零伪影按 0 处理。
+  const conc = Math.min(Math.max(Math.floor(pm25 * 10) / 10, 0), 500.4);
+  for (const [concLow, concHigh, aqiLow, aqiHigh] of US_PM25_BREAKPOINTS) {
+    if (conc <= concHigh) {
+      return Math.round((aqiHigh - aqiLow) / (concHigh - concLow) * (conc - concLow) + aqiLow);
+    }
+  }
+  return 500;
+}
+
 /** Open-Meteo 空气质量解析（纯函数）：us_aqi 为主 AQI，污染物浓度 μg/m³ */
 export function parseOpenMeteoAqi(city: string, raw: unknown): AirQuality {
   const body = raw as {
@@ -108,7 +130,6 @@ export function parseOpenMeteoAqi(city: string, raw: unknown): AirQuality {
   if (!current || typeof current !== "object") {
     throw new Error("airquality provider: Open-Meteo air-quality response is missing current");
   }
-  const aqi = toFiniteNumber(current.us_aqi, "current.us_aqi");
   const pollutants: AirQuality["pollutants"] = {
     pm25: optionalFiniteNumber(current.pm2_5, "current.pm2_5"),
     pm10: optionalFiniteNumber(current.pm10, "current.pm10"),
@@ -116,13 +137,20 @@ export function parseOpenMeteoAqi(city: string, raw: unknown): AirQuality {
     no2: optionalFiniteNumber(current.nitrogen_dioxide, "current.nitrogen_dioxide"),
     so2: optionalFiniteNumber(current.sulphur_dioxide, "current.sulphur_dioxide"),
   };
+  // us_aqi 是可空字段（污染物数据不足的地区返回 null）：降级用 PM2.5 断点近似，
+  // 而不是让整条查询失败——两者都没有才视为响应不可用。
+  const usAqi = optionalFiniteNumber(current.us_aqi, "current.us_aqi");
+  const derived = usAqi ?? (pollutants.pm25 !== undefined ? usAqiFromPm25(pollutants.pm25) : undefined);
+  if (derived === undefined) {
+    throw new Error("airquality provider: Open-Meteo air-quality response has neither us_aqi nor pm2_5");
+  }
   return {
     city,
     scale: "US",
-    aqi,
-    category: usAqiCategory(aqi),
+    aqi: derived,
+    category: usAqiCategory(derived),
     pollutants,
-    source: "Open-Meteo",
+    source: usAqi !== undefined ? "Open-Meteo" : "Open-Meteo（us_aqi 缺失，按 PM2.5 近似）",
   };
 }
 

@@ -116,7 +116,12 @@ export async function fetchIndices(city: string, lat: number, lon: number): Prom
   if (!Array.isArray(d.uv_index_max) || d.uv_index_max.length === 0) {
     throw new Error("weather provider: Open-Meteo indices response is missing daily.uv_index_max");
   }
-  const uv = requireFiniteNumber(d.uv_index_max[0], "daily.uv_index_max[0]");
+  // uv_index_max 是可空字段：当天无数据时为 null，降级为空指数（degraded）而非整体失败。
+  const uvRaw = d.uv_index_max[0];
+  if (typeof uvRaw !== "number" || !Number.isFinite(uvRaw)) {
+    return { indices: [], source: "Open-Meteo", degraded: true };
+  }
+  const uv = uvRaw;
   const { category, text } = uvIndexCategory(uv);
   return {
     indices: [{ name: "紫外线指数", category, text: `今日紫外线指数最大值约 ${uv}。${text}` }],
@@ -200,6 +205,14 @@ function requireFiniteNumberArray(value: unknown, label: string): number[] {
     }
     return item;
   });
+}
+
+/** 可空数值数组：元素级 null（如集合预报未覆盖）降级为 undefined，字段整体缺失仍抛错。 */
+function optionalFiniteNumberArray(value: unknown, label: string): Array<number | undefined> {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new Error(`weather provider: ${label} is missing or empty`);
+  }
+  return value.map((item) => (typeof item === "number" && Number.isFinite(item) ? item : undefined));
 }
 
 function requireStringArray(value: unknown, label: string): string[] {
@@ -295,7 +308,7 @@ export async function fetchCurrent(lat: number, lon: number, city?: string): Pro
   }
   const r = await httpJson<{ current?: Record<string, unknown> }>(
     `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}` +
-      `&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m&timezone=auto`,
+      `&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m&timezone=auto&windspeed_unit=ms`,
   );
   const current = r.current;
   if (!current || typeof current !== "object") {
@@ -342,10 +355,10 @@ export async function fetchForecast(lat: number, lon: number, days = 3, city?: s
             tMax,
             tMin,
             weatherText: d.textDay || (QW_TEXT[d.iconDay] ?? `code ${d.iconDay}`),
-            // 和风 v7 daily 的 precip 是「降水概率百分比」（0~100），不是降水量 mm；
-            // 实测多云天返回 6.9/7.6/1.4，按 mm 解释会导致任何非零概率都触发带伞建议。
-            // Number("")/Number("0")/NaN 一律折叠为 undefined，避免 "预计0%" 噪音
-            precipProb: Number(d.precip) || undefined,
+            // 和风 v7 daily 的 precip 是当日累计降水量（mm），实测（2026-08，专属 API host）
+            // 响应中没有 precipProb 字段：阵雨日 precip=9.5 是毫米量，按概率解释会
+            // 显示"概率 9%"并漏掉带伞建议。降水量缺失时置 undefined，不带噪音。
+            precipAmountMm: Number(d.precip) || undefined,
           };
         });
       }
@@ -365,7 +378,9 @@ export async function fetchForecast(lat: number, lon: number, days = 3, city?: s
   const tMax = requireFiniteNumberArray(d.temperature_2m_max, "daily.temperature_2m_max");
   const tMin = requireFiniteNumberArray(d.temperature_2m_min, "daily.temperature_2m_min");
   const weatherCodes = requireFiniteNumberArray(d.weather_code, "daily.weather_code");
-  const precipProbs = requireFiniteNumberArray(d.precipitation_probability_max, "daily.precipitation_probability_max");
+  // 降水概率是可空字段：集合预报未覆盖的地区逐日返回 null，按元素降级为 undefined
+  // 而不是让整条预报失败（字段整体缺失仍视为响应畸形）。
+  const precipProbs = optionalFiniteNumberArray(d.precipitation_probability_max, "daily.precipitation_probability_max");
   if (tMax.length < time.length || tMin.length < time.length
     || weatherCodes.length < time.length || precipProbs.length < time.length) {
     throw new Error("weather provider: Open-Meteo forecast daily arrays are shorter than time");
@@ -437,10 +452,10 @@ export async function fetchAlerts(city: string, lat: number, lon: number): Promi
       console.error(`[weather] QWeather alerts failed, fallback to inference: ${(e as Error).message}`);
     }
   }
-  // 降级：阈值推断
+  // 降级：阈值推断（windspeed_unit=ms：Open-Meteo 默认 km/h，阈值 17.2 是 m/s 的 8 级风下限）
   const r = await httpJson<{ hourly?: Record<string, unknown> }>(
     `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}` +
-      `&hourly=temperature_2m,precipitation,wind_speed_10m&forecast_days=2&timezone=auto`,
+      `&hourly=temperature_2m,precipitation,wind_speed_10m&forecast_days=2&timezone=auto&windspeed_unit=ms`,
   );
   const alerts: WeatherAlert[] = [];
   const h = r.hourly;

@@ -15,9 +15,10 @@ const {
   parseOpenMeteoAqi,
   parseQweatherAqi,
   usAqiCategory,
+  usAqiFromPm25,
 } = await import("../src/modules/airquality/provider.js");
 const { parseQweatherIndices, uvIndexCategory } = await import("../src/modules/weather/provider.js");
-const { runDailyWeatherBrief } = await import("../src/modules/weather/index.js");
+const { runDailyWeatherBrief, dailyAdvice, umbrellaWarranted } = await import("../src/modules/weather/index.js");
 const { renderNotification } = await import("../src/core/notification.js");
 import type { NotificationEnvelope } from "../src/core/notification.js";
 const { airqualityModule } = await import("../src/modules/airquality/index.js");
@@ -98,7 +99,30 @@ test("parseOpenMeteoAqi maps the air-quality current payload onto the US scale",
   assert.equal(air.source, "Open-Meteo");
 
   assert.throws(() => parseOpenMeteoAqi("萍乡", {}), /missing current/);
-  assert.throws(() => parseOpenMeteoAqi("萍乡", { current: { us_aqi: null } }), /not a finite number/);
+  // us_aqi 为 null 且无 PM2.5 才视为不可用；集合预报未覆盖时常见 null，不得拖垮整条查询。
+  assert.throws(
+    () => parseOpenMeteoAqi("萍乡", { current: { us_aqi: null } }),
+    /neither us_aqi nor pm2_5/,
+  );
+
+  const derived = parseOpenMeteoAqi("萍乡", { current: { us_aqi: null, pm2_5: 18.5 } });
+  assert.equal(derived.scale, "US");
+  assert.equal(derived.aqi, 69); // PM2.5 断点插值：18.5 μg/m³ → AQI 69
+  assert.equal(derived.category, "中等");
+  assert.match(derived.source, /PM2\.5 近似/);
+});
+
+test("usAqiFromPm25 maps EPA breakpoints and clamps beyond the table", () => {
+  assert.equal(usAqiFromPm25(0), 0);
+  assert.equal(usAqiFromPm25(9.0), 50);
+  // EPA 参考方法：浓度先截断到 1 位小数（9.05 → 9.0 → AQI 50，不落进 9.0/9.1 断点间隙）。
+  assert.equal(usAqiFromPm25(9.05), 50);
+  assert.equal(usAqiFromPm25(35.4), 100);
+  assert.equal(usAqiFromPm25(55.4), 150);
+  assert.equal(usAqiFromPm25(600), 500);
+  // 负的近零伪影按 0 处理，不产生负 AQI。
+  assert.equal(usAqiFromPm25(-1), 0);
+  assert.throws(() => usAqiFromPm25(Number.NaN), /finite/);
 });
 
 test("parseQweatherIndices keeps only well-formed entries", () => {
@@ -200,4 +224,28 @@ test("airquality.current tool fails fast when no location is confirmed", async (
   const result = await tool.handler({}, { id: "airquality-profile" });
   assert.equal(result.isError, true);
   assert.match((result.content[0] as { text: string }).text, /位置未确认/);
+});
+
+test("umbrella advice covers probability, amount and weather-text signals without trace noise", () => {
+  const day = (overrides: Record<string, unknown>) => ({
+    date: "2026-08-23", tMax: 28, tMin: 22, weatherText: "多云",
+    ...overrides,
+  }) as Parameters<typeof umbrellaWarranted>[0];
+
+  // 概率路径（Open-Meteo）：≥60% 建议带伞。
+  assert.equal(umbrellaWarranted(day({ precipProb: 60 })), true);
+  assert.equal(umbrellaWarranted(day({ precipProb: 59 })), false);
+  // 量级路径（和风）：≥1mm 建议带伞；0.x mm 痕量（夜间毛毛雨残留）不提示。
+  assert.equal(umbrellaWarranted(day({ precipAmountMm: 1 })), true);
+  assert.equal(umbrellaWarranted(day({ precipAmountMm: 0.5 })), false);
+  // 天气现象路径：文本明确说有雨即建议；雪类不含"雨"不误报。
+  assert.equal(umbrellaWarranted(day({ weatherText: "阵雨" })), true);
+  assert.equal(umbrellaWarranted(day({ weatherText: "雷阵雨伴冰雹" })), true);
+  assert.equal(umbrellaWarranted(day({ weatherText: "阵雪（轻微）" })), false);
+  assert.equal(umbrellaWarranted(day({})), false);
+
+  // dailyAdvice 拼接：痕量 + 多云不再产生带伞建议。
+  assert.equal(dailyAdvice(day({ precipAmountMm: 0.2 })), undefined);
+  assert.equal(dailyAdvice(day({ precipAmountMm: 9.5, weatherText: "阵雨" })), "外出记得带伞");
+  assert.equal(dailyAdvice(day({ tMax: 36, precipAmountMm: 9.5 })), "减少午后长时间户外活动，外出记得带伞");
 });

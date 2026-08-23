@@ -22,7 +22,7 @@ const actionHelp = Object.values(automationActions)
 const scheduleField = automationScheduleSchema;
 
 const conditionField = automationConditionSchema.optional().describe(
-  "触发条件；缺省表示每次到点都提醒。field 是 action 结果的 dot-path（如 today.precipProb、aqi、p92），数值比较，字段缺失视为不满足。",
+  "触发条件；缺省表示每次到点都提醒。field 是 action 结果的 dot-path（如 today.precipAmountMm、aqi、p92），数值比较，字段缺失视为不满足。注意 today.precipProb 仅 Open-Meteo 数据源有值，和风路径用 today.precipAmountMm；windSpeed 的单位随数据源不同（和风 km/h，Open-Meteo m/s）。",
 );
 
 export const automationModule: AssistantModule = {
