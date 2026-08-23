@@ -9,7 +9,7 @@ test("getDatabase refuses a database whose schema version is newer than supporte
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "life-assistant-db-version-"));
   const dbPath = path.join(dataDir, "life-assistant.sqlite");
 
-  // 构造一个比当前支持版本(5)更新的库。
+  // 构造一个比当前支持版本(6)更新的库。
   const legacy = new DatabaseSync(dbPath);
   legacy.exec(`
     CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -30,7 +30,7 @@ test("getDatabase refuses a database whose schema version is newer than supporte
   assert.throws(
     () => getDatabase(),
     (err: Error) => {
-      assert.match(err.message, /database schema version 9 is newer than supported version 5/);
+      assert.match(err.message, /database schema version 9 is newer than supported version 6/);
       return true;
     },
   );

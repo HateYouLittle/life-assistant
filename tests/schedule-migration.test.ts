@@ -128,13 +128,14 @@ test("schema v3 additively upgrades legacy schedules without touching protected 
 
   assert.equal(
     (legacy.prepare("SELECT value FROM schema_meta WHERE key = 'version'").get() as { value: string }).value,
-    "5",
+    "6",
   );
   assert.ok(columnNames(legacy, "schedules").includes("deadline_at"));
   assert.ok(columnNames(legacy, "schedules").includes("deadline_offset_minutes"));
-  // v5 对 deliveries 的 additive 新列：只允许在表尾追加，不得改动既有列。
+  // v5/v6 的 additive 新列：只允许在表尾追加，不得改动既有列。
   const additiveColumns: Record<string, string[]> = {
     profile_notification_deliveries: ["not_before"],
+    profile_notifications: ["envelope"],
   };
   for (const table of protectedTables) {
     assert.deepEqual(

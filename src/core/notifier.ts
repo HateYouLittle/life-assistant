@@ -1,8 +1,10 @@
 import crypto from "node:crypto";
 import { config } from "../config.js";
 import { getDatabase } from "./database.js";
+import { renderDeliveredNotification } from "./delivery-render.js";
 import { quietProfileIds } from "./notification-settings.js";
 import { requireProfileContext, type ProfileContext } from "./profile.js";
+import type { NotificationEnvelope } from "./notification.js";
 
 export interface Notice {
   id: number;
@@ -124,13 +126,14 @@ export async function publishProfile(
   bodyOrKey?: string,
   maybeDedupeKey?: string,
   legacyDedupeKeys: readonly string[] = [],
+  envelope?: NotificationEnvelope,
 ): Promise<void> {
   const hasSource = maybeDedupeKey !== undefined;
   const source = hasSource ? sourceOrTitle : "schedule";
   const title = hasSource ? titleOrBody : sourceOrTitle;
   const body = hasSource ? bodyOrKey ?? "" : titleOrBody;
   const dedupeKey = hasSource ? maybeDedupeKey : bodyOrKey;
-  await publishResolvedProfile(profileId, source, title, body, dedupeKey, legacyDedupeKeys);
+  await publishResolvedProfile(profileId, source, title, body, dedupeKey, legacyDedupeKeys, envelope);
 }
 
 async function publishResolvedProfile(
@@ -140,6 +143,7 @@ async function publishResolvedProfile(
   body: string,
   dedupeKey?: string,
   legacyDedupeKeys: readonly string[] = [],
+  envelope?: NotificationEnvelope,
 ): Promise<void> {
   const profile = requireProfileContext(profileId);
   const db = getDatabase();
@@ -164,8 +168,8 @@ async function publishResolvedProfile(
     let notificationId = current?.id ?? legacyId;
     if (notificationId === undefined) {
       const inserted = db.prepare(
-        "INSERT OR IGNORE INTO profile_notifications(profile_id, source, title, body, created_at, dedupe_key) VALUES(?, ?, ?, ?, ?, ?)",
-      ).run(profile.id, source, title, body, time, dedupeKey ?? null) as {
+        "INSERT OR IGNORE INTO profile_notifications(profile_id, source, title, body, created_at, dedupe_key, envelope) VALUES(?, ?, ?, ?, ?, ?, ?)",
+      ).run(profile.id, source, title, body, time, dedupeKey ?? null, envelope ? JSON.stringify(envelope) : null) as {
         changes: number;
         lastInsertRowid: number | bigint;
       };
@@ -330,7 +334,7 @@ export async function deliverPendingProfileNotifications(options: {
   const rows = db.prepare(`
     SELECT d.profile_id, d.notification_id, d.route, d.attempts,
            d.request_generation, d.request_started_at, d.transport_failures,
-           n.source, n.title, n.body, n.created_at, n.dedupe_key
+           d.not_before, n.source, n.title, n.body, n.created_at, n.dedupe_key, n.envelope
     FROM profile_notification_deliveries d
     JOIN profile_notifications n ON n.id = d.notification_id AND n.profile_id = d.profile_id
     WHERE (
@@ -386,13 +390,24 @@ export async function deliverPendingProfileNotifications(options: {
     if (claimed.changes !== 1) return result;
     result.attempted += 1;
 
+    // 发送前按投递时刻重渲染 schedule.reminder 的相对时间（勿扰顺延等原因在此附加）；
+    // 其余 kind 或无 envelope 的存量行原样使用落库快照。
+    const view = renderDeliveredNotification({
+      profileId,
+      title: String(row.title),
+      body: String(row.body),
+      envelope: row.envelope == null ? null : String(row.envelope),
+      notBefore: row.not_before == null ? null : String(row.not_before),
+      attempts: Number(row.attempts),
+    }, requestAt);
+
     const body = JSON.stringify({
       event_type: "life_assistant.reminder",
       notification: {
         profileId,
         source: String(row.source),
-        title: String(row.title),
-        body: String(row.body),
+        title: view.title,
+        body: view.body,
         createdAt: String(row.created_at),
       },
     });
@@ -664,10 +679,10 @@ export function listProfileNotifications(value: ProfileContext | string, limit =
   }));
 }
 
-export function pullPending(value: ProfileContext | string): Notice[] {
+export function pullPending(value: ProfileContext | string, at: Date = new Date()): Notice[] {
   const profile = asContext(value);
   const db = getDatabase();
-  const time = now();
+  const time = at.toISOString();
   const staleClaimAt = new Date(new Date(time).getTime() - 2 * 60 * 1000).toISOString();
   const activeRoute = Object.prototype.hasOwnProperty.call(config.profilePushRoutes, profile.id)
     ? config.profilePushRoutes[profile.id].route
@@ -682,7 +697,12 @@ export function pullPending(value: ProfileContext | string): Notice[] {
       ORDER BY n.id ASC LIMIT 100
     `).all(profile.id) as Record<string, unknown>[];
     const profileRows = db.prepare(`
-      SELECT n.* FROM profile_notifications n
+      SELECT n.*,
+        (SELECT MAX(d.attempts) FROM profile_notification_deliveries d
+          WHERE d.profile_id = n.profile_id AND d.notification_id = n.id) AS pull_attempts,
+        (SELECT MIN(d.not_before) FROM profile_notification_deliveries d
+          WHERE d.profile_id = n.profile_id AND d.notification_id = n.id AND d.not_before IS NOT NULL) AS pull_not_before
+      FROM profile_notifications n
       LEFT JOIN profile_notification_reads r ON r.notification_id = n.id AND r.profile_id = ?
       WHERE n.profile_id = ? AND r.notification_id IS NULL
         AND NOT EXISTS (
@@ -697,7 +717,18 @@ export function pullPending(value: ProfileContext | string): Notice[] {
     `).all(profile.id, profile.id, activeRoute ?? null, activeRoute ?? null, staleClaimAt, activeRoute ?? null, staleClaimAt) as Record<string, unknown>[];
     const notices = [
       ...globalRows.map((row) => noticeFromRow(row, "global")),
-      ...profileRows.map((row) => noticeFromRow(row, "profile")),
+      ...profileRows.map((row) => {
+        // 拉取与主动投递同一套重渲染口径：顺延后的相对时间按拉取时刻重算。
+        const view = renderDeliveredNotification({
+          profileId: profile.id,
+          title: String(row.title),
+          body: String(row.body),
+          envelope: row.envelope == null ? null : String(row.envelope),
+          notBefore: row.pull_not_before == null ? null : String(row.pull_not_before),
+          attempts: row.pull_attempts == null ? 0 : Number(row.pull_attempts),
+        }, at);
+        return noticeFromRow({ ...row, title: view.title, body: view.body }, "profile");
+      }),
     ].sort((a, b) => a.time.localeCompare(b.time) || a.id - b.id).slice(0, 100);
     const markGlobal = db.prepare("INSERT OR IGNORE INTO global_notification_reads(profile_id, notification_id, read_at) VALUES(?, ?, ?)");
     const markProfile = db.prepare("INSERT OR IGNORE INTO profile_notification_reads(profile_id, notification_id, read_at) VALUES(?, ?, ?)");

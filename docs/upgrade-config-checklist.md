@@ -33,7 +33,7 @@ npm run build
 npm test
 ```
 
-基线应为：`npm test` 406/406 全绿，`npm run build` 零错误。
+基线应为：`npm test` 全绿（用例数随版本递增，以零失败为准），`npm run build` 零错误。
 
 ## 3. 必检项
 
@@ -109,9 +109,9 @@ console.log('deliveries:', db.prepare('SELECT status, COUNT(*) c FROM profile_no
 EOF
 ```
 
-- `schema version` 应为 `5`（v0.3 起：新增 `profile_settings`、`automations` 表与 `profile_notification_deliveries.not_before` 列）。
+- `schema version` 应为 `6`（v6 起：`profile_notifications` 增加可空的 `envelope` 列，用于日程提醒投递时重渲染相对时间）。
 - 若旧库中有历史 `profile_notifications`/deliveries，升级会自动迁移，不应报外键错误。
-- 若数据库版本 > 5，说明是未来版本库被旧程序打开，应立即停止并用对应新版本程序处理。
+- 若数据库版本 > 6，说明是未来版本库被旧程序打开，应立即停止并用对应新版本程序处理。
 
 > **v0.3 起迁移语义变化**：v4→v5 迁移是单向的（旧代码打开 v5 库会直接拒绝启动）。回滚必须连库一起处理：停服务 → 还原升级前的 v4 备份 → 部署旧代码。见本仓库 `docs/v0.3-capabilities-acceptance.md` 第 5 节。
 
@@ -136,6 +136,8 @@ LOCATION_LAT=
 LOCATION_LON=
 
 QWEATHER_KEY=
+# 新式 API Key 绑定专属 host（控制台「设置 → API Host」），必须改成自己的专属 host；
+# 旧订阅 key 才用默认 devapi.qweather.com。配错 host 时全部 403 并静默降级 Open-Meteo。
 QWEATHER_API_HOST=devapi.qweather.com
 TIANAPI_KEY=
 JUHE_KEY=
@@ -219,7 +221,7 @@ JUHE_KEY=
 | `PROFILE_PUSH_ROUTES_JSON is set but produced no valid routes` | JSON 非法、secret 非 64 hex、URL 非 loopback、route 名/Profile 名非法 | 按第 5 节修正 |
 | `notify.pull` 没有公共天气/油价通知 | 公共事件只为配置了 route 的 Profile materialize | 确认该 Profile 在 `PROFILE_PUSH_ROUTES_JSON` 中有合法条目 |
 | delivery 一直 `failed`/`fallback` | Gateway 未运行、端口错误、route 名不匹配、secret 不一致 | 执行 4.2 逐项核对 |
-| `database schema version X is newer than supported version 5` | 新库被旧程序打开 | 停止旧进程，使用当前版本 |
+| `database schema version X is newer than supported version 6` | 新库被旧程序打开 | 停止旧进程，使用当前版本 |
 | `HERMES_PROFILE is required...` | MCP 进程未注入 Profile 身份 | 在 `hermes mcp add --env` 或 `.env` 中显式设置 |
 | workday/holiday 日程创建后 `enabled=0` | 当年节假日数据未 ready | 先执行第 6 节第 3 步，或调用 `holiday.refresh` |
 
@@ -237,16 +239,20 @@ npm run build
 **v0.3 之前（schema ≤ 4）**：SQLite 使用 additive 迁移，回滚代码通常可继续读取旧数据；
 若已写入新表数据，旧版本会忽略对应表，不影响既有日程/通知。
 
-**v0.3 及以后（schema 5）**：v4→v5 迁移单向，旧代码打开 v5 库会被拒绝启动。若库已升级到
+**v0.3（schema 5）**：v4→v5 迁移单向，旧代码打开 v5 库会被拒绝启动。若库已升级到
 v5，回滚必须：停服务 → 从升级前备份还原 v4 库 → 部署旧代码 → 确认 `version == 4`。
+
+**当前（schema 6）**：v5→v6 仅给 `profile_notifications` 表尾追加可空的 `envelope` 列，
+无数据改写；旧代码无法打开 v6 库（版本护栏拒绝），回滚需还原 v5 备份或手工把
+`schema_meta.version` 改回 5 并删除 `envelope` 列。
 
 ## 9. 验收签字
 
 - [ ] 4.1 route 解析输出包含全部目标 Profile
 - [ ] 4.2 Hermes subscription 与 `.env` 逐字段一致
-- [ ] 4.3 schema version=5、旧数据可读
+- [ ] 4.3 schema version=6、旧数据可读
 - [ ] 6.3 节假日 ready
 - [ ] 6.4 workday 日程 nextRunAt 正确
 - [ ] 6.5 Webhook delivery=sent、pull 不重复返回
 - [ ] 6.6 smoke 数据已清理
-- [ ] `npm test` 406/406、`npm run build` 零错误
+- [ ] `npm test` 全部通过、`npm run build` 零错误

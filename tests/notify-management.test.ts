@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import type { NotificationEnvelope } from "../src/core/notification.js";
 
 // F1：静默时段 + snooze/cancel/list 通知管理。
 // 必须在导入 src 模块前设置环境：config 在模块加载时解析 PROFILE_PUSH_ROUTES_JSON。
@@ -35,6 +36,8 @@ const {
 } = await import("../src/core/notification-settings.js");
 const { notifyModule } = await import("../src/core/notify-module.js");
 const { getDatabase } = await import("../src/core/database.js");
+const { publishNotification } = await import("../src/core/notification-publisher.js");
+const { renderDeliveredNotification } = await import("../src/core/delivery-render.js");
 const db = getDatabase();
 
 const successFetch = (async () => new Response("ok", { status: 200 })) as typeof fetch;
@@ -265,4 +268,180 @@ test("quiet hours in a non-UTC timezone evaluate against local wall clock", () =
   const quiet = { start: "22:30", end: "07:00", timezone: "Asia/Shanghai" };
   assert.equal(isQuietAt(quiet, new Date("2027-06-30T22:00:00.000Z")), true);
   assert.equal(isQuietAt(quiet, new Date("2027-06-30T04:00:00.000Z")), false); // 北京 12:00，窗口外
+});
+
+// ---------------------------------------------------------------------------
+// 方案 A：schedule.reminder 投递时重渲染（相对时间重算 + 顺延原因标注）
+// ---------------------------------------------------------------------------
+
+function scheduleReminderEnvelope(identity: string, at: string): NotificationEnvelope {
+  return {
+    kind: "schedule.reminder",
+    identity,
+    source: "schedule",
+    scope: { type: "profile", profileId: "profile-a" },
+    headline: `待办 · 发生提醒：${identity}`,
+    generatedAt: at,
+    payload: {
+      title: identity,
+      eventAt: at,
+      occurrenceAt: at,
+      targetAt: at,
+      target: "occurrence",
+      reminderId: "reminder-1",
+      timezone: "UTC",
+      reminderMinutes: 0,
+      type: "todo",
+      status: "active",
+      priority: "normal",
+      allDay: false,
+      generatedAt: at,
+    },
+  };
+}
+
+const bodyCapturingFetch = (requests: Array<{ body: string }>): typeof fetch =>
+  (async (_input: RequestInfo | URL, init?: RequestInit) => {
+    requests.push({ body: String(init?.body ?? "") });
+    return new Response("ok", { status: 200 });
+  }) as typeof fetch;
+
+const failingFetch = (async () => new Response("boom", { status: 500 })) as typeof fetch;
+
+/** 隔离本条通知：取消 profile-a 其他遗留的未完成投递，避免 summary/请求计数被污染。 */
+function cancelOtherDeliveries(notificationId: number): void {
+  db.prepare(`
+    UPDATE profile_notification_deliveries SET status = 'cancelled'
+    WHERE profile_id = 'profile-a' AND notification_id <> ? AND status IN ('pending', 'failed', 'fallback')
+  `).run(notificationId);
+}
+
+test("quiet-deferred schedule reminder re-renders relative time with reason at delivery", async () => {
+  clearQuietHours("profile-a");
+  saveQuietHours("profile-a", "22:00", "07:00", "UTC");
+  try {
+    const firedAt = "2027-06-01T23:00:00.000Z"; // 静默窗口内触发
+    await publishNotification(scheduleReminderEnvelope("mgmt:quiet-defer:1", firedAt));
+    cancelOtherDeliveries(notificationIdFor("schedule:mgmt:quiet-defer:1"));
+
+    // 落库快照按发布时刻渲染：显示"现在"（且被冻结）。
+    const snapshot = db.prepare(
+      "SELECT body, envelope FROM profile_notifications WHERE profile_id = ? AND dedupe_key = ?",
+    ).get("profile-a", "schedule:mgmt:quiet-defer:1") as { body: string; envelope: string | null };
+    assert.match(snapshot.body, /相对：现在/);
+    assert.ok(snapshot.envelope, "结构化 envelope 应随快照落库");
+
+    const duringQuiet = await deliverPendingProfileNotifications({
+      at: new Date("2027-06-01T23:01:00.000Z"),
+      profileId: "profile-a",
+      fetchImpl: bodyCapturingFetch([]),
+      clock: () => new Date("2027-06-01T23:01:00.000Z"),
+    });
+    assert.equal(duringQuiet.attempted, 0);
+
+    const requests: Array<{ body: string }> = [];
+    const released = await deliverPendingProfileNotifications({
+      at: new Date("2027-06-02T08:00:00.000Z"),
+      profileId: "profile-a",
+      fetchImpl: bodyCapturingFetch(requests),
+      clock: () => new Date("2027-06-02T08:00:00.000Z"),
+    });
+    assert.equal(released.sent, 1);
+    const payload = JSON.parse(requests[0].body) as { notification: { body: string } };
+    assert.match(
+      payload.notification.body,
+      /相对：已逾期 9 小时（勿扰时段顺延）/,
+      "补推时应按投递时刻重算相对时间并标注原因",
+    );
+  } finally {
+    clearQuietHours("profile-a");
+  }
+});
+
+test("immediate delivery within tolerance keeps a punctual reminder at 现在", async () => {
+  clearQuietHours("profile-a");
+  await publishNotification(scheduleReminderEnvelope("mgmt:punctual:1", "2027-06-05T10:00:00.000Z"));
+  cancelOtherDeliveries(notificationIdFor("schedule:mgmt:punctual:1"));
+
+  const requests: Array<{ body: string }> = [];
+  const summary = await deliverPendingProfileNotifications({
+    at: new Date("2027-06-05T10:00:02.000Z"),
+    profileId: "profile-a",
+    fetchImpl: bodyCapturingFetch(requests),
+    clock: () => new Date("2027-06-05T10:00:02.000Z"),
+  });
+  assert.equal(summary.sent, 1);
+  const payload = JSON.parse(requests[0].body) as { notification: { body: string } };
+  assert.match(payload.notification.body, /相对：现在/);
+  assert.doesNotMatch(payload.notification.body, /已逾期/);
+});
+
+test("snoozed delivery appends the 稍后提醒 deferral reason", async () => {
+  clearQuietHours("profile-a");
+  await publishNotification(scheduleReminderEnvelope("mgmt:snooze-defer:1", "2027-06-10T09:00:00.000Z"));
+  const notificationId = notificationIdFor("schedule:mgmt:snooze-defer:1");
+  cancelOtherDeliveries(notificationId);
+  snoozeProfileNotificationDelivery("profile-a", notificationId, 30, new Date("2027-06-10T09:00:00.000Z"));
+
+  const requests: Array<{ body: string }> = [];
+  const summary = await deliverPendingProfileNotifications({
+    at: new Date("2027-06-10T09:30:00.000Z"),
+    profileId: "profile-a",
+    fetchImpl: bodyCapturingFetch(requests),
+    clock: () => new Date("2027-06-10T09:30:00.000Z"),
+  });
+  assert.equal(summary.sent, 1);
+  const payload = JSON.parse(requests[0].body) as { notification: { body: string } };
+  assert.match(payload.notification.body, /相对：已逾期 30 分钟（稍后提醒）/);
+});
+
+test("retried delivery appends the 投递重试延迟 deferral reason", async () => {
+  clearQuietHours("profile-a");
+  await publishNotification(scheduleReminderEnvelope("mgmt:retry-defer:1", "2027-06-15T09:00:00.000Z"));
+  cancelOtherDeliveries(notificationIdFor("schedule:mgmt:retry-defer:1"));
+
+  const failed = await deliverPendingProfileNotifications({
+    at: new Date("2027-06-15T09:00:00.000Z"),
+    profileId: "profile-a",
+    fetchImpl: failingFetch,
+    clock: () => new Date("2027-06-15T09:00:00.000Z"),
+  });
+  assert.equal(failed.failed, 1);
+
+  const requests: Array<{ body: string }> = [];
+  const retried = await deliverPendingProfileNotifications({
+    at: new Date("2027-06-15T09:05:00.000Z"),
+    profileId: "profile-a",
+    fetchImpl: bodyCapturingFetch(requests),
+    clock: () => new Date("2027-06-15T09:05:00.000Z"),
+  });
+  assert.equal(retried.sent, 1);
+  const payload = JSON.parse(requests[0].body) as { notification: { body: string } };
+  assert.match(payload.notification.body, /相对：已逾期 5 分钟（投递重试延迟）/);
+});
+
+test("notify.pull re-renders quiet-deferred schedule reminders at pull time", async () => {
+  clearQuietHours("profile-a");
+  saveQuietHours("profile-a", "22:00", "07:00", "UTC");
+  try {
+    await publishNotification(scheduleReminderEnvelope("mgmt:pull-defer:1", "2027-06-20T23:00:00.000Z"));
+    const pulled = pullPending("profile-a", new Date("2027-06-21T08:00:00.000Z"));
+    const target = pulled.find((notice) => notice.dedupeKey === "schedule:mgmt:pull-defer:1");
+    assert.ok(target, "顺延中的提醒应可被拉取");
+    assert.match(target.body, /相对：已逾期 9 小时（勿扰时段顺延）/);
+  } finally {
+    clearQuietHours("profile-a");
+  }
+});
+
+test("renderDeliveredNotification falls back to the stored snapshot without a usable envelope", () => {
+  const snapshot = { title: "快照标题", body: "快照正文" };
+  assert.deepEqual(
+    renderDeliveredNotification({ profileId: "profile-a", ...snapshot, envelope: null }, new Date()),
+    snapshot,
+  );
+  assert.deepEqual(
+    renderDeliveredNotification({ profileId: "profile-a", ...snapshot, envelope: "{not json" }, new Date()),
+    snapshot,
+  );
 });

@@ -161,6 +161,12 @@ async function processDue(item: ScheduleItem, at: DateTime<true>): Promise<void>
           `).get(item.profileId, legacyDedupeKey)
         : undefined;
       if (!legacyNotification) {
+        // 渲染参考时间钉在计划触发时刻：tick 墙钟恒晚于 trigger（triggerAt > at 会被跳过），
+        // 准时提醒若按墙钟渲染必然落入"已逾期 1 分钟"分支；亚分钟抖动吸收后显示"现在"。
+        // 迟到超过 1 分钟（停机补发）保留墙钟，让相对时间如实反映逾期时长。
+        const referenceAt = at.toMillis() - timing.triggerAt.toMillis() <= 60_000
+          ? timing.triggerAt
+          : at;
         const notification = buildScheduleReminderNotification({
           item,
           occurrenceKey: key,
@@ -169,7 +175,7 @@ async function processDue(item: ScheduleItem, at: DateTime<true>): Promise<void>
           target: timing.target,
           reminderId: id,
           reminderMinutes: reminder.minutesBefore,
-          generatedAt: at.toISO(),
+          generatedAt: referenceAt.toISO(),
         });
         await publishNotification(notification, { publishProfile });
       }

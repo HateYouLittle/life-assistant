@@ -85,6 +85,8 @@ export interface ScheduleReminderPayload {
   priority?: "low" | "normal" | "high";
   allDay?: boolean;
   generatedAt?: string;
+  /** 投递时由 delivery-render 附加：本次推送晚于提醒触发时刻的原因（如勿扰时段顺延）。 */
+  deferralReason?: string;
 }
 
 export interface AutomationResultPayload {
@@ -319,6 +321,7 @@ function scheduleReminderBlocks(payload: ScheduleReminderPayload): RenderBlock[]
   } else {
     relative = `已逾期 ${Math.floor(-differenceMs / (24 * 60 * 60 * 1000))} 天`;
   }
+  if (payload.deferralReason) relative = `${relative}（${payload.deferralReason}）`;
   const timeLabel = payload.target === "deadline" ? "截止时间" : "发生时间";
   const blocks: RenderBlock[] = [
     { type: "line", text: firstLine },

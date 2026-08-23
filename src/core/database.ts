@@ -55,6 +55,7 @@ export function migrateDatabaseSchema(db: DatabaseSync): void {
       body TEXT NOT NULL,
       created_at TEXT NOT NULL,
       dedupe_key TEXT,
+      envelope TEXT,
       UNIQUE (profile_id, dedupe_key)
     );
     CREATE TABLE IF NOT EXISTS profile_notification_reads (
@@ -175,8 +176,8 @@ export function migrateDatabaseSchema(db: DatabaseSync): void {
     const versionRow = db.prepare("SELECT value FROM schema_meta WHERE key = 'version'").get() as { value?: string } | undefined;
     if (versionRow?.value !== undefined) {
       const existingVersion = Number(versionRow.value);
-      if (Number.isFinite(existingVersion) && existingVersion > 5) {
-        throw new Error(`database schema version ${versionRow.value} is newer than supported version 5`);
+      if (Number.isFinite(existingVersion) && existingVersion > 6) {
+        throw new Error(`database schema version ${versionRow.value} is newer than supported version 6`);
       }
     }
 
@@ -194,8 +195,10 @@ export function migrateDatabaseSchema(db: DatabaseSync): void {
     ensureColumn(db, "profile_notification_deliveries", "claimed_at", "TEXT");
     // v5：snooze/延迟投递生效点；NULL 表示不延迟。
     ensureColumn(db, "profile_notification_deliveries", "not_before", "TEXT");
+    // v6：结构化快照；投递时据此重渲染 schedule.reminder 的相对时间并附加顺延原因。
+    ensureColumn(db, "profile_notifications", "envelope", "TEXT");
 
-    db.prepare("INSERT OR REPLACE INTO schema_meta(key, value) VALUES('version', '5')").run();
+    db.prepare("INSERT OR REPLACE INTO schema_meta(key, value) VALUES('version', '6')").run();
     db.exec("COMMIT");
   } catch (error) {
     db.exec("ROLLBACK");

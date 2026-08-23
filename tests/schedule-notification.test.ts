@@ -212,6 +212,29 @@ test("relative schedule time handles zero and sub-minute boundaries", () => {
   }
 });
 
+test("deferral reason is appended to the relative line when present", () => {
+  const base = buildScheduleReminderNotification({
+    item: { ...item, type: "todo", title: "勿扰顺延", note: undefined },
+    occurrenceKey: "2026-08-10T01:30:00.000Z:occurrence:test",
+    occurrenceAt: "2026-08-10T01:30:00.000Z",
+    target: "occurrence",
+    reminderId: "test",
+    reminderMinutes: 0,
+    generatedAt: "2026-08-10T03:30:00.000Z",
+  });
+  const deferred = {
+    ...base,
+    payload: { ...base.payload, deferralReason: "勿扰时段顺延" },
+  };
+  const plain = renderNotification(deferred, "plain");
+  assert.match(plain.body, /相对：已逾期 2 小时（勿扰时段顺延）$/);
+  const markdown = renderNotification(deferred, "qq-markdown");
+  assert.match(markdown.body, /\*\*相对\*\*：已逾期 2 小时（勿扰时段顺延）$/);
+
+  // 未带原因的 envelope 渲染保持原样（发布时快照不受该字段影响）。
+  assert.doesNotMatch(renderNotification(base, "plain").body, /勿扰时段顺延/);
+});
+
 test("deadline reminders label the deadline and distinguish anniversary semantics", () => {
   const notification = buildScheduleReminderNotification({
     item: { ...item, type: "anniversary", title: "相识纪念日", note: undefined },

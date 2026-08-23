@@ -1356,6 +1356,34 @@ test("a due reminder stores the new semantic snapshot with Profile-scoped target
   `).get("profile-b", "semantic bridge reminder")?.count, 0);
 });
 
+test("准时提醒快照不受 tick 亚分钟抖动影响（渲染为现在而非逾期 1 分钟）", async () => {
+  // 动态"明天"：避免固定日期过期后 createSchedule 跳到下一年（日期炸弹）。
+  const tomorrowShanghai = DateTime.now().setZone("Asia/Shanghai").plus({ days: 1 }).startOf("day");
+  const schedule = createSchedule(requireProfileContext("profile-a"), {
+    title: "准时提醒不显示逾期",
+    calendar: "solar",
+    date: tomorrowShanghai.toFormat("yyyy-MM-dd"),
+    time: "09:00",
+    timezone: "Asia/Shanghai",
+    reminders: [{ minutesBefore: 0 }],
+  });
+  db.prepare("UPDATE schedules SET enabled = 0 WHERE NOT (profile_id = ? AND id = ?)")
+    .run("profile-a", schedule.id);
+
+  // tick 墙钟比计划触发时刻晚 5 秒（cron 回调的固有抖动）。
+  const triggerAt = tomorrowShanghai.plus({ hours: 9 }).toUTC().toJSDate();
+  await runDueSchedules(new Date(triggerAt.getTime() + 5_000));
+
+  const occurrenceKey = `${tomorrowShanghai.plus({ hours: 9 }).toUTC().toISO()}:occurrence:reminder-1`;
+  const row = db.prepare(`
+    SELECT body FROM profile_notifications
+    WHERE profile_id = ? AND dedupe_key = ?
+  `).get("profile-a", `schedule:profile-a:${schedule.id}:${occurrenceKey}`) as { body: string } | undefined;
+  assert.ok(row, "准时提醒应已落库");
+  assert.match(row.body, /相对：现在/);
+  assert.doesNotMatch(row.body, /已逾期/);
+});
+
 test("a notification insert failure does not consume the schedule occurrence", async () => {
   const schedule = createSchedule(requireProfileContext("profile-a"), {
     title: "retry-safe reminder",
@@ -1549,7 +1577,7 @@ test("schema v2 upgrades to a valid v4 delivery outbox", () => {
   migrateDatabaseSchema(legacy);
   const version = legacy.prepare("SELECT value FROM schema_meta WHERE key = 'version'").get() as { value: string };
   const columns = legacy.prepare("PRAGMA table_info(profile_notification_deliveries)").all() as Array<{ name: string }>;
-  assert.equal(version.value, "5");
+  assert.equal(version.value, "6");
   assert.equal(columns.some((column) => column.name === "claim_token"), true);
   assert.equal(columns.some((column) => column.name === "transport_failures"), true);
   assert.equal(columns.some((column) => column.name === "request_started_at"), true);

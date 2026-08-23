@@ -150,6 +150,8 @@ secret 只来自环境变量或权限受限的配置文件，不得打印到日�
 
 每 Profile 渲染通过 `publishGlobal` 的第 6 参 `renderForProfile(profileId, {title, body})` 回调实现：该回调只替换每个 Profile 的落库快照，suppressRetainedGlobal / legacy dedupe / delivery 创建逻辑一律不变；既有 5 参调用不受影响。通知快照在生成时按该 Profile 的 renderTarget 渲染并落库，之后不重渲染；因此 renderTarget 只影响配置变更之后新生成的通知，已落库的旧快照不会自动重渲染。
 
+唯一例外是 `schedule.reminder`（v6）：profile 通知发布时同步落库结构化 envelope（`profile_notifications.envelope` 列），投递/拉取时由 `core/delivery-render.ts` 按投递时刻重算"相对"行——避免勿扰顺延、snooze、重试补投时推送过期的相对时间；推送晚于提醒触发时刻时附加原因（勿扰时段顺延 / 稍后提醒 / 投递重试延迟）。亚分钟抖动有 60 秒容差（与 scheduler 的发布参考时间同口径），准时提醒即时投递仍显示"现在"。其余 kind 与无 envelope 的存量行保持"快照即投递"，原样输出。
+
 天气推断预警已信封化为 `weather.inferred_alert`（builder `inferredAlertNotification()`），经 `publishNotification`（publishGlobal 路径）按 Profile fan-out；identity 为 `inferred:<title>:<date>`，与 source 前缀组合成 dedupe key `weather:inferred:<title>:<date>`，与旧路径 dedupe 兼容（旧 legacy dedupe keys 保留）。plain 下 description 原样输出；markdown（qq/feishu/wechat 同集）下 label 块为 `**风险**` 加粗前缀。
 
 天气 Open-Meteo 兜底的 WMO 天气码映射表（`WMO: Record<number, string>`）已补齐 53/55/56/57/66/67/77/85/86 等缺失码（如 55 = 密集毛毛雨），映射后不再出现原始 `code N` 回退；未知码仍保留 `code N` 兜底。天气 provider：QWeather 首选、Open-Meteo 兜底。
@@ -180,4 +182,4 @@ secret 只来自环境变量或权限受限的配置文件，不得打印到日�
 
 ## 9. 演进原则
 
-迁移保持 additive，并保留旧数据读取兼容（当前 schema version 5：新增 `profile_settings`、`automations` 表与 deliveries 的 `not_before` 列）。新增模块不得直绑消息平台；新增私有数据必须带 Profile 所有权；新增公共 job 必须接受按配置 Profile 独立 materialize 的语义。automation 的 action 白名单是唯一扩展动态任务能力的入口，新增 action 必须复用模块 Provider 并保持无 LLM、确定性执行。
+迁移保持 additive，并保留旧数据读取兼容（当前 schema version 6：新增 `profile_settings`、`automations` 表、deliveries 的 `not_before` 列与 `profile_notifications.envelope` 列）。新增模块不得直绑消息平台；新增私有数据必须带 Profile 所有权；新增公共 job 必须接受按配置 Profile 独立 materialize 的语义。automation 的 action 白名单是唯一扩展动态任务能力的入口，新增 action 必须复用模块 Provider 并保持无 LLM、确定性执行。

@@ -22,6 +22,7 @@ type ProfilePublisher = (
   body: string,
   dedupeKey: string,
   legacyDedupeKeys?: readonly string[],
+  envelope?: NotificationEnvelope,
 ) => Promise<void>;
 
 export interface NotificationPublishers {
@@ -65,6 +66,7 @@ export async function publishNotification(
   }
   const profileId = notification.scope.profileId;
   const rendered = (publishers.renderer ?? renderNotification)(notification, resolveTargetForProfile(publishers, profileId));
+  // envelope 随快照一并落库：schedule.reminder 在投递时据此重算相对时间（delivery-render）。
   await (publishers.publishProfile ?? publishProfile)(
     profileId,
     notification.source,
@@ -72,5 +74,6 @@ export async function publishNotification(
     rendered.body,
     dedupeKey,
     legacyDedupeKeys,
+    notification,
   );
 }
