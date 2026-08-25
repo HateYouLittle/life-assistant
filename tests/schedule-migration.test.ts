@@ -128,11 +128,13 @@ test("schema v3 additively upgrades legacy schedules without touching protected 
 
   assert.equal(
     (legacy.prepare("SELECT value FROM schema_meta WHERE key = 'version'").get() as { value: string }).value,
-    "6",
+    "7",
   );
   assert.ok(columnNames(legacy, "schedules").includes("deadline_at"));
   assert.ok(columnNames(legacy, "schedules").includes("deadline_offset_minutes"));
-  // v5/v6 的 additive 新列：只允许在表尾追加，不得改动既有列。
+  assert.ok(columnNames(legacy, "schedules").includes("reminder_interval_minutes"));
+  assert.ok(columnNames(legacy, "schedules").includes("reminder_max_attempts"));
+  // v5/v6/v7 的 additive 新列：只允许在表尾追加，不得改动既有列。
   const additiveColumns: Record<string, string[]> = {
     profile_notification_deliveries: ["not_before"],
     profile_notifications: ["envelope"],
@@ -152,6 +154,8 @@ test("schema v3 additively upgrades legacy schedules without touching protected 
   const item = hydrateRow(row);
   assert.equal(item.deadlineAt, undefined);
   assert.equal(item.deadlineOffsetMinutes, undefined);
+  assert.equal(item.reminderIntervalMinutes, undefined);
+  assert.equal(item.reminderMaxAttempts, undefined);
   assert.equal(item.reminders[0].target, "occurrence");
   legacy.close();
 });

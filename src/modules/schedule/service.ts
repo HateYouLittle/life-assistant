@@ -285,7 +285,24 @@ function normalizeDeadline(
   return { deadlineAt: normalizedDeadlineAt, deadlineOffsetMinutes };
 }
 
-function normalizeInput(input: ScheduleInput): ScheduleInput & { type: ScheduleType; timezone: string; time: string; recurrence: RecurrenceRule; reminders: ReminderInput[]; allDay: boolean } {
+/** 强提醒参数归一化：两参数均未传 = 未开启；至少传一个即开启，缺省值补全（interval 120 / maxAttempts 3）。 */
+function normalizeStrongReminder(input: ScheduleInput): Pick<ScheduleItem, "reminderIntervalMinutes" | "reminderMaxAttempts"> {
+  const interval = input.intervalMinutes;
+  const maxAttempts = input.maxAttempts;
+  if (interval === undefined && maxAttempts === undefined) return {};
+  if (interval !== undefined && (!Number.isInteger(interval) || interval < 1 || interval > 10080)) {
+    throw new Error("intervalMinutes must be an integer between 1 and 10080");
+  }
+  if (maxAttempts !== undefined && (!Number.isInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 99)) {
+    throw new Error("maxAttempts must be an integer between 1 and 99");
+  }
+  return {
+    reminderIntervalMinutes: interval ?? 120,
+    reminderMaxAttempts: maxAttempts ?? 3,
+  };
+}
+
+function normalizeInput(input: ScheduleInput): ScheduleInput & { type: ScheduleType; timezone: string; time: string; recurrence: RecurrenceRule; reminders: ReminderInput[]; allDay: boolean; reminderIntervalMinutes?: number; reminderMaxAttempts?: number } {
   if (!input.title?.trim()) throw new Error("title is required");
   const type = input.type ?? "todo";
   const calendar = input.calendar ?? "solar";
@@ -306,6 +323,7 @@ function normalizeInput(input: ScheduleInput): ScheduleInput & { type: ScheduleT
   }
   const reminders = normalizeReminders(input.reminders);
   const deadline = normalizeDeadline(input, recurrence, timezone, time);
+  const strongReminder = normalizeStrongReminder(input);
   const { clearDeadline: _clearDeadline, ...persistentInput } = input;
   return {
     ...persistentInput,
@@ -317,6 +335,7 @@ function normalizeInput(input: ScheduleInput): ScheduleInput & { type: ScheduleT
     recurrence,
     reminders,
     ...deadline,
+    ...strongReminder,
     priority: input.priority ?? "normal",
     status: input.status ?? "active",
   };
@@ -757,6 +776,8 @@ function rowToItem(
     reminders,
     deadlineAt: row.deadline_at == null ? undefined : String(row.deadline_at),
     deadlineOffsetMinutes: finiteIntOrUndefined(row.deadline_offset_minutes, 0, 60 * 24 * 365),
+    reminderIntervalMinutes: finiteIntOrUndefined(row.reminder_interval_minutes, 1, 10080),
+    reminderMaxAttempts: finiteIntOrUndefined(row.reminder_max_attempts, 1, 99),
     enabled: Boolean(row.enabled),
     nextRunAt: row.next_run_at == null ? undefined : String(row.next_run_at),
     version: normalizeVersion(row.version),
@@ -793,8 +814,8 @@ function rowToItem(
 function insertSchedule(profile: ProfileContext, item: ScheduleItem): void {
   const db = getDatabase();
   db.prepare(`
-    INSERT INTO schedules(profile_id, id, type, title, note, priority, status, calendar, date, lunar_month, lunar_day, leap_month_policy, time, all_day, timezone, recurrence_json, reminders_json, deadline_at, deadline_offset_minutes, enabled, next_run_at, version, created_at, updated_at)
-    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO schedules(profile_id, id, type, title, note, priority, status, calendar, date, lunar_month, lunar_day, leap_month_policy, time, all_day, timezone, recurrence_json, reminders_json, deadline_at, deadline_offset_minutes, reminder_interval_minutes, reminder_max_attempts, enabled, next_run_at, version, created_at, updated_at)
+    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     profile.id,
     item.id,
@@ -815,6 +836,8 @@ function insertSchedule(profile: ProfileContext, item: ScheduleItem): void {
     JSON.stringify(item.reminders),
     item.deadlineAt ?? null,
     item.deadlineOffsetMinutes ?? null,
+    item.reminderIntervalMinutes ?? null,
+    item.reminderMaxAttempts ?? null,
     item.enabled ? 1 : 0,
     item.nextRunAt ?? null,
     item.version,
@@ -853,6 +876,8 @@ export function createSchedule(value: ProfileContext | string, input: ScheduleIn
     reminders: normalized.reminders,
     deadlineAt: normalized.deadlineAt,
     deadlineOffsetMinutes: normalized.deadlineOffsetMinutes,
+    reminderIntervalMinutes: normalized.reminderIntervalMinutes,
+    reminderMaxAttempts: normalized.reminderMaxAttempts,
     enabled: normalized.status !== "archived",
     version: 1,
     createdAt,
@@ -929,6 +954,8 @@ export function updateSchedule(value: ProfileContext | string, id: string, chang
     reminders: current.reminders,
     deadlineAt: current.deadlineAt,
     deadlineOffsetMinutes: current.deadlineOffsetMinutes,
+    intervalMinutes: current.reminderIntervalMinutes,
+    maxAttempts: current.reminderMaxAttempts,
     ...restChanges,
   };
   const normalized = normalizeInput(merged);
@@ -952,11 +979,11 @@ export function updateSchedule(value: ProfileContext | string, id: string, chang
   next.status = derivedStatus(next, next.nextRunAt, now);
   next.nextOccurrenceSolar = event?.toISO() ?? undefined;
   const result = getDatabase().prepare(`
-    UPDATE schedules SET type=?, title=?, note=?, priority=?, status=?, calendar=?, date=?, lunar_month=?, lunar_day=?, leap_month_policy=?, time=?, all_day=?, timezone=?, recurrence_json=?, reminders_json=?, deadline_at=?, deadline_offset_minutes=?, enabled=?, next_run_at=?, version=?, updated_at=?
+    UPDATE schedules SET type=?, title=?, note=?, priority=?, status=?, calendar=?, date=?, lunar_month=?, lunar_day=?, leap_month_policy=?, time=?, all_day=?, timezone=?, recurrence_json=?, reminders_json=?, deadline_at=?, deadline_offset_minutes=?, reminder_interval_minutes=?, reminder_max_attempts=?, enabled=?, next_run_at=?, version=?, updated_at=?
     WHERE profile_id=? AND id=? AND version IS ?
   `).run(
     next.type, next.title, next.note ?? null, next.priority, next.status, next.calendar, next.date ?? null, next.lunarMonth ?? null, next.lunarDay ?? null,
-    next.recurrence.leapMonthPolicy ?? null, next.time, next.allDay ? 1 : 0, next.timezone, JSON.stringify(next.recurrence), JSON.stringify(next.reminders), next.deadlineAt ?? null, next.deadlineOffsetMinutes ?? null, next.enabled ? 1 : 0,
+    next.recurrence.leapMonthPolicy ?? null, next.time, next.allDay ? 1 : 0, next.timezone, JSON.stringify(next.recurrence), JSON.stringify(next.reminders), next.deadlineAt ?? null, next.deadlineOffsetMinutes ?? null, next.reminderIntervalMinutes ?? null, next.reminderMaxAttempts ?? null, next.enabled ? 1 : 0,
     next.nextRunAt ?? null, next.version, next.updatedAt, profile.id, id, rawVersion,
   ) as { changes: number };
   if (!result.changes) throw new Error("schedule update conflict");
@@ -1075,10 +1102,23 @@ export function completeSchedule(value: ProfileContext | string, id: string, occ
   let occurrenceAt = occurrenceKey?.match(/^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z)(?::.*)?$/)?.[1];
   if (!occurrenceAt && item.nextRunAt) {
     const triggerAt = fromUtc(item.nextRunAt);
-    occurrenceAt = item.reminders
+    const derived = item.reminders
       .map((reminder) => nextReminderTiming(item, reminder, triggerAt, true))
-      .find((timing) => timing?.triggerAt.equals(triggerAt))
-      ?.occurrenceAt.toISO() ?? undefined;
+      .find((timing) => timing?.triggerAt.equals(triggerAt));
+    if (derived) {
+      occurrenceAt = derived.occurrenceAt.toISO();
+    } else {
+      // 强提醒重发期间 next_run_at 是重发时刻而非真实触发时刻：回退到最近一条
+      // 已发布的正式提醒 occurrence（与 scheduler 重发目标同一口径），确保
+      // completed 标记能命中 occurrenceCompleted 的前缀匹配而终止重发。
+      const notified = db.prepare(`
+        SELECT occurrence_at FROM schedule_occurrences
+        WHERE profile_id = ? AND schedule_id = ? AND status = 'notified'
+          AND occurrence_at <= ?
+        ORDER BY occurrence_at DESC LIMIT 1
+      `).get(profile.id, id, item.nextRunAt) as { occurrence_at: string } | undefined;
+      occurrenceAt = notified?.occurrence_at;
+    }
   }
   occurrenceAt ??= item.nextRunAt ?? nowIso();
   db.prepare("INSERT OR REPLACE INTO schedule_occurrences(profile_id, schedule_id, occurrence_key, occurrence_at, status) VALUES(?, ?, ?, ?, 'completed')").run(profile.id, id, occurrenceAt, occurrenceAt);
