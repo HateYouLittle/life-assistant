@@ -49,6 +49,8 @@ export interface ScheduleInput {
   intervalMinutes?: number;
   /** 最多重提醒轮数（1-99）；与 intervalMinutes 至少传其一即开启强提醒，缺省 3 */
   maxAttempts?: number;
+  /** update 专用：传 true 清空强提醒两列（intervalMinutes/maxAttempts 同时被忽略） */
+  clearStrongReminder?: boolean;
 }
 
 export interface ScheduleItem {

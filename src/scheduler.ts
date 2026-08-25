@@ -6,7 +6,7 @@ import { DateTime } from "luxon";
 import { getModules } from "./modules/index.js";
 import { getDatabase } from "./core/database.js";
 import { publishNotification } from "./core/notification-publisher.js";
-import { deliverPendingProfileNotifications, notify, publishProfile, type DeliverySummary } from "./core/notifier.js";
+import { cancelProfileNotificationDelivery, deliverPendingProfileNotifications, notify, publishProfile, type DeliverySummary } from "./core/notifier.js";
 import { notifyModule } from "./core/notify-module.js";
 import { ok, type AssistantModule } from "./core/registry.js";
 import { buildScheduleReminderNotification } from "./modules/schedule/notification.js";
@@ -65,8 +65,39 @@ function occurrenceCompleted(item: ScheduleItem, occurrenceAt: string): boolean 
 }
 
 /** LIKE 通配符转义（配合 ESCAPE '\\'），occurrence_key 中的用户可控片段（reminder id）安全匹配。 */
-function escapeLike(value: string): string {
+export function escapeLike(value: string): string {
   return value.replace(/[\\%_]/g, (char) => `\\${char}`);
+}
+
+/**
+ * P2-5：发布提醒后落 schedule_occurrences 行。publishNotification 是 await 点，期间
+ * deleteSchedule 可能已执行完毕（外键 PRAGMA foreign_keys=ON 使 INSERT 抛 FK 错误）。
+ * 此时取消刚发布的投递（复用 cancelProfileNotificationDelivery）并继续处理其余 due，
+ * 不中断整个 tick；日程仍存在时的其他落行失败照常抛出。
+ */
+function recordNotifiedOccurrence(item: ScheduleItem, occurrenceKey: string, occurrenceAt: string): void {
+  const db = getDatabase();
+  try {
+    db.prepare("INSERT OR IGNORE INTO schedule_occurrences(profile_id, schedule_id, occurrence_key, occurrence_at, status) VALUES(?, ?, ?, ?, 'notified')")
+      .run(item.profileId, item.id, occurrenceKey, occurrenceAt);
+  } catch (error) {
+    const stillExists = db.prepare("SELECT 1 FROM schedules WHERE profile_id = ? AND id = ?").get(item.profileId, item.id);
+    if (stillExists) throw error;
+    try {
+      const notice = db.prepare(`
+        SELECT id FROM profile_notifications
+        WHERE profile_id = ? AND dedupe_key = ?
+      `).get(item.profileId, `schedule:${item.profileId}:${item.id}:${occurrenceKey}`) as { id: number } | undefined;
+      if (notice) {
+        // 先取消未投递投递（有 route 时），再整行删除（级联 deliveries/reads），
+        // 与 deleteSchedule 的 S1.2 清理口径一致：删除后不残留任何通知。
+        cancelProfileNotificationDelivery(item.profileId, notice.id);
+        db.prepare("DELETE FROM profile_notifications WHERE profile_id = ? AND id = ?").run(item.profileId, notice.id);
+      }
+    } catch (cleanupError) {
+      console.warn("[schedule] could not clean up notification published for concurrently deleted schedule:", cleanupError);
+    }
+  }
 }
 
 function calculateNextIncompleteRun(
@@ -193,8 +224,7 @@ async function processDue(item: ScheduleItem, at: DateTime<true>): Promise<void>
               generatedAt: at.toISO(),
             });
             await publishNotification(notification, { publishProfile });
-            db.prepare("INSERT OR IGNORE INTO schedule_occurrences(profile_id, schedule_id, occurrence_key, occurrence_at, status) VALUES(?, ?, ?, ?, 'notified')")
-              .run(item.profileId, item.id, resendKey, occurrenceIso);
+            recordNotifiedOccurrence(item, resendKey, occurrenceIso);
           }
           if (attemptN < item.reminderMaxAttempts) {
             resendNextAt = at.plus({ minutes: item.reminderIntervalMinutes }) as DateTime<true>;
@@ -247,8 +277,7 @@ async function processDue(item: ScheduleItem, at: DateTime<true>): Promise<void>
         });
         await publishNotification(notification, { publishProfile });
       }
-      db.prepare("INSERT OR IGNORE INTO schedule_occurrences(profile_id, schedule_id, occurrence_key, occurrence_at, status) VALUES(?, ?, ?, ?, 'notified')")
-        .run(item.profileId, item.id, key, occurrenceIso);
+      recordNotifiedOccurrence(item, key, occurrenceIso);
       // 正式提醒发布后：开启强提醒则该 occurrence 保持 active，安排首轮重发。
       if (formalId !== undefined && id === formalId
         && item.reminderIntervalMinutes !== undefined && item.reminderMaxAttempts !== undefined) {

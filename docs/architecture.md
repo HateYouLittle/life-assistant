@@ -182,4 +182,4 @@ secret 只来自环境变量或权限受限的配置文件，不得打印到日�
 
 ## 9. 演进原则
 
-迁移保持 additive，并保留旧数据读取兼容（当前 schema version 7：新增 `profile_settings`、`automations` 表、deliveries 的 `not_before` 列、`profile_notifications.envelope` 列与 `schedules` 的 `reminder_interval_minutes`/`reminder_max_attempts` 列）。新增模块不得直绑消息平台；新增私有数据必须带 Profile 所有权；新增公共 job 必须接受按配置 Profile 独立 materialize 的语义。automation 的 action 白名单是唯一扩展动态任务能力的入口，新增 action 必须复用模块 Provider 并保持无 LLM、确定性执行。
+迁移保持 additive，并保留旧数据读取兼容（当前 schema version 7：新增 `profile_settings`、`automations` 表、deliveries 的 `not_before` 列、`profile_notifications.envelope` 列与 `schedules` 的 `reminder_interval_minutes`/`reminder_max_attempts` 列；两列为强提醒重发配置，`NULL` = 未开启，可经 `schedule.update` 的 `clearStrongReminder: true` 清空）。新增模块不得直绑消息平台；新增私有数据必须带 Profile 所有权；新增公共 job 必须接受按配置 Profile 独立 materialize 的语义。automation 的 action 白名单是唯一扩展动态任务能力的入口，新增 action 必须复用模块 Provider 并保持无 LLM、确定性执行。

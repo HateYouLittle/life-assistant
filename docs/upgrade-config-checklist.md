@@ -109,7 +109,7 @@ console.log('deliveries:', db.prepare('SELECT status, COUNT(*) c FROM profile_no
 EOF
 ```
 
-- `schema version` 应为 `7`（v6 起：`profile_notifications` 增加可空的 `envelope` 列，用于日程提醒投递时重渲染相对时间；v7 起：`schedules` 增加可空的 `reminder_interval_minutes`/`reminder_max_attempts` 列，用于待办强提醒重发）。
+- `schema version` 应为 `7`（v6 起：`profile_notifications` 增加可空的 `envelope` 列，用于日程提醒投递时重渲染相对时间；v7 起：`schedules` 增加可空的 `reminder_interval_minutes`/`reminder_max_attempts` 列，用于待办强提醒重发；两列置 `NULL` = 未开启强提醒，`schedule.update` 的 `clearStrongReminder: true` 会将其清空）。
 - 若旧库中有历史 `profile_notifications`/deliveries，升级会自动迁移，不应报外键错误。
 - 若数据库版本 > 7，说明是未来版本库被旧程序打开，应立即停止并用对应新版本程序处理。
 

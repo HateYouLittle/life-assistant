@@ -232,6 +232,11 @@ function normalizeReminders(value: ReminderInput[] | undefined): ReminderInput[]
     if (!Number.isInteger(reminder.minutesBefore) || reminder.minutesBefore < 0 || reminder.minutesBefore > 60 * 24 * 365) {
       throw new Error("reminder minutesBefore must be an integer between 0 and 525600");
     }
+    // P2-6：':' 是 occurrence_key 的段分隔符（:occurrence: / :deadline: / :attempt-N）。
+    // 允许它进入提醒 id 会与 attempt 键撞车（如 due:attempt-1）被 dedupe 吞掉，写入侧直接拒绝。
+    if (reminder.id !== undefined && reminder.id.includes(":")) {
+      throw new Error("reminder id must not contain ':' (reserved for occurrence key separators)");
+    }
   }
   const normalized = reminders.map((reminder, index) => ({
     id: reminder.id ?? `reminder-${index + 1}`,
@@ -285,11 +290,14 @@ function normalizeDeadline(
   return { deadlineAt: normalizedDeadlineAt, deadlineOffsetMinutes };
 }
 
-/** 强提醒参数归一化：两参数均未传 = 未开启；至少传一个即开启，缺省值补全（interval 120 / maxAttempts 3）。 */
+/** 强提醒参数归一化：clearStrongReminder 优先清空；两参数均未传 = 未开启；至少传一个即开启，缺省值补全（interval 120 / maxAttempts 3）。 */
 function normalizeStrongReminder(input: ScheduleInput): Pick<ScheduleItem, "reminderIntervalMinutes" | "reminderMaxAttempts"> {
+  // 显式返回 undefined 键（而非 {}）：update 的 merged 输入总是带当前值，
+  // 只有显式 undefined 才能覆盖 {...current, ...normalized} 中残留的旧列值（clear 语义）。
+  if (input.clearStrongReminder) return { reminderIntervalMinutes: undefined, reminderMaxAttempts: undefined };
   const interval = input.intervalMinutes;
   const maxAttempts = input.maxAttempts;
-  if (interval === undefined && maxAttempts === undefined) return {};
+  if (interval === undefined && maxAttempts === undefined) return { reminderIntervalMinutes: undefined, reminderMaxAttempts: undefined };
   if (interval !== undefined && (!Number.isInteger(interval) || interval < 1 || interval > 10080)) {
     throw new Error("intervalMinutes must be an integer between 1 and 10080");
   }
@@ -300,6 +308,13 @@ function normalizeStrongReminder(input: ScheduleInput): Pick<ScheduleItem, "remi
     reminderIntervalMinutes: interval ?? 120,
     reminderMaxAttempts: maxAttempts ?? 3,
   };
+}
+
+/** P2-4：recurrence 触发间隔（分钟）；仅 daily/weekly 可廉价确定（monthly/yearly/workday/holiday 长度不定）。 */
+function recurrenceIntervalMinutes(recurrence: RecurrenceRule): number | undefined {
+  if (recurrence.frequency === "daily") return 1440 * recurrence.interval;
+  if (recurrence.frequency === "weekly") return 7 * 1440 * recurrence.interval;
+  return undefined;
 }
 
 function normalizeInput(input: ScheduleInput): ScheduleInput & { type: ScheduleType; timezone: string; time: string; recurrence: RecurrenceRule; reminders: ReminderInput[]; allDay: boolean; reminderIntervalMinutes?: number; reminderMaxAttempts?: number } {
@@ -324,7 +339,26 @@ function normalizeInput(input: ScheduleInput): ScheduleInput & { type: ScheduleT
   const reminders = normalizeReminders(input.reminders);
   const deadline = normalizeDeadline(input, recurrence, timezone, time);
   const strongReminder = normalizeStrongReminder(input);
-  const { clearDeadline: _clearDeadline, ...persistentInput } = input;
+  // P3-3：强提醒依赖 occurrence 正式提醒（target=occurrence 且 minutesBefore=0）驱动重发；
+  // 缺失时明确报错而非静默不生效（仅 deadline 提醒/仅提前提醒的配置直接拒绝）。
+  if (strongReminder.reminderIntervalMinutes !== undefined
+    && !reminders.some((reminder) => (reminder.target ?? "occurrence") === "occurrence" && reminder.minutesBefore === 0)) {
+    throw new Error("强提醒需要一条 occurrence 正式提醒（target=occurrence 且 minutesBefore=0）");
+  }
+  // P2-4：重发间隔 ≥ recurrence 触发间隔时，下一 occurrence 恒先到并接管重发（attempt 永不触发）。
+  // recurrence 间隔仅在可廉价确定的频率（daily/weekly）给出可检测警告；其余频率由文档约束。
+  const recurrenceGapMinutes = strongReminder.reminderIntervalMinutes !== undefined
+    ? recurrenceIntervalMinutes(recurrence)
+    : undefined;
+  if (recurrenceGapMinutes !== undefined
+    && strongReminder.reminderIntervalMinutes !== undefined
+    && strongReminder.reminderIntervalMinutes >= recurrenceGapMinutes) {
+    console.warn(
+      `[schedule] strong reminder intervalMinutes=${strongReminder.reminderIntervalMinutes} ` +
+        `>= recurrence interval ${recurrenceGapMinutes}min: resends will be superseded by the next occurrence`,
+    );
+  }
+  const { clearDeadline: _clearDeadline, clearStrongReminder: _clearStrongReminder, ...persistentInput } = input;
   return {
     ...persistentInput,
     type,
@@ -899,13 +933,13 @@ export function createSchedule(value: ProfileContext | string, input: ScheduleIn
 export function listSchedules(value: ProfileContext | string, options: ScheduleListOptions = {}): ScheduleItem[] {
   const profile = context(value);
   const clauses = ["profile_id = ?"];
-  const values: unknown[] = [profile.id];
+  const values: string[] = [profile.id];
   if (options.type) { clauses.push("type = ?"); values.push(options.type); }
   if (options.status) { clauses.push("status = ?"); values.push(options.status); }
   if (options.from) { clauses.push("COALESCE(next_run_at, '9999-12-31T23:59:59.999Z') >= ?"); values.push(options.from); }
   if (options.to) { clauses.push("COALESCE(next_run_at, '0000-01-01T00:00:00.000Z') <= ?"); values.push(options.to); }
   const limit = Math.min(Math.max(options.upcoming ?? 100, 1), 500);
-  const rows = getDatabase().prepare(`SELECT * FROM schedules WHERE ${clauses.join(" AND ")} ORDER BY COALESCE(next_run_at, '9999-12-31T23:59:59.999Z'), created_at LIMIT ${limit}`).all(...values as any[]) as Record<string, unknown>[];
+  const rows = getDatabase().prepare(`SELECT * FROM schedules WHERE ${clauses.join(" AND ")} ORDER BY COALESCE(next_run_at, '9999-12-31T23:59:59.999Z'), created_at LIMIT ${limit}`).all(...values) as Record<string, unknown>[];
   return rows.map((row) => rowToItem(row));
 }
 
@@ -1064,7 +1098,24 @@ export function reconcileHolidaySchedules(at = new Date()): HolidayScheduleRecon
     if (!HOLIDAY_AWARE_FREQUENCIES.includes(item.recurrence.frequency)) continue;
     summary.scanned += 1;
     const event = findOccurrence(item, now, true);
-    const nextRunAt = calculateInitialNextRun(item, event, now)?.toISO() ?? null;
+    const recomputed = calculateInitialNextRun(item, event, now)?.toISO() ?? null;
+    // P2-2：强提醒重发窗口内（interval/maxAttempts 非空、当前 occurrence 未 completed），
+    // next_run_at 是重发时刻而非真实触发时刻；reconcile 不得重算到下一 occurrence 触发
+    // 而丢弃剩余 attempts，保留 min(当前重发下一时刻, 下一 occurrence 触发) 与 scheduler 同口径。
+    let nextRunAt = recomputed;
+    if (item.reminderIntervalMinutes !== undefined && item.reminderMaxAttempts !== undefined && item.nextRunAt !== undefined) {
+      const currentOccurrence = db.prepare(`
+        SELECT occurrence_at FROM schedule_occurrences
+        WHERE profile_id = ? AND schedule_id = ? AND status = 'notified'
+          AND occurrence_at <= ?
+        ORDER BY occurrence_at DESC LIMIT 1
+      `).get(item.profileId, item.id, item.nextRunAt) as { occurrence_at: string } | undefined;
+      if (currentOccurrence
+        && !isScheduleOccurrenceCompleted(item.profileId, item.id, currentOccurrence.occurrence_at)
+        && (recomputed === null || Date.parse(item.nextRunAt) < Date.parse(recomputed))) {
+        nextRunAt = item.nextRunAt;
+      }
+    }
     // T4：真正耗尽（until/count）→ completed 终态；仅数据缺失 → 保持 active 等待复活；
     // archived 等其他状态不被覆盖。status 与 enabled/next_run_at 一样是派生状态，重算不推进 version。
     const exhausted = nextRunAt === null
@@ -1101,23 +1152,31 @@ export function completeSchedule(value: ProfileContext | string, id: string, occ
   const rawVersion = rawRow.version as number | null;
   let occurrenceAt = occurrenceKey?.match(/^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z)(?::.*)?$/)?.[1];
   if (!occurrenceAt && item.nextRunAt) {
-    const triggerAt = fromUtc(item.nextRunAt);
-    const derived = item.reminders
-      .map((reminder) => nextReminderTiming(item, reminder, triggerAt, true))
-      .find((timing) => timing?.triggerAt.equals(triggerAt));
-    if (derived) {
-      occurrenceAt = derived.occurrenceAt.toISO();
-    } else {
-      // 强提醒重发期间 next_run_at 是重发时刻而非真实触发时刻：回退到最近一条
-      // 已发布的正式提醒 occurrence（与 scheduler 重发目标同一口径），确保
-      // completed 标记能命中 occurrenceCompleted 的前缀匹配而终止重发。
-      const notified = db.prepare(`
-        SELECT occurrence_at FROM schedule_occurrences
-        WHERE profile_id = ? AND schedule_id = ? AND status = 'notified'
-          AND occurrence_at <= ?
-        ORDER BY occurrence_at DESC LIMIT 1
-      `).get(profile.id, id, item.nextRunAt) as { occurrence_at: string } | undefined;
+    // P1-1：强提醒重发窗口内 next_run_at 是重发时刻 R 而非真实触发时刻，derived 的
+    // 「下一提醒触发」可能恰好等于 R 却指向下一 occurrence（如 daily + intervalMinutes=240
+    // + minutesBefore=960 在 k=2 时命中），会误把未来 occurrence 标 completed、当前重发
+    // 停不下来且未来提醒被 occurrenceCompleted 静默跳过。重发窗口（强提醒开启）直接以
+    // 最近一条已发布提醒的 occurrence 为「当前进行中的 occurrence」；普通提前提醒时刻的
+    // 完成语义（无强提醒）仍走 derived 路径，保持既有行为。
+    const notified = db.prepare(`
+      SELECT occurrence_at FROM schedule_occurrences
+      WHERE profile_id = ? AND schedule_id = ? AND status = 'notified'
+        AND occurrence_at <= ?
+      ORDER BY occurrence_at DESC LIMIT 1
+    `).get(profile.id, id, item.nextRunAt) as { occurrence_at: string } | undefined;
+    if (item.reminderIntervalMinutes !== undefined && item.reminderMaxAttempts !== undefined) {
       occurrenceAt = notified?.occurrence_at;
+    }
+    if (!occurrenceAt) {
+      const triggerAt = fromUtc(item.nextRunAt);
+      const derived = item.reminders
+        .map((reminder) => nextReminderTiming(item, reminder, triggerAt, true))
+        .find((timing) => timing?.triggerAt.equals(triggerAt));
+      if (derived) {
+        occurrenceAt = derived.occurrenceAt.toISO();
+      } else {
+        occurrenceAt = notified?.occurrence_at;
+      }
     }
   }
   occurrenceAt ??= item.nextRunAt ?? nowIso();
@@ -1139,14 +1198,20 @@ export function completeSchedule(value: ProfileContext | string, id: string, occ
   }
   const desiredEnabled = desiredStatus === "active" && nextRunAt !== null ? 1 : 0;
   const updatedAt = nowIso();
+  // P2-1：完成是内容级变更，必须递增 version 参与乐观锁。scheduler 在发布期间持旧版本
+  // 快照（publishNotification 是 await 点），完成后其 UPDATE ... WHERE version IS ? 不再
+  // 命中，避免把 next_run_at 覆盖回重发时刻导致删除/完成后再收提醒。写回用归一化版本，
+  // WHERE 用原始列值（与 scheduler 同一口径，脏行 version=0/NULL 一并自愈）。
+  const nextVersion = normalizeVersion(rawVersion) + 1;
   const result = db.prepare(`
-    UPDATE schedules SET next_run_at = ?, enabled = ?, status = ?, updated_at = ?
+    UPDATE schedules SET next_run_at = ?, enabled = ?, status = ?, version = ?, updated_at = ?
     WHERE profile_id = ? AND id = ? AND version IS ?
-  `).run(nextRunAt, desiredEnabled, desiredStatus, updatedAt, profile.id, id, rawVersion) as { changes: number };
+  `).run(nextRunAt, desiredEnabled, desiredStatus, nextVersion, updatedAt, profile.id, id, rawVersion) as { changes: number };
   if (result.changes !== 1) throw new Error("schedule update conflict");
   item.nextRunAt = nextRunAt ?? undefined;
   item.enabled = desiredEnabled === 1;
   item.status = desiredStatus;
+  item.version = nextVersion;
   item.updatedAt = updatedAt;
   return item;
 }
