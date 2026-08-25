@@ -208,6 +208,9 @@ async function processDue(item: ScheduleItem, at: DateTime<true>): Promise<void>
           WHERE profile_id = ? AND schedule_id = ?
             AND occurrence_key LIKE ? ESCAPE '\\'
         `).get(item.profileId, item.id, `${escapeLike(occurrenceIso)}:occurrence:${escapeLike(formalId)}:attempt-%`) as { n: number }).n;
+        // P3-7：attemptsDone 按 COUNT(attempt-%) 统计。正常路径 attempt 行只会顺序插入
+        // （发布前查 exists、发布后落行），计数不会错位；仅当 DB 被外部手工增删行时才
+        // 可能进入空转窗口（计数虚高跳过本轮或虚低补发），属外部干预，不做额外防御。
         if (attemptsDone < item.reminderMaxAttempts) {
           const attemptN = attemptsDone + 1;
           const resendKey = `${occurrenceIso}:occurrence:${formalId}:attempt-${attemptN}`;
@@ -225,6 +228,8 @@ async function processDue(item: ScheduleItem, at: DateTime<true>): Promise<void>
               reminderId: formalId,
               reminderMinutes: 0,
               generatedAt: at.toISO(),
+              // P3-5：重发轮次随通知下发，标题标注（第 N 次提醒，共 M 次）。
+              attemptN,
             });
             await publishNotification(notification, { publishProfile });
             recordNotifiedOccurrence(item, resendKey, occurrenceIso);

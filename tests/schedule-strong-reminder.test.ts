@@ -888,3 +888,234 @@ test("MCP update schema exposes clearStrongReminder", () => {
   assert.equal(updateShape.clearStrongReminder.parse(true), true);
   assert.equal(updateShape.clearStrongReminder.safeParse("yes").success, false);
 });
+
+test("P2-7: non-timeline update inside the resend window keeps the resend schedule and remaining attempts", async () => {
+  db.prepare("UPDATE schedules SET enabled = 0").run();
+  const item = createSchedule(profile, {
+    title: "p2-7 rename during resend",
+    calendar: "solar",
+    date: "2099-05-15",
+    time: "09:00",
+    timezone: "Asia/Shanghai",
+    intervalMinutes: 60,
+    maxAttempts: 3,
+  });
+  await runDueSchedules(new Date("2099-05-15T01:00:00.000Z")); // 正式提醒
+  await runDueSchedules(new Date("2099-05-15T02:00:00.000Z")); // attempt-1 → next_run_at = 03:00
+  assert.equal(scheduleRow(item.id).next_run_at, "2099-05-15T03:00:00.000Z");
+
+  // 重发窗口内仅改 title：不重算到下一 occurrence，next_run_at 保持重发时刻 03:00，
+  // 剩余 attempts 不丢（还原 P2-7 保留分支 → 下面 next_run_at/attempt-2 断言失败）。
+  const renamed = updateSchedule(profile, item.id, { title: "p2-7 renamed" }, new Date("2099-05-15T02:05:00.000Z"));
+  assert.equal(renamed.title, "p2-7 renamed");
+  assert.equal(scheduleRow(item.id).next_run_at, "2099-05-15T03:00:00.000Z");
+
+  // 下一轮 attempt-2 照常触发。
+  await runDueSchedules(new Date("2099-05-15T03:00:00.000Z"));
+  assert.equal(occurrenceKeys(item.id).some((key) => key.includes("attempt-2")), true);
+});
+
+test("P2-7: timeline-affecting update inside the resend window recomputes next_run_at (unchanged behavior)", async () => {
+  db.prepare("UPDATE schedules SET enabled = 0").run();
+  const item = createSchedule(profile, {
+    title: "p2-7 timeline change",
+    calendar: "solar",
+    date: "2099-05-16",
+    time: "09:00",
+    timezone: "Asia/Shanghai",
+    recurrence: "daily",
+    intervalMinutes: 60,
+    maxAttempts: 3,
+  });
+  await runDueSchedules(new Date("2099-05-16T01:00:00.000Z")); // 正式提醒
+  await runDueSchedules(new Date("2099-05-16T02:00:00.000Z")); // attempt-1 → next_run_at = 03:00
+  assert.equal(scheduleRow(item.id).next_run_at, "2099-05-16T03:00:00.000Z");
+
+  // 改 reminders（时间线字段）→ 照常重算，不再保留 03:00（与现状一致）。
+  updateSchedule(profile, item.id, {
+    reminders: [{ id: "early", minutesBefore: 30 }, { id: "due", minutesBefore: 0 }],
+  }, new Date("2099-05-16T02:05:00.000Z"));
+  assert.notEqual(scheduleRow(item.id).next_run_at, "2099-05-16T03:00:00.000Z");
+});
+
+test("P2-7: lunar date change inside the resend window recomputes next_run_at (title-only keeps it)", async () => {
+  db.prepare("UPDATE schedules SET enabled = 0").run();
+  // 农历 5/15 → 公历 2099-07-03（09:00 Asia/Shanghai = 01:00Z）；at 钉住创建时钟，
+  // 让首个 occurrence 落在 2099 而非 2098，与其余 P2-7 用例同一时间线。
+  const item = createSchedule(profile, {
+    title: "p2-7 lunar change",
+    calendar: "lunar",
+    lunarMonth: 5,
+    lunarDay: 15,
+    time: "09:00",
+    timezone: "Asia/Shanghai",
+    recurrence: { frequency: "yearly" },
+    intervalMinutes: 60,
+    maxAttempts: 3,
+  }, new Date("2099-07-01T00:00:00.000Z"));
+  await runDueSchedules(new Date("2099-07-03T01:00:00.000Z")); // 正式提醒
+  await runDueSchedules(new Date("2099-07-03T02:00:00.000Z")); // attempt-1 → next_run_at = 03:00
+  assert.equal(scheduleRow(item.id).next_run_at, "2099-07-03T03:00:00.000Z");
+
+  // 对照：重发窗口内只改 title → 保留重发时刻 03:00。
+  updateSchedule(profile, item.id, { title: "p2-7 lunar renamed" }, new Date("2099-07-03T02:05:00.000Z"));
+  assert.equal(scheduleRow(item.id).next_run_at, "2099-07-03T03:00:00.000Z");
+
+  // 改 lunarMonth（时间线字段）→ 按新时间线重算：农历 6/15 → 公历 2099-08-01，
+  // 不再保留旧重发时刻 03:00（还原 timelineKeys 缺 lunarMonth → 保留 03:00，下面断言失败）。
+  const lunarChanged = updateSchedule(profile, item.id, { lunarMonth: 6 }, new Date("2099-07-03T02:05:00.000Z"));
+  assert.equal(lunarChanged.lunarMonth, 6);
+  assert.equal(scheduleRow(item.id).next_run_at, "2099-08-01T01:00:00.000Z");
+  assert.notEqual(scheduleRow(item.id).next_run_at, "2099-07-03T03:00:00.000Z");
+});
+
+test("P2-7: update outside the resend window recomputes as before", async () => {
+  db.prepare("UPDATE schedules SET enabled = 0").run();
+  const item = createSchedule(profile, {
+    title: "p2-7 outside window",
+    calendar: "solar",
+    date: "2099-05-18",
+    time: "09:00",
+    timezone: "Asia/Shanghai",
+    recurrence: "daily",
+    intervalMinutes: 60,
+    maxAttempts: 3,
+  });
+  // 正式提醒尚未发布：next_run_at = 发生时刻 05-18T01:00，不在重发窗口。
+  assert.equal(item.nextRunAt, "2099-05-18T01:00:00.000Z");
+  const renamed = updateSchedule(profile, item.id, { title: "renamed-outside" }, new Date("2099-05-17T00:00:00.000Z"));
+  // 无 notified occurrence → 保留分支不命中，照常重算到下一 occurrence 触发。
+  assert.equal(renamed.nextRunAt, "2099-05-18T01:00:00.000Z");
+});
+
+test("P2-7: clearStrongReminder inside the resend window recomputes to the real trigger and stops resends", async () => {
+  db.prepare("UPDATE schedules SET enabled = 0").run();
+  const item = createSchedule(profile, {
+    title: "p2-7 clear in window",
+    calendar: "solar",
+    date: "2099-05-19",
+    time: "09:00",
+    timezone: "Asia/Shanghai",
+    recurrence: "daily",
+    intervalMinutes: 60,
+    maxAttempts: 3,
+  });
+  await runDueSchedules(new Date("2099-05-19T01:00:00.000Z")); // 正式提醒
+  await runDueSchedules(new Date("2099-05-19T02:00:00.000Z")); // attempt-1 → next_run_at = 03:00
+  assert.equal(scheduleRow(item.id).next_run_at, "2099-05-19T03:00:00.000Z");
+
+  // 关闭强提醒：正常重算，next_run_at 回到真实触发语义（下一 occurrence 正式提醒）。
+  const cleared = updateSchedule(profile, item.id, { clearStrongReminder: true }, new Date("2099-05-19T02:05:00.000Z"));
+  assert.equal(cleared.reminderIntervalMinutes, undefined);
+  assert.equal(cleared.reminderMaxAttempts, undefined);
+  assert.equal(scheduleRow(item.id).next_run_at, "2099-05-20T01:00:00.000Z");
+
+  // 不再重发 attempt-2；下一 occurrence 正式提醒照常。
+  await runDueSchedules(new Date("2099-05-19T03:00:00.000Z"));
+  assert.equal(occurrenceKeys(item.id).some((key) => key.includes("attempt-2")), false);
+  await runDueSchedules(new Date("2099-05-20T01:00:00.000Z"));
+  assert.equal(occurrenceKeys(item.id).includes("2099-05-20T01:00:00.000Z:occurrence:reminder-1"), true);
+});
+
+test("P2-8: completeSchedule conflict rolls back the completed row (error matches outcome, retry converges)", async () => {
+  db.prepare("UPDATE schedules SET enabled = 0").run();
+  const item = createSchedule(profile, {
+    title: "p2-8 conflict rollback",
+    calendar: "solar",
+    date: "2099-05-21",
+    time: "09:00",
+    timezone: "Asia/Shanghai",
+    // daily + count:1：走 recurring 分支的版本守卫 UPDATE（once 分支经 updateSchedule
+    // 会重读版本，冲突路径不经过 completeSchedule 自身的守卫）。
+    recurrence: { frequency: "daily", count: 1 },
+    intervalMinutes: 60,
+    maxAttempts: 3,
+  });
+  await runDueSchedules(new Date("2099-05-21T01:00:00.000Z")); // 正式提醒
+  await runDueSchedules(new Date("2099-05-21T02:00:00.000Z")); // attempt-1
+  assert.equal((scheduleRow(item.id).version as number), 3);
+
+  // 模拟并发：scheduler 在 completed 行落库瞬间抢先推进 version（AFTER INSERT trigger），
+  // 使 completeSchedule 的版本守卫 UPDATE 失败——正是此前「completed 已落但报冲突」的误报窗口。
+  db.exec(`
+    CREATE TRIGGER complete_conflict_advance
+    AFTER INSERT ON schedule_occurrences
+    WHEN NEW.profile_id = '${profile.id}' AND NEW.schedule_id = '${item.id}' AND NEW.status = 'completed'
+    BEGIN
+      UPDATE schedules SET version = version + 1 WHERE profile_id = NEW.profile_id AND id = NEW.schedule_id;
+    END;
+  `);
+  try {
+    assert.throws(
+      () => completeSchedule(
+        profile,
+        item.id,
+        "2099-05-21T01:00:00.000Z:occurrence:reminder-1:attempt-1",
+        new Date("2099-05-21T02:05:00.000Z"),
+      ),
+      /schedule update conflict/,
+    );
+  } finally {
+    db.exec("DROP TRIGGER complete_conflict_advance");
+  }
+
+  // 事务整体回滚：completed 行未落库、version 未被推进（trigger 的推进一并回滚），
+  // 报错与结果一致（还原 P2-8 事务 → completed 行残留、version=4，以下断言失败）。
+  assert.equal(scheduleRow(item.id).version, 3);
+  assert.equal(db.prepare(`
+    SELECT 1 FROM schedule_occurrences
+    WHERE profile_id = ? AND schedule_id = ? AND status = 'completed'
+  `).get(profile.id, item.id), undefined);
+
+  // 重试（无并发）按当前版本幂等收敛：completed 行落库，完成语义正常（version 3→4）。
+  completeSchedule(
+    profile,
+    item.id,
+    "2099-05-21T01:00:00.000Z:occurrence:reminder-1:attempt-1",
+    new Date("2099-05-21T02:10:00.000Z"),
+  );
+  assert.equal(scheduleRow(item.id).version, 4);
+  assert.notEqual(db.prepare(`
+    SELECT 1 FROM schedule_occurrences
+    WHERE profile_id = ? AND schedule_id = ? AND status = 'completed'
+  `).get(profile.id, item.id), undefined);
+});
+
+test("P3-5: resend notifications carry the attempt round marker; formal reminders do not", async () => {
+  db.prepare("UPDATE schedules SET enabled = 0").run();
+  const item = createSchedule(profile, {
+    title: "p3-5 round marker",
+    calendar: "solar",
+    date: "2099-06-30",
+    time: "09:00",
+    timezone: "Asia/Shanghai",
+    intervalMinutes: 60,
+    maxAttempts: 3,
+  });
+  await runDueSchedules(new Date("2099-06-30T01:00:00.000Z")); // 正式提醒
+  await runDueSchedules(new Date("2099-06-30T02:00:00.000Z")); // attempt-1
+  await runDueSchedules(new Date("2099-06-30T03:00:00.000Z")); // attempt-2
+  const rows = notices(item.id);
+  const byKey = new Map(rows.map((row) => [String(row.dedupe_key), row]));
+  const formal = byKey.get(`schedule:${profile.id}:${item.id}:2099-06-30T01:00:00.000Z:occurrence:reminder-1`);
+  const attempt1 = byKey.get(`schedule:${profile.id}:${item.id}:2099-06-30T01:00:00.000Z:occurrence:reminder-1:attempt-1`);
+  const attempt2 = byKey.get(`schedule:${profile.id}:${item.id}:2099-06-30T01:00:00.000Z:occurrence:reminder-1:attempt-2`);
+  assert.ok(formal, "正式提醒应存在");
+  assert.ok(attempt1, "attempt-1 应存在");
+  assert.ok(attempt2, "attempt-2 应存在");
+
+  // 正式提醒：标题/正文均无轮次标记。
+  assert.equal(String(formal.title), "待办 · 发生提醒：p3-5 round marker");
+  assert.equal(String(formal.title).includes("第 1 次提醒"), false);
+
+  // attempt-1/2：标题与正文首行均含轮次标记与总次数。
+  assert.equal(String(attempt1.title), "待办 · 发生提醒：p3-5 round marker（第 1 次提醒，共 3 次）");
+  assert.ok(String(attempt1.body).includes("第 1 次提醒，共 3 次"));
+  assert.equal(String(attempt2.title), "待办 · 发生提醒：p3-5 round marker（第 2 次提醒，共 3 次）");
+  assert.ok(String(attempt2.body).includes("第 2 次提醒，共 3 次"));
+
+  // dedupe/去重不受影响：重复 tick 不重复发布，通知总数不变。
+  await runDueSchedules(new Date("2099-06-30T02:00:00.000Z"));
+  await runDueSchedules(new Date("2099-06-30T03:00:00.000Z"));
+  assert.equal(notices(item.id).length, 3);
+});
