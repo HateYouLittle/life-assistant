@@ -312,12 +312,19 @@ function normalizeStrongReminder(input: ScheduleInput): Pick<ScheduleItem, "remi
 
 /** P2-4：recurrence 触发间隔（分钟）；仅 daily/weekly 可廉价确定（monthly/yearly/workday/holiday 长度不定）。 */
 function recurrenceIntervalMinutes(recurrence: RecurrenceRule): number | undefined {
+  // P3-2：byWeekday（如 daily+[MO..FR]）让实际触发间隔可为 1-3 天，无法廉价确定，
+  // 视为「间隔不可知」返回 undefined、不输出提示性警告；README/skill 注明该警告
+  // 仅适用于无 byWeekday 的 daily/weekly。
+  if (recurrence.byWeekday !== undefined && recurrence.byWeekday.length > 0) return undefined;
   if (recurrence.frequency === "daily") return 1440 * recurrence.interval;
   if (recurrence.frequency === "weekly") return 7 * 1440 * recurrence.interval;
   return undefined;
 }
 
-function normalizeInput(input: ScheduleInput): ScheduleInput & { type: ScheduleType; timezone: string; time: string; recurrence: RecurrenceRule; reminders: ReminderInput[]; allDay: boolean; reminderIntervalMinutes?: number; reminderMaxAttempts?: number } {
+function normalizeInput(
+  input: ScheduleInput,
+  options: { explicitStrongReminder?: boolean } = {},
+): ScheduleInput & { type: ScheduleType; timezone: string; time: string; recurrence: RecurrenceRule; reminders: ReminderInput[]; allDay: boolean; reminderIntervalMinutes?: number; reminderMaxAttempts?: number } {
   if (!input.title?.trim()) throw new Error("title is required");
   const type = input.type ?? "todo";
   const calendar = input.calendar ?? "solar";
@@ -350,7 +357,11 @@ function normalizeInput(input: ScheduleInput): ScheduleInput & { type: ScheduleT
   const recurrenceGapMinutes = strongReminder.reminderIntervalMinutes !== undefined
     ? recurrenceIntervalMinutes(recurrence)
     : undefined;
-  if (recurrenceGapMinutes !== undefined
+  // P3-1：该警告只在本次调用显式涉及强提醒字段（create 显式传 intervalMinutes/maxAttempts，
+  // update 的 restChanges 显式含这两字段）时输出；仅改 title/note 等无关字段的 update
+  // merged 输入虽恒带当前 intervalMinutes，也不刷噪音警告。
+  if (options.explicitStrongReminder
+    && recurrenceGapMinutes !== undefined
     && strongReminder.reminderIntervalMinutes !== undefined
     && strongReminder.reminderIntervalMinutes >= recurrenceGapMinutes) {
     console.warn(
@@ -882,7 +893,11 @@ function insertSchedule(profile: ProfileContext, item: ScheduleItem): void {
 
 export function createSchedule(value: ProfileContext | string, input: ScheduleInput, at: Date = new Date()): ScheduleItem {
   const profile = context(value);
-  const normalized = normalizeInput(input);
+  // P3-1：create 显式传 intervalMinutes/maxAttempts（至少其一）才视为本次显式涉及强提醒，
+  // 触发 >= recurrence 间隔的提示性警告；未显式传时不刷噪音。
+  const normalized = normalizeInput(input, {
+    explicitStrongReminder: input.intervalMinutes !== undefined || input.maxAttempts !== undefined,
+  });
   const createdAt = nowIso();
   // 导入场景允许保留导出时的 ID（幂等重放、跨机迁移）；非法/缺省时回退 UUID。
   const importedId = typeof input.id === "string" ? input.id.trim() : "";
@@ -992,7 +1007,11 @@ export function updateSchedule(value: ProfileContext | string, id: string, chang
     maxAttempts: current.reminderMaxAttempts,
     ...restChanges,
   };
-  const normalized = normalizeInput(merged);
+  // P3-1：update 仅当 restChanges 显式含 intervalMinutes/maxAttempts 时视为显式涉及强提醒；
+  // merged 恒带当前值，只改 title/note 等无关字段的 update 不触发 >= recurrence 间隔警告。
+  const normalized = normalizeInput(merged, {
+    explicitStrongReminder: "intervalMinutes" in restChanges || "maxAttempts" in restChanges,
+  });
   const updatedAt = nowIso();
   const next: ScheduleItem = {
     ...current,

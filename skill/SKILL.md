@@ -61,7 +61,7 @@ Hermes 将 MCP 工具注册为 `mcp_life_assistant_<tool>`，点号转换为下�
 - 创建前确认用户说的是公历还是农历。`leapMonthPolicy: "leap"` 的事件仅在对应闰月年份触发。
 - 中国大陆法定工作日重复提醒用 `recurrence: "workday"`（如「每个法定工作日 09:00」）；仅放假日的提醒用 `recurrence: "holiday"`。两者只支持公历和 `Asia/Shanghai` 时区，不支持 interval/byWeekday/byMonthDay。
 - 用户想要「没确认就一直提醒」时用强提醒：`schedule.create` 传 `intervalMinutes`（1–10080 分钟，默认 120）与/或 `maxAttempts`（1–99 轮，默认 3），到期未确认完成会按间隔重复提醒直至完成/删除/达上限；`schedule.update` 传 `clearStrongReminder: true` 关闭。强提醒需要一条 occurrence 正式提醒（`target: "occurrence"` 且 `minutesBefore: 0`，默认提醒即满足），只配提前提醒/截止提醒会被拒绝。
-- 强提醒 `intervalMinutes` 大于等于 recurrence 触发间隔（daily=1440 分钟、weekly=10080 分钟）时重发不生效，会被下一 occurrence 的正式提醒接管；遇到该场景如实向用户说明。
+- 强提醒 `intervalMinutes` 大于等于 recurrence 触发间隔（daily=1440 分钟、weekly=10080 分钟）时重发不生效，会被下一 occurrence 的正式提醒接管；遇到该场景如实向用户说明（该间隔警告仅适用于未配 `byWeekday` 的 daily/weekly，配了 `byWeekday` 时实际触发间隔不定，不输出警告）。
 - 日程和日程通知只属于当前 Profile。不得因为天气/油价公共 fan-out 而扩大日程作用域。
 
 ## 自动任务 automation

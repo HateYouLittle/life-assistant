@@ -89,8 +89,11 @@ function recordNotifiedOccurrence(item: ScheduleItem, occurrenceKey: string, occ
         WHERE profile_id = ? AND dedupe_key = ?
       `).get(item.profileId, `schedule:${item.profileId}:${item.id}:${occurrenceKey}`) as { id: number } | undefined;
       if (notice) {
-        // 先取消未投递投递（有 route 时），再整行删除（级联 deliveries/reads），
-        // 与 deleteSchedule 的 S1.2 清理口径一致：删除后不残留任何通知。
+        // P3-4：可直接整行删除（级联 deliveries/reads）——此分支只命中「同一 tick 内刚发布、
+        // 随后日程被并发删除」的孤儿通知，而 delivery 行在 runDueSchedules 之后的
+        // deliverPendingProfileNotifications 才落库，该时刻不可能已有 sent/sending 投递，
+        // 无需像 deleteSchedule 的 S1.2 那样保留已投递历史；先取消未投递投递（有 route 时）
+        // 再删除，保证不残留任何通知。
         cancelProfileNotificationDelivery(item.profileId, notice.id);
         db.prepare("DELETE FROM profile_notifications WHERE profile_id = ? AND id = ?").run(item.profileId, notice.id);
       }

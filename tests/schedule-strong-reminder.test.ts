@@ -452,22 +452,75 @@ test("P1-1: plain early reminder completion still resolves to the correct occurr
   assert.equal(notices(item.id).length, 0);
 });
 
-test("P2-1: concurrent completion bumps version so the scheduler cannot overwrite next_run_at", async () => {
+test("P2-1: real completeSchedule during the resend window bumps version and terminates resends (red→green guard)", async () => {
   db.prepare("UPDATE schedules SET enabled = 0").run();
   const item = createSchedule(profile, {
-    title: "p2-1 concurrent complete",
+    title: "p2-1 real complete",
     calendar: "solar",
     date: "2099-05-09",
+    time: "09:00",
+    timezone: "Asia/Shanghai",
+    // daily + count:1：T 是唯一 occurrence，完成 T 后无下一 occurrence → 终态
+    // next_run_at=NULL/status=completed/enabled=0，便于断言「后跑 tick 不被覆盖」。
+    recurrence: { frequency: "daily", count: 1 },
+    intervalMinutes: 60,
+    maxAttempts: 3,
+  });
+  await runDueSchedules(new Date("2099-05-09T01:00:00.000Z")); // 正式提醒，version 2
+  await runDueSchedules(new Date("2099-05-09T02:00:00.000Z")); // attempt-1，version 3
+  assert.equal((scheduleRow(item.id).version as number), 3);
+
+  // 真实调用 completeSchedule（走 service 真实代码，不用 SQL trigger 模拟）：以 attempt-1
+  // 的 occurrence key 完成当前 occurrence，version 由 completeSchedule 自身的 P2-1 递增
+  // 逻辑写回（还原/注释掉 service.ts 里的 `normalizeVersion(rawVersion) + 1` 递增 →
+  // 下方 version=4 断言失败，保证红→绿有效）。
+  completeSchedule(
+    profile,
+    item.id,
+    "2099-05-09T01:00:00.000Z:occurrence:reminder-1:attempt-1",
+    new Date("2099-05-09T02:05:00.000Z"),
+  );
+  assert.deepEqual({ ...scheduleRow(item.id) }, {
+    next_run_at: null,
+    enabled: 0,
+    status: "completed",
+    version: 4, // completeSchedule 的 P2-1 version 递增（3 → 4）
+    reminder_interval_minutes: 60,
+    reminder_max_attempts: 3,
+  });
+
+  // 后续 scheduler tick 不再产生重发，也不把 next_run_at 覆盖回重发时刻。
+  await runDueSchedules(new Date("2099-05-09T03:00:00.000Z"));
+  await runDueSchedules(new Date("2099-05-09T04:00:00.000Z"));
+  assert.equal(scheduleRow(item.id).next_run_at, null);
+  assert.deepEqual(occurrenceKeys(item.id), [
+    "2099-05-09T01:00:00.000Z",
+    "2099-05-09T01:00:00.000Z:occurrence:reminder-1",
+    "2099-05-09T01:00:00.000Z:occurrence:reminder-1:attempt-1",
+  ]);
+  assert.equal(notices(item.id).length, 2);
+});
+
+test("P2-1: scheduler stale snapshot never overwrites next_run_at after a concurrent completion (terminal-state simulation)", async () => {
+  db.prepare("UPDATE schedules SET enabled = 0").run();
+  const item = createSchedule(profile, {
+    title: "p2-1 stale skip",
+    calendar: "solar",
+    date: "2099-05-10",
     time: "09:00",
     timezone: "Asia/Shanghai",
     intervalMinutes: 60,
     maxAttempts: 3,
   });
-  await runDueSchedules(new Date("2099-05-09T01:00:00.000Z")); // 正式提醒，version 2
+  await runDueSchedules(new Date("2099-05-10T01:00:00.000Z")); // 正式提醒，version 2
   assert.equal((scheduleRow(item.id).version as number), 2);
 
-  // 模拟 completeSchedule 恰在 attempt-1 落库瞬间并发完成：completed 行 + version 递增
-  // （对应 P2-1 修复后的真实 completeSchedule 行为）。
+  // 注意：此用例锁定的是 scheduler 的 stale-skip（不回写 next_run_at），不是
+  // completeSchedule 的 version 递增（那是上面真实路径用例的事）。trigger 模拟的是
+  // 「并发完成已经发生、version 已递增」的终态：completed 行 + status/enabled/next_run_at
+  // 终态 + version 递增，对应 completeSchedule 恰在 attempt-1 落库瞬间（publishNotification
+  // 的 await 点之后）完成后的数据库形态。version 递增本身由 trigger 写入，故不作为本用例
+  // 对 completeSchedule 递增逻辑的锁定依据。
   db.exec(`
     CREATE TRIGGER complete_during_resend
     AFTER INSERT ON schedule_occurrences
@@ -481,21 +534,22 @@ test("P2-1: concurrent completion bumps version so the scheduler cannot overwrit
       WHERE profile_id = NEW.profile_id AND id = NEW.schedule_id;
     END;
   `);
-  await runDueSchedules(new Date("2099-05-09T02:00:00.000Z"));
+  // scheduler 在本 tick 开头已持 version 2 快照（fresh.version=2）；若 stale-skip 失效、
+  // 它把 next_run_at 写回 03:00/active/enabled=1，下方终态断言即失败。
+  await runDueSchedules(new Date("2099-05-10T02:00:00.000Z"));
   db.exec("DROP TRIGGER complete_during_resend");
 
-  // 完成者的终态不被 scheduler 的旧 version CAS 覆盖回重发时刻。
   assert.deepEqual({ ...scheduleRow(item.id) }, {
     next_run_at: null,
     enabled: 0,
     status: "completed",
-    version: 3,
+    version: 3, // trigger 写入的终态版本；scheduler 的旧版本 CAS（WHERE version IS 2）未命中
     reminder_interval_minutes: 60,
     reminder_max_attempts: 3,
   });
-  // 之后不再有任何重发。
-  await runDueSchedules(new Date("2099-05-09T03:00:00.000Z"));
-  await runDueSchedules(new Date("2099-05-09T04:00:00.000Z"));
+  // 之后不再有任何重发（stale 写回若发生，03:00 会再发 attempt-2）。
+  await runDueSchedules(new Date("2099-05-10T03:00:00.000Z"));
+  await runDueSchedules(new Date("2099-05-10T04:00:00.000Z"));
   assert.equal(occurrenceKeys(item.id).length, 3); // completed T + formal + attempt-1
   assert.equal(notices(item.id).length, 2);
 });
@@ -567,6 +621,83 @@ test("P2-4: intervalMinutes >= recurrence interval never resends and the next oc
     "2099-06-01T01:00:00.000Z:occurrence:reminder-1",
   ]);
   assert.equal(notices(item.id).length, 3);
+});
+
+test("P3-1: interval warning only fires when strong-reminder fields are explicitly involved", async () => {
+  db.prepare("UPDATE schedules SET enabled = 0").run();
+  const originalWarn = console.warn;
+  const warnings: string[] = [];
+  console.warn = (message?: unknown) => { warnings.push(String(message)); };
+  try {
+    // (a) create 显式传 intervalMinutes：daily 触发间隔 1440，2400 >= 1440 → 警告出现。
+    const item = createSchedule(profile, {
+      title: "p3-1 explicit create",
+      calendar: "solar",
+      date: "2099-07-05",
+      time: "09:00",
+      timezone: "Asia/Shanghai",
+      recurrence: "daily",
+      intervalMinutes: 2400,
+      maxAttempts: 3,
+    });
+    assert.equal(warnings.some((message) => message.includes("intervalMinutes=2400") && message.includes("recurrence interval 1440min")), true);
+
+    // (b) 仅改 title：merged 输入恒带当前 intervalMinutes=2400，但本次未显式涉及强提醒
+    // 字段 → 不刷该警告（修复前每次 update 都会刷）。
+    warnings.length = 0;
+    updateSchedule(profile, item.id, { title: "p3-1 renamed" });
+    assert.equal(warnings.some((message) => message.includes("recurrence interval")), false);
+
+    // (c) update 显式改 intervalMinutes 为 >=1440 → 警告出现。
+    warnings.length = 0;
+    updateSchedule(profile, item.id, { intervalMinutes: 1440 });
+    assert.equal(warnings.some((message) => message.includes("intervalMinutes=1440") && message.includes("recurrence interval 1440min")), true);
+
+    // 传 clearStrongReminder（即使同时显式传大 interval）也不刷警告。
+    warnings.length = 0;
+    const cleared = updateSchedule(profile, item.id, { clearStrongReminder: true, intervalMinutes: 5000 });
+    assert.equal(warnings.some((message) => message.includes("recurrence interval")), false);
+    assert.equal(cleared.reminderIntervalMinutes, undefined);
+  } finally {
+    console.warn = originalWarn;
+  }
+});
+
+test("P3-2: byWeekday makes the daily/weekly interval warning unavailable", async () => {
+  db.prepare("UPDATE schedules SET enabled = 0").run();
+  const originalWarn = console.warn;
+  const warnings: string[] = [];
+  console.warn = (message?: unknown) => { warnings.push(String(message)); };
+  try {
+    // daily + byWeekday（如 [MO..FR]，实际 gap 1-3 天）：间隔无法廉价确定，即使
+    // intervalMinutes >= 1440 也不输出提示性警告。
+    createSchedule(profile, {
+      title: "p3-2 byweekday",
+      calendar: "solar",
+      date: "2099-07-06",
+      time: "09:00",
+      timezone: "Asia/Shanghai",
+      recurrence: { frequency: "daily", byWeekday: ["MO", "TU", "WE", "TH", "FR"] },
+      intervalMinutes: 1440,
+      maxAttempts: 3,
+    });
+    assert.equal(warnings.some((message) => message.includes("recurrence interval")), false);
+
+    // 同配置无 byWeekday 的 daily 仍警告。
+    createSchedule(profile, {
+      title: "p3-2 plain daily",
+      calendar: "solar",
+      date: "2099-07-07",
+      time: "09:00",
+      timezone: "Asia/Shanghai",
+      recurrence: "daily",
+      intervalMinutes: 1440,
+      maxAttempts: 3,
+    });
+    assert.equal(warnings.some((message) => message.includes("intervalMinutes=1440") && message.includes("recurrence interval 1440min")), true);
+  } finally {
+    console.warn = originalWarn;
+  }
 });
 
 test("P2-5: deleting during publish does not break the tick and cancels the orphaned notification", async () => {

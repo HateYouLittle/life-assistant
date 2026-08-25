@@ -347,7 +347,7 @@ hermes -p "<profile>" webhook subscribe "<route-name>" \
 
 查询工具：`holiday.next`（距离下次放假的天数、节日名、起止日期与调休上班日）、`holiday.list`（某年完整安排）、`holiday.is_workday`（判断某天是否法定工作日）、`holiday.refresh`（手动补抓某年，数据仍来自官方源）。
 
-待办强提醒：`schedule.create` 传 `intervalMinutes`（1–10080 分钟，默认 120）与/或 `maxAttempts`（1–99 轮，默认 3）即可开启；到期未确认完成时 scheduler 按间隔重复提醒，直至完成/删除/达上限。强提醒需要一条 occurrence 正式提醒（`target: "occurrence"` 且 `minutesBefore: 0`，默认提醒即满足），否则创建/更新会被拒绝；`schedule.update` 传 `clearStrongReminder: true` 可随时关闭。注意 `intervalMinutes` 大于等于 recurrence 触发间隔（daily=1440 分钟、weekly=10080 分钟）时重发不生效，会被下一 occurrence 的正式提醒接管（创建/更新会输出可检测的警告）。
+待办强提醒：`schedule.create` 传 `intervalMinutes`（1–10080 分钟，默认 120）与/或 `maxAttempts`（1–99 轮，默认 3）即可开启；到期未确认完成时 scheduler 按间隔重复提醒，直至完成/删除/达上限。强提醒需要一条 occurrence 正式提醒（`target: "occurrence"` 且 `minutesBefore: 0`，默认提醒即满足），否则创建/更新会被拒绝；`schedule.update` 传 `clearStrongReminder: true` 可随时关闭。注意 `intervalMinutes` 大于等于 recurrence 触发间隔（daily=1440 分钟、weekly=10080 分钟）时重发不生效，会被下一 occurrence 的正式提醒接管（创建/更新会输出可检测的警告；该间隔警告仅适用于未配 `byWeekday` 的 daily/weekly，配了 `byWeekday` 时实际触发间隔不定，无法廉价检测）。
 
 ## 工具一览
 
