@@ -1029,12 +1029,12 @@ export function updateSchedule(value: ProfileContext | string, id: string, chang
   // P2-7：强提醒重发窗口内（interval/maxAttempts 非空、当前 occurrence 未 completed），
   // 不改变 occurrence 时间线的 update（仅改 title/note/priority 等）不得重算 next_run_at
   // 跳到下一 occurrence，否则剩余 attempts 被静默丢弃。保留 min(当前重发时刻, 重算的下一触发)
-  // 与 reconcileHolidaySchedules 同口径：涉及时间线字段（recurrence/date/time/allDay/
-  // calendar/lunarMonth/lunarDay/isLeapMonth/leapMonthPolicy/deadlineAt/deadlineOffsetMinutes/
+  // 与 reconcileHolidaySchedules 同口径：涉及时间线字段（recurrence/calendar/date/time/allDay/
+  // timezone/lunarMonth/lunarDay/isLeapMonth/leapMonthPolicy/deadlineAt/deadlineOffsetMinutes/
   // reminders/intervalMinutes/maxAttempts/clearStrongReminder/status）的 update 照常重算
-  // （clearStrongReminder 关闭强提醒后回到真实触发语义；历法/农历日期变化同样改变时间线）。
+  // （clearStrongReminder 关闭强提醒后回到真实触发语义；时区/历法/农历日期变化同样改变时间线）。
   const timelineKeys = ["recurrence", "calendar", "lunarMonth", "lunarDay", "isLeapMonth", "leapMonthPolicy",
-    "date", "time", "allDay", "deadlineAt", "deadlineOffsetMinutes", "reminders", "intervalMinutes",
+    "date", "time", "allDay", "timezone", "deadlineAt", "deadlineOffsetMinutes", "reminders", "intervalMinutes",
     "maxAttempts", "clearStrongReminder", "status"];
   const touchesTimeline = recurrenceChange !== undefined
     || Object.keys(restChanges).some((key) => timelineKeys.includes(key));
@@ -1046,9 +1046,12 @@ export function updateSchedule(value: ProfileContext | string, id: string, chang
         AND occurrence_at <= ?
       ORDER BY occurrence_at DESC LIMIT 1
     `).get(profile.id, id, current.nextRunAt) as { occurrence_at: string } | undefined;
-    // 保留条件 = min(当前重发时刻, 重算的下一触发)：重算结果落在过去（once 的
-    // calculateInitialNextRun 恒返回正式触发时刻，即使已触发过）时无「下一触发」
-    // 可言，直接保留当前重发时刻，避免 once 日程在重发窗口内被重置回过去。
+    // 保留条件 = min(当前重发时刻, 重算的下一触发)：once 的 calculateInitialNextRun
+    // 恒返回正式触发时刻——完成后 next_run_at 是过去的正式触发时刻（非 null）、
+    // status=completed、enabled=1，故重算结果落在过去时无「下一触发」可言，直接保留
+    // 当前重发时刻，避免 once 日程在重发窗口内被重置回过去。该保留的安全性不依赖
+    // next_run_at 已 null：isScheduleOccurrenceCompleted（update 路径）与 scheduler
+    // dueRows 仅取 status='active'（completed 的 once 不再被调度）双重兜底。
     if (currentOccurrence
       && !isScheduleOccurrenceCompleted(profile.id, id, currentOccurrence.occurrence_at)
       && (next.nextRunAt === undefined

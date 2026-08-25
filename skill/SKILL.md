@@ -90,7 +90,7 @@ Hermes 将 MCP 工具注册为 `mcp_life_assistant_<tool>`，点号转换为下�
 
 ## 备份与迁移
 
-- `assistant.export` 导出当前 Profile 快照（日程全量含状态与强提醒配置、自动任务、静默时段、位置），让用户保存 JSON 文件；当前导出格式 `EXPORT_VERSION=2`，v1 旧快照仍可导入（其中无强提醒字段，导入后强提醒视为未开启）。
+- `assistant.export` 导出当前 Profile 快照（日程全量含状态与强提醒配置、自动任务、静默时段、位置），让用户保存 JSON 文件；当前导出格式 `EXPORT_VERSION=2`，v1 旧快照仍可导入（其中无强提醒字段，导入后强提醒视为未开启）。单类条目超过 1000 条时快照带 `truncated: true`，导入方应提示用户分批处理。
 - `assistant.import` 导入：按 ID 幂等（已存在跳过），位置是共享数据，只有用户明确同意时才传 `applyLocation: true`。
 
 ## 通知平台切换

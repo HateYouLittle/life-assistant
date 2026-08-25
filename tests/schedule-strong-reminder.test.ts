@@ -969,6 +969,33 @@ test("P2-7: lunar date change inside the resend window recomputes next_run_at (t
   assert.notEqual(scheduleRow(item.id).next_run_at, "2099-07-03T03:00:00.000Z");
 });
 
+test("P2-7: timezone change inside the resend window recomputes next_run_at (title-only keeps it)", async () => {
+  db.prepare("UPDATE schedules SET enabled = 0").run();
+  const item = createSchedule(profile, {
+    title: "p2-7 timezone change",
+    calendar: "solar",
+    date: "2099-05-20",
+    time: "09:00",
+    timezone: "Asia/Shanghai",
+    intervalMinutes: 60,
+    maxAttempts: 3,
+  });
+  await runDueSchedules(new Date("2099-05-20T01:00:00.000Z")); // 正式提醒（09:00 Asia/Shanghai = 01:00Z）
+  await runDueSchedules(new Date("2099-05-20T02:00:00.000Z")); // attempt-1 → next_run_at = 03:00
+  assert.equal(scheduleRow(item.id).next_run_at, "2099-05-20T03:00:00.000Z");
+
+  // 对照：重发窗口内只改 title → 保留重发时刻 03:00。
+  updateSchedule(profile, item.id, { title: "p2-7 tz renamed" }, new Date("2099-05-20T02:05:00.000Z"));
+  assert.equal(scheduleRow(item.id).next_run_at, "2099-05-20T03:00:00.000Z");
+
+  // 改 timezone（时间线字段）→ 按新时区重算：09:00 UTC = 2099-05-20T09:00Z，不再保留
+  // 旧重发时刻 03:00（还原 timelineKeys 缺 timezone → 保留 03:00，下面断言失败）。
+  const tzChanged = updateSchedule(profile, item.id, { timezone: "UTC" }, new Date("2099-05-20T02:05:00.000Z"));
+  assert.equal(tzChanged.timezone, "UTC");
+  assert.equal(scheduleRow(item.id).next_run_at, "2099-05-20T09:00:00.000Z");
+  assert.notEqual(scheduleRow(item.id).next_run_at, "2099-05-20T03:00:00.000Z");
+});
+
 test("P2-7: update outside the resend window recomputes as before", async () => {
   db.prepare("UPDATE schedules SET enabled = 0").run();
   const item = createSchedule(profile, {
