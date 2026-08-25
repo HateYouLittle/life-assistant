@@ -21,7 +21,7 @@ export const EXPORT_FORMAT = "life-assistant.export";
  * 不动 DB schema（保持 v7）。
  */
 export const EXPORT_VERSION = 2;
-/** 单类条目导出上限；超出时快照带 truncated 标记，导入方应提示用户分批处理。 */
+/** 单类条目导出上限；超过时快照带 truncated 标记，导入方应提示用户分批处理。 */
 export const EXPORT_ROW_LIMIT = 1000;
 
 /** 可移植日程条目：ScheduleItem 去掉运行时派生字段（profileId/version/enabled/nextRunAt 等）。 */
@@ -87,7 +87,7 @@ export interface AssistantExport {
     automations: Array<Omit<AutomationCreateInput, "schedule"> & { schedule: AutomationCreateInput["schedule"] }>;
     quietHours: { start: string; end: string; timezone: string } | null;
     location: { city: string; province?: string; lat: number; lon: number } | null;
-    /** 任一类条目达到导出上限时为 true：快照不完整，导入方应提示 */
+    /** 任一类条目超过导出上限时为 true：快照不完整，导入方应提示 */
     truncated?: boolean;
   };
 }
@@ -96,10 +96,12 @@ export function buildAssistantExport(profile: ProfileContext): AssistantExport {
   const db = getDatabase();
   const rows = db.prepare(
     "SELECT * FROM schedules WHERE profile_id = ? ORDER BY created_at, id LIMIT ?",
-  ).all(profile.id, EXPORT_ROW_LIMIT) as Array<Record<string, unknown>>;
+  ).all(profile.id, EXPORT_ROW_LIMIT + 1) as Array<Record<string, unknown>>;
   const automations = db.prepare(
     "SELECT * FROM automations WHERE profile_id = ? ORDER BY created_at, id LIMIT ?",
-  ).all(profile.id, EXPORT_ROW_LIMIT) as Array<Record<string, unknown>>;
+  ).all(profile.id, EXPORT_ROW_LIMIT + 1) as Array<Record<string, unknown>>;
+  const schedulesTruncated = rows.length > EXPORT_ROW_LIMIT;
+  const automationsTruncated = automations.length > EXPORT_ROW_LIMIT;
   const quiet = getQuietHours(profile.id);
   const loc = currentLocation();
   return {
@@ -108,8 +110,8 @@ export function buildAssistantExport(profile: ProfileContext): AssistantExport {
     exportedAt: new Date().toISOString(),
     profile: profile.id,
     data: {
-      schedules: rows.map((row) => toPortableSchedule(hydrateRow(row))),
-      automations: automations.map((row) => ({
+      schedules: rows.slice(0, EXPORT_ROW_LIMIT).map((row) => toPortableSchedule(hydrateRow(row))),
+      automations: automations.slice(0, EXPORT_ROW_LIMIT).map((row) => ({
         id: String(row.id),
         name: String(row.name),
         action: String(row.action),
@@ -122,7 +124,7 @@ export function buildAssistantExport(profile: ProfileContext): AssistantExport {
       })),
       quietHours: quiet ? { start: quiet.start, end: quiet.end, timezone: quiet.timezone } : null,
       location: loc ? { city: loc.city, province: loc.province, lat: loc.lat, lon: loc.lon } : null,
-      truncated: rows.length >= EXPORT_ROW_LIMIT || automations.length >= EXPORT_ROW_LIMIT,
+      truncated: schedulesTruncated || automationsTruncated,
     },
   };
 }

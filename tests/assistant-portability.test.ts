@@ -168,7 +168,7 @@ test("invalid entries are counted and malformed payloads are rejected", () => {
   assert.throws(() => importAssistantExport(profile, "not-an-object"), /不是有效的快照对象/);
 });
 
-test("export marks truncation when the row limit is reached", () => {
+test("export marks truncation when the row limit is exceeded", () => {
   const seed = createSchedule(profile, {
     title: "截断种子",
     calendar: "solar",
@@ -181,7 +181,7 @@ test("export marks truncation when the row limit is reached", () => {
   const insert = db.prepare(
     `INSERT INTO schedules(${columns.join(",")}) VALUES(${columns.map(() => "?").join(",")})`,
   );
-  const bulkCount = 1000; // 种子 + 1000 条 bulk，确保触达上限
+  const bulkCount = 1000; // 种子 + 1000 条 bulk，确保超过上限
   const tx = db.prepare("BEGIN");
   tx.run();
   for (let index = 0; index < bulkCount; index += 1) {
@@ -198,6 +198,40 @@ test("export marks truncation when the row limit is reached", () => {
   }
   // 清理后回到未截断状态。
   assert.equal(buildAssistantExport(profile).data.truncated, false);
+});
+
+test("export does not mark an exactly full category as truncated", () => {
+  const exactProfile = { id: "exact-limit-profile" };
+  const seed = createSchedule(exactProfile, {
+    title: "精确上限种子",
+    calendar: "solar",
+    date: "2099-12-01",
+    time: "09:00",
+    timezone: "Asia/Shanghai",
+  });
+  const row = db.prepare("SELECT * FROM schedules WHERE profile_id = ? AND id = ?").get(exactProfile.id, seed.id) as Record<string, unknown>;
+  const columns = Object.keys(row);
+  const insert = db.prepare(
+    `INSERT INTO schedules(${columns.join(",")}) VALUES(${columns.map(() => "?").join(",")})`,
+  );
+  let committed = false;
+  try {
+    db.exec("BEGIN");
+    for (let index = 0; index < 999; index += 1) {
+      insert.run(...columns.map((column) => (column === "id" ? `exact-${index}` : row[column])) as never);
+    }
+    db.exec("COMMIT");
+    committed = true;
+    const snapshot = buildAssistantExport(exactProfile);
+    assert.equal(snapshot.data.schedules.length, 1000);
+    assert.equal(snapshot.data.truncated, false);
+  } finally {
+    if (!committed) {
+      try { db.exec("ROLLBACK"); } catch { /* preserve the original assertion failure */ }
+    }
+    db.prepare("DELETE FROM schedules WHERE profile_id = ? AND id LIKE 'exact-%'").run(exactProfile.id);
+    db.prepare("DELETE FROM schedules WHERE profile_id = ? AND id = ?").run(exactProfile.id, seed.id);
+  }
 });
 
 test("import rejects snapshots exceeding 1000 entries per type", () => {
