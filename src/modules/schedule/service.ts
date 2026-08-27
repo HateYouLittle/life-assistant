@@ -3,7 +3,7 @@ import rrulePkg from "rrule";
 import { DateTime } from "luxon";
 import { Lunar, LunarYear } from "lunar-javascript";
 import { getDatabase } from "../../core/database.js";
-import { requireProfileContext, type ProfileContext } from "../../core/profile.js";
+import { asProfileContext, isWellFormedId, type ProfileContext } from "../../core/profile.js";
 import { config } from "../../config.js";
 import { dayInfo, isDateCoveredByHolidayData } from "../holiday/calendar.js";
 import type {
@@ -27,14 +27,8 @@ const DEFAULT_TIME = "09:00";
 const VALID_FREQUENCIES = ["once", "daily", "weekly", "monthly", "yearly", "workday", "holiday"];
 const HOLIDAY_AWARE_FREQUENCIES = ["workday", "holiday"];
 const HOLIDAY_ZONE = "Asia/Shanghai";
-const VALID_PROFILE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
-type ValidDateTime = DateTime<true>;
 
-function context(value: ProfileContext | string): ProfileContext {
-  const id = typeof value === "string" ? value : value.id;
-  if (!VALID_PROFILE.test(id)) throw new Error("invalid Profile context");
-  return requireProfileContext(id);
-}
+type ValidDateTime = DateTime<true>;
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -824,12 +818,12 @@ function insertSchedule(profile: ProfileContext, item: ScheduleItem): void {
 }
 
 export function createSchedule(value: ProfileContext | string, input: ScheduleInput, at: Date = new Date()): ScheduleItem {
-  const profile = context(value);
+  const profile = asProfileContext(value);
   const normalized = normalizeInput(input);
   const createdAt = nowIso();
   // 导入场景允许保留导出时的 ID（幂等重放、跨机迁移）；非法/缺省时回退 UUID。
   const importedId = typeof input.id === "string" ? input.id.trim() : "";
-  if (importedId && !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(importedId)) {
+  if (importedId && !isWellFormedId(importedId)) {
     throw new Error(`invalid schedule id: ${importedId}`);
   }
   const id = importedId || crypto.randomUUID();
@@ -872,7 +866,7 @@ export function createSchedule(value: ProfileContext | string, input: ScheduleIn
 }
 
 export function listSchedules(value: ProfileContext | string, options: ScheduleListOptions = {}): ScheduleItem[] {
-  const profile = context(value);
+  const profile = asProfileContext(value);
   const clauses = ["profile_id = ?"];
   const values: unknown[] = [profile.id];
   if (options.type) { clauses.push("type = ?"); values.push(options.type); }
@@ -885,14 +879,14 @@ export function listSchedules(value: ProfileContext | string, options: ScheduleL
 }
 
 export function getSchedule(value: ProfileContext | string, id: string): ScheduleItem {
-  const profile = context(value);
+  const profile = asProfileContext(value);
   const row = getDatabase().prepare("SELECT * FROM schedules WHERE profile_id = ? AND id = ?").get(profile.id, id) as Record<string, unknown> | undefined;
   if (!row) throw new Error("schedule not found");
   return rowToItem(row);
 }
 
 export function updateSchedule(value: ProfileContext | string, id: string, changes: Partial<ScheduleInput>, at: Date = new Date()): ScheduleItem {
-  const profile = context(value);
+  const profile = asProfileContext(value);
   // N1：current（经 rowToItem hydration 归一化）与乐观锁 WHERE 用的原始 version
   // 来自同一次 SELECT 快照，消除 getSchedule+rawVersion 两次独立读取的 TOCTOU 窗口；
   // 写回统一用归一化后的值自愈（N2：WHERE 用 version IS ? 以匹配 NULL）。
@@ -964,7 +958,7 @@ export function updateSchedule(value: ProfileContext | string, id: string, chang
 }
 
 export function deleteSchedule(value: ProfileContext | string, id: string): void {
-  const profile = context(value);
+  const profile = asProfileContext(value);
   const db = getDatabase();
   const prefix = `schedule:${profile.id}:${id}:%`;
   const updatedAt = nowIso();
@@ -1062,7 +1056,7 @@ export function reconcileHolidaySchedules(at = new Date()): HolidayScheduleRecon
 }
 
 export function completeSchedule(value: ProfileContext | string, id: string, occurrenceKey?: string, at: Date = new Date()): ScheduleItem {
-  const profile = context(value);
+  const profile = asProfileContext(value);
   const db = getDatabase();
   // 与 updateSchedule 相同：current 与乐观锁 WHERE 使用的原始 version 来自同一次快照，
   // 避免先 getSchedule 再取 version 的 TOCTOU 窗口（S6）。

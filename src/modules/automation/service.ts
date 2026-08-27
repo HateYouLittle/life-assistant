@@ -4,7 +4,7 @@ import { z } from "zod";
 import { config } from "../../config.js";
 import { getDatabase } from "../../core/database.js";
 import { publishNotification } from "../../core/notification-publisher.js";
-import { requireProfileContext, type ProfileContext } from "../../core/profile.js";
+import { asProfileContext, isWellFormedId, requireProfileContext, type ProfileContext } from "../../core/profile.js";
 import { automationActions } from "./actions.js";
 import { automationResultNotification, resultFields } from "./notification.js";
 import type { AutomationCondition, AutomationItem, AutomationListOptions } from "./types.js";
@@ -38,10 +38,6 @@ export interface AutomationCreateInput {
   condition?: AutomationCondition;
   schedule: z.infer<typeof automationScheduleSchema>;
   enabled?: boolean;
-}
-
-function context(value: ProfileContext | string): ProfileContext {
-  return typeof value === "string" ? requireProfileContext(value) : requireProfileContext(value.id);
 }
 
 function normalizeSchedule(schedule: z.infer<typeof automationScheduleSchema>): AutomationItem["schedule"] {
@@ -78,7 +74,7 @@ function rowToItem(row: Record<string, unknown>): AutomationItem {
 }
 
 export function createAutomation(value: ProfileContext | string, input: AutomationCreateInput): AutomationItem {
-  const profile = context(value);
+  const profile = asProfileContext(value);
   const name = z.string().min(1).max(100).parse(input.name);
   const { action, params } = validateAction(
     z.string().min(1).max(64).parse(input.action),
@@ -92,7 +88,7 @@ export function createAutomation(value: ProfileContext | string, input: Automati
   const time = new Date().toISOString();
   // 导入场景保留原 ID；非法/缺省回退 UUID。
   const importedId = typeof input.id === "string" ? input.id.trim() : "";
-  if (importedId && !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(importedId)) {
+  if (importedId && !isWellFormedId(importedId)) {
     throw new Error(`invalid automation id: ${importedId}`);
   }
   const id = importedId || crypto.randomUUID();
@@ -117,7 +113,7 @@ export function createAutomation(value: ProfileContext | string, input: Automati
 }
 
 export function listAutomations(value: ProfileContext | string, options: AutomationListOptions = {}): AutomationItem[] {
-  const profile = context(value);
+  const profile = asProfileContext(value);
   const clauses = ["profile_id = ?"];
   const params: unknown[] = [profile.id];
   if (options.enabled !== undefined) {
@@ -131,7 +127,7 @@ export function listAutomations(value: ProfileContext | string, options: Automat
 }
 
 export function getAutomation(value: ProfileContext | string, id: string): AutomationItem {
-  const profile = context(value);
+  const profile = asProfileContext(value);
   const row = getDatabase().prepare(
     "SELECT * FROM automations WHERE profile_id = ? AND id = ?",
   ).get(profile.id, id) as Record<string, unknown> | undefined;
@@ -150,7 +146,7 @@ export interface AutomationUpdateInput {
 }
 
 export function updateAutomation(value: ProfileContext | string, id: string, changes: AutomationUpdateInput): AutomationItem {
-  const profile = context(value);
+  const profile = asProfileContext(value);
   const current = getAutomation(profile, id);
   const name = changes.name === undefined ? current.name : z.string().min(1).max(100).parse(changes.name);
   const nextAction = changes.action === undefined && changes.params === undefined
@@ -186,7 +182,7 @@ export function updateAutomation(value: ProfileContext | string, id: string, cha
 }
 
 export function deleteAutomation(value: ProfileContext | string, id: string): void {
-  const profile = context(value);
+  const profile = asProfileContext(value);
   const result = getDatabase().prepare(
     "DELETE FROM automations WHERE profile_id = ? AND id = ?",
   ).run(profile.id, id) as { changes: number };
@@ -373,7 +369,7 @@ export async function runAutomationNow(
   id: string,
   options: AutomationRunOptions = {},
 ): Promise<AutomationRunOutcome & { result?: Record<string, unknown> }> {
-  const profile = context(value);
+  const profile = asProfileContext(value);
   const item = getAutomation(profile, id);
   const at = options.at ?? new Date();
   const actions = options.actions ?? automationActions;

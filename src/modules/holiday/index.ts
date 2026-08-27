@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { DateTime } from "luxon";
 import { config } from "../../config.js";
-import { registerModule, ok, fail, type AssistantModule } from "../../core/registry.js";
+import { registerModule, ok, fail, withTool, type AssistantModule } from "../../core/registry.js";
 import { reconcileHolidaySchedules } from "../schedule/service.js";
 import type { FetchHolidayYearOptions, HolidayYearDataset } from "./provider.js";
 import {
@@ -140,93 +140,78 @@ export async function runHolidayRefresh(): Promise<void> {
 const holidayModule: AssistantModule = {
   name: "holiday",
   tools: [
-    {
-      name: "next",
-      description: "查询距离下一次中国大陆法定节假日放假还有多少天。返回节日名、放假起止日期、倒计时天数及该假期的调休上班日；若正在假期中会返回 ongoing 与剩余天数。",
-      schema: { from: z.string().regex(DATE_RE, "from must be YYYY-MM-DD").optional().describe("可选，按该日期（Asia/Shanghai）计算，默认今天") },
-      handler: async (args) => {
-        try {
-          const { from } = z.object({ from: z.string().regex(DATE_RE).optional() }).parse(args ?? {});
-          if (from !== undefined) {
-            const parsed = DateTime.fromISO(from, { zone: CHINA_ZONE });
-            if (!parsed.isValid || parsed.toISODate() !== from) {
-              return fail("from must be a valid calendar date");
-            }
+    withTool(
+      {
+        name: "next",
+        description: "查询距离下一次中国大陆法定节假日放假还有多少天。返回节日名、放假起止日期、倒计时天数及该假期的调休上班日；若正在假期中会返回 ongoing 与剩余天数。",
+      },
+      { from: z.string().regex(DATE_RE, "from must be YYYY-MM-DD").optional().describe("可选，按该日期（Asia/Shanghai）计算，默认今天") },
+      async ({ from }) => {
+        if (from !== undefined) {
+          const parsed = DateTime.fromISO(from, { zone: CHINA_ZONE });
+          if (!parsed.isValid || parsed.toISODate() !== from) {
+            return fail("from must be a valid calendar date");
           }
-          const at = from
-            ? DateTime.fromISO(from, { zone: CHINA_ZONE }).startOf("day").toJSDate()
-            : new Date();
-          return ok(nextHoliday(at));
-        } catch (e) {
-          return fail((e as Error).message);
         }
+        const at = from
+          ? DateTime.fromISO(from, { zone: CHINA_ZONE }).startOf("day").toJSDate()
+          : new Date();
+        return ok(nextHoliday(at));
       },
-    },
-    {
-      name: "list",
-      description: "查询指定年份的中国大陆法定节假日安排：所有连休期（起止日期、天数、调休上班日）及该年全部调休上班日。数据缺失时会自动向官方数据源补齐。",
-      schema: { year: z.number().int().min(2004).max(2100) },
-      handler: async (args) => {
-        try {
-          const { year } = z.object({ year: z.number().int().min(2004).max(2100) }).parse(args ?? {});
-          await ensureYearForView(year);
-          return ok(viewOrFail(year));
-        } catch (e) {
-          return fail((e as Error).message);
-        }
+    ),
+    withTool(
+      {
+        name: "list",
+        description: "查询指定年份的中国大陆法定节假日安排：所有连休期（起止日期、天数、调休上班日）及该年全部调休上班日。数据缺失时会自动向官方数据源补齐。",
       },
-    },
-    {
-      name: "is_workday",
-      description: "判断某一天是否为中国大陆法定工作日。会考虑法定节假日与调休上班日；缺省判断今天。返回 isWorkday、dayType（workday/holiday/weekend/weekday）与节日名/补班说明。",
-      schema: { date: z.string().regex(DATE_RE, "date must be YYYY-MM-DD").optional().describe("可选，默认今天（Asia/Shanghai）") },
-      handler: async (args) => {
-        try {
-          const { date } = z.object({ date: z.string().regex(DATE_RE).optional() }).parse(args ?? {});
-          const target = date ?? DateTime.fromJSDate(new Date(), { zone: CHINA_ZONE }).toISODate();
-          if (!target) throw new Error("invalid date");
-          await ensureDayCoverage(target);
-          const info = dayInfo(target);
-          if (!info) throw new Error(`invalid date: ${target}`);
-          return ok(info);
-        } catch (e) {
-          return fail((e as Error).message);
-        }
+      { year: z.number().int().min(2004).max(2100) },
+      async ({ year }) => {
+        await ensureYearForView(year);
+        return ok(viewOrFail(year));
       },
-    },
-    {
-      name: "refresh",
-      description: "手动触发补抓指定年份（默认当年）的中国大陆法定节假日安排并重算受影响的 workday/holiday 日程；force=true 会跳过失败冷却立即重试。数据仍来自官方数据源。",
-      schema: {
+    ),
+    withTool(
+      {
+        name: "is_workday",
+        description: "判断某一天是否为中国大陆法定工作日。会考虑法定节假日与调休上班日；缺省判断今天。返回 isWorkday、dayType（workday/holiday/weekend/weekday）与节日名/补班说明。",
+      },
+      { date: z.string().regex(DATE_RE, "date must be YYYY-MM-DD").optional().describe("可选，默认今天（Asia/Shanghai）") },
+      async ({ date }) => {
+        const target = date ?? DateTime.fromJSDate(new Date(), { zone: CHINA_ZONE }).toISODate();
+        if (!target) throw new Error("invalid date");
+        await ensureDayCoverage(target);
+        const info = dayInfo(target);
+        if (!info) throw new Error(`invalid date: ${target}`);
+        return ok(info);
+      },
+    ),
+    withTool(
+      {
+        name: "refresh",
+        description: "手动触发补抓指定年份（默认当年）的中国大陆法定节假日安排并重算受影响的 workday/holiday 日程；force=true 会跳过失败冷却立即重试。数据仍来自官方数据源。",
+      },
+      {
         year: z.number().int().min(2004).max(2100).optional(),
         force: z.boolean().optional(),
       },
-      handler: async (args) => {
-        try {
-          const { year, force } = z.object({
-            year: z.number().int().min(2004).max(2100).optional(),
-            force: z.boolean().optional(),
-          }).parse(args ?? {});
-          const targetYear = year ?? localYear();
-          const record = await ensureHolidayYear(targetYear, {
-            allowFallback: targetYear <= localYear(),
-            requireOfficialPapers: targetYear > localYear(),
-            cooldownMs: force ? 0 : undefined,
-          });
-          const summary = reconcileHolidaySchedules();
-          return ok({
-            fetched: true,
-            year: record.year,
-            source: record.source,
-            fetchedAt: record.fetchedAt,
-            days: record.days.length,
-            scheduleReconcile: summary,
-          });
-        } catch (e) {
-          return fail((e as Error).message);
-        }
+      async ({ year, force }) => {
+        const targetYear = year ?? localYear();
+        const record = await ensureHolidayYear(targetYear, {
+          allowFallback: targetYear <= localYear(),
+          requireOfficialPapers: targetYear > localYear(),
+          cooldownMs: force ? 0 : undefined,
+        });
+        const summary = reconcileHolidaySchedules();
+        return ok({
+          fetched: true,
+          year: record.year,
+          source: record.source,
+          fetchedAt: record.fetchedAt,
+          days: record.days.length,
+          scheduleReconcile: summary,
+        });
       },
-    },
+    ),
   ],
   jobs: [
     {

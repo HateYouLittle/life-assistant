@@ -1,6 +1,6 @@
 import { config } from "../../config.js";
 import { currentLocation } from "../../core/location.js";
-import { registerModule, ok, fail, type AssistantModule } from "../../core/registry.js";
+import { registerModule, ok, fail, withTool, type AssistantModule } from "../../core/registry.js";
 import { fetchOilPrice, type OilPriceObservation } from "./provider.js";
 import { nextWindow } from "./schedule.js";
 import { runOilPriceWatch } from "./watch.js";
@@ -38,30 +38,30 @@ export function nextAdjustmentSummary(at = new Date()) {
 const oilpriceModule: AssistantModule = {
   name: "oilprice",
   tools: [
-    {
-      name: "current",
-      description: "查询用户所在地当前油价（92#、95# 汽油与 0# 柴油，元/升）。",
-      schema: {},
-      handler: async () => {
-        try {
-          const loc = currentLocation();
-          if (!loc) throw new Error("位置未确认，请先调用 location.get");
-          return ok(currentOilPriceResult(await fetchOilPrice(loc.city, { province: loc.province })));
-        } catch (e) {
-          return fail((e as Error).message);
-        }
+    withTool(
+      {
+        name: "current",
+        description: "查询用户所在地当前油价（92#、95# 汽油与 0# 柴油，元/升）。",
       },
-    },
-    {
-      name: "next_adjustment",
-      description: "查询下一次油价调整窗口、生效时间与倒计时。发改委每 10 个工作日一调。",
-      schema: {},
-      handler: async () => {
+      {},
+      async () => {
+        const loc = currentLocation();
+        if (!loc) throw new Error("位置未确认，请先调用 location.get");
+        return ok(currentOilPriceResult(await fetchOilPrice(loc.city, { province: loc.province })));
+      },
+    ),
+    withTool(
+      {
+        name: "next_adjustment",
+        description: "查询下一次油价调整窗口、生效时间与倒计时。发改委每 10 个工作日一调。",
+      },
+      {},
+      () => {
         const summary = nextAdjustmentSummary();
         if (!summary) return fail("年度窗口表未覆盖当前日期，请更新 src/modules/oilprice/schedule.ts");
         return ok(summary);
       },
-    },
+    ),
   ],
   jobs: [
     {

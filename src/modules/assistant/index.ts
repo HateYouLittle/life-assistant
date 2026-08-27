@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { registerModule, ok, fail, type AssistantModule } from "../../core/registry.js";
+import { registerModule, ok, withTool, type AssistantModule } from "../../core/registry.js";
 import { requireProfileContext, type ProfileContext } from "../../core/profile.js";
 import { getDatabase } from "../../core/database.js";
 import { currentLocation, saveImportedLocation } from "../../core/location.js";
@@ -275,39 +275,28 @@ export function importAssistantExport(
 const assistantModule: AssistantModule = {
   name: "assistant",
   tools: [
-    {
-      name: "export",
-      description: "导出当前 Profile 的数据快照（日程全量含状态、自动任务、静默时段和共享位置）为 JSON，用于备份或迁移。返回的 JSON 可原样传给 assistant.import。导出不包含通知历史与 Webhook secret。单类条目超过 1000 条时 truncated=true，快照不完整，应提示用户。",
-      schema: {},
-      handler: async (_args, context) => {
-        try {
-          return ok(buildAssistantExport(context ?? requireProfileContext()));
-        } catch (error) {
-          return fail((error as Error).message);
-        }
+    withTool(
+      {
+        name: "export",
+        description: "导出当前 Profile 的数据快照（日程全量含状态、自动任务、静默时段和共享位置）为 JSON，用于备份或迁移。返回的 JSON 可原样传给 assistant.import。导出不包含通知历史与 Webhook secret。单类条目超过 1000 条时 truncated=true，快照不完整，应提示用户。",
       },
-    },
-    {
-      name: "import",
-      description: "导入 assistant.export 生成的快照（仅支持当前导出版本）：日程/自动任务按 ID 幂等导入（已存在的跳过，不覆盖），静默时段直接应用；applyLocation=true 时才覆盖共享位置（多 Profile 共享位置，默认不动）。非法条目跳过并计入 invalid；快照带 truncated=true 时应向用户说明数据不完整。",
-      schema: {
+      {},
+      (_args, context) => ok(buildAssistantExport(context ?? requireProfileContext())),
+    ),
+    withTool(
+      {
+        name: "import",
+        description: "导入 assistant.export 生成的快照（仅支持当前导出版本）：日程/自动任务按 ID 幂等导入（已存在的跳过，不覆盖），静默时段直接应用；applyLocation=true 时才覆盖共享位置（多 Profile 共享位置，默认不动）。非法条目跳过并计入 invalid；快照带 truncated=true 时应向用户说明数据不完整。",
+      },
+      {
         data: z.unknown().describe("assistant.export 返回的快照对象"),
         applyLocation: z.boolean().optional().describe("是否用快照中的位置覆盖当前共享位置，默认 false"),
       },
-      handler: async (args, context) => {
-        try {
-          const parsed = z.object({
-            data: z.unknown(),
-            applyLocation: z.boolean().optional(),
-          }).parse(args ?? {});
-          return ok(importAssistantExport(context ?? requireProfileContext(), parsed.data, {
-            applyLocation: parsed.applyLocation ?? false,
-          }));
-        } catch (error) {
-          return fail((error as Error).message);
-        }
-      },
-    },
+      (args, context) =>
+        ok(importAssistantExport(context ?? requireProfileContext(), args.data, {
+          applyLocation: args.applyLocation ?? false,
+        })),
+    ),
   ],
 };
 

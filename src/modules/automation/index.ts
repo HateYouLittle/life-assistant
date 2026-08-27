@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { config } from "../../config.js";
-import { registerModule, ok, fail, type AssistantModule } from "../../core/registry.js";
+import { registerModule, ok, withTool, type AssistantModule } from "../../core/registry.js";
 import { requireProfileContext } from "../../core/profile.js";
 import { automationActions } from "./actions.js";
 import {
@@ -28,10 +28,12 @@ const conditionField = automationConditionSchema.optional().describe(
 export const automationModule: AssistantModule = {
   name: "automation",
   tools: [
-    {
-      name: "create",
-      description: `创建当前 Profile 的私有自动任务（确定性执行，不使用 LLM）。scheduler 按 schedule 到点执行白名单 action，条件满足（或无条件）时通过主动通知提醒；同一任务每个本地日期最多主动提醒一次。可用 action：\n${actionHelp}`,
-      schema: {
+    withTool(
+      {
+        name: "create",
+        description: `创建当前 Profile 的私有自动任务（确定性执行，不使用 LLM）。scheduler 按 schedule 到点执行白名单 action，条件满足（或无条件）时通过主动通知提醒；同一任务每个本地日期最多主动提醒一次。可用 action：\n${actionHelp}`,
+      },
+      {
         name: z.string().min(1).max(100).describe("任务名，如 早晨下雨提醒"),
         action: z.string().describe("白名单 action 名，见工具说明"),
         params: z.record(z.string(), z.unknown()).optional().describe("action 参数，如 { city: \"北京\" } 或 { days: 2 }"),
@@ -39,39 +41,22 @@ export const automationModule: AssistantModule = {
         schedule: scheduleField.describe("daily（每天 time，可带 timezone）或 interval（每 minutes 分钟，最小 5）"),
         enabled: z.boolean().optional().describe("缺省 true"),
       },
-      handler: async (args, context) => {
-        try {
-          const parsed = z.object({
-            name: z.string().min(1).max(100),
-            action: z.string(),
-            params: z.record(z.string(), z.unknown()).optional(),
-            condition: automationConditionSchema.optional(),
-            schedule: automationScheduleSchema,
-            enabled: z.boolean().optional(),
-          }).parse(args);
-          return ok(createAutomation(context ?? requireProfileContext(), parsed));
-        } catch (error) {
-          return fail((error as Error).message);
-        }
+      (args, context) => ok(createAutomation(context ?? requireProfileContext(), args)),
+    ),
+    withTool(
+      {
+        name: "list",
+        description: "列出当前 Profile 的自动任务（含 enabled、调度、条件、最近一次运行结果与错误）。",
       },
-    },
-    {
-      name: "list",
-      description: "列出当前 Profile 的自动任务（含 enabled、调度、条件、最近一次运行结果与错误）。",
-      schema: { enabled: z.boolean().optional().describe("按启用状态过滤") },
-      handler: async (args, context) => {
-        try {
-          const { enabled } = z.object({ enabled: z.boolean().optional() }).parse(args ?? {});
-          return ok({ automations: listAutomations(context ?? requireProfileContext(), { enabled }) });
-        } catch (error) {
-          return fail((error as Error).message);
-        }
+      { enabled: z.boolean().optional().describe("按启用状态过滤") },
+      (args, context) => ok({ automations: listAutomations(context ?? requireProfileContext(), args) }),
+    ),
+    withTool(
+      {
+        name: "update",
+        description: "修改当前 Profile 的自动任务（name/action/params/condition/schedule/enabled）。condition 传 null 表示清除条件。",
       },
-    },
-    {
-      name: "update",
-      description: "修改当前 Profile 的自动任务（name/action/params/condition/schedule/enabled）。condition 传 null 表示清除条件。",
-      schema: {
+      {
         id: z.string(),
         name: z.string().min(1).max(100).optional(),
         action: z.string().optional(),
@@ -80,51 +65,27 @@ export const automationModule: AssistantModule = {
         schedule: automationScheduleSchema.optional(),
         enabled: z.boolean().optional(),
       },
-      handler: async (args, context) => {
-        try {
-          const parsed = z.object({
-            id: z.string(),
-            name: z.string().min(1).max(100).optional(),
-            action: z.string().optional(),
-            params: z.record(z.string(), z.unknown()).optional(),
-            condition: automationConditionSchema.nullable().optional(),
-            schedule: automationScheduleSchema.optional(),
-            enabled: z.boolean().optional(),
-          }).parse(args);
-          const { id, ...changes } = parsed;
-          return ok(updateAutomation(context ?? requireProfileContext(), id, changes));
-        } catch (error) {
-          return fail((error as Error).message);
-        }
+      (args, context) => {
+        const { id, ...changes } = args;
+        return ok(updateAutomation(context ?? requireProfileContext(), id, changes));
       },
-    },
-    {
-      name: "delete",
-      description: "删除当前 Profile 的自动任务。",
-      schema: { id: z.string() },
-      handler: async (args, context) => {
-        try {
-          const { id } = z.object({ id: z.string() }).parse(args);
-          deleteAutomation(context ?? requireProfileContext(), id);
-          return ok({ deleted: true, id });
-        } catch (error) {
-          return fail((error as Error).message);
-        }
+    ),
+    withTool(
+      { name: "delete", description: "删除当前 Profile 的自动任务。" },
+      { id: z.string() },
+      (args, context) => {
+        deleteAutomation(context ?? requireProfileContext(), args.id);
+        return ok({ deleted: true, id: args.id });
       },
-    },
-    {
-      name: "run",
-      description: "立即手动执行一次自动任务并返回结果（用于验证配置）。条件满足时会推送一条提醒（同一分钟内重复执行会去重）；手动执行不影响任务的既定调度节奏。",
-      schema: { id: z.string() },
-      handler: async (args, context) => {
-        try {
-          const { id } = z.object({ id: z.string() }).parse(args);
-          return ok(await runAutomationNow(context ?? requireProfileContext(), id));
-        } catch (error) {
-          return fail((error as Error).message);
-        }
+    ),
+    withTool(
+      {
+        name: "run",
+        description: "立即手动执行一次自动任务并返回结果（用于验证配置）。条件满足时会推送一条提醒（同一分钟内重复执行会去重）；手动执行不影响任务的既定调度节奏。",
       },
-    },
+      { id: z.string() },
+      (args, context) => ok(runAutomationNow(context ?? requireProfileContext(), args.id)),
+    ),
   ],
   jobs: [
     {

@@ -1,5 +1,6 @@
 import { config } from "../../config.js";
 import { httpJson } from "../../core/http.js";
+import { assertQweatherOk } from "../../core/qweather.js";
 import { store } from "../../core/store.js";
 
 export interface CurrentWeather {
@@ -73,9 +74,7 @@ export function parseQweatherIndices(raw: unknown): LifeIndex[] {
     code?: string | number;
     daily?: Array<{ date?: string; type?: string; name?: string; level?: string; category?: string; text?: string }>;
   };
-  if (body.code !== undefined && body.code !== null && String(body.code) !== "200") {
-    throw new Error(`QWeather indices error code ${body.code}`);
-  }
+  assertQweatherOk(body.code, "indices");
   if (!Array.isArray(body.daily)) throw new Error("weather provider: QWeather indices response is missing daily");
   return body.daily
     .filter((entry) => typeof entry.name === "string" && entry.name.length > 0 && typeof entry.category === "string")
@@ -279,10 +278,7 @@ export async function fetchCurrent(lat: number, lon: number, city?: string): Pro
         `https://${config.qweatherApiHost}/v7/weather/now?location=${loc?.id ?? `${lon.toFixed(2)},${lat.toFixed(2)}`}&key=${config.qweatherKey}`,
       );
       // 和风业务错误：HTTP 200 + code 字段（如 401/402/403）→ 抛出后走 Open-Meteo 降级。
-      // code 可能是数字或字符串，统一 String 化比较，避免数字型 code 绕过检查。
-      if (r.code !== undefined && r.code !== null && String(r.code) !== "200") {
-        throw new Error(`QWeather weathernow error code ${r.code}`);
-      }
+      assertQweatherOk(r.code, "weathernow");
       if (r.now) {
         const temperature = Number(r.now.temp);
         const apparent = Number(r.now.feelsLike);
@@ -335,9 +331,7 @@ export async function fetchForecast(lat: number, lon: number, days = 3, city?: s
         `https://${config.qweatherApiHost}/v7/weather/${daysKey}?location=${loc?.id ?? `${lon.toFixed(2)},${lat.toFixed(2)}`}&key=${config.qweatherKey}`,
       );
       // 和风业务错误：HTTP 200 + code 字段（如 401/402/403）→ 抛出后走 Open-Meteo 降级
-      if (r.code !== undefined && r.code !== null && String(r.code) !== "200") {
-        throw new Error(`QWeather weatherforecast error code ${r.code}`);
-      }
+      assertQweatherOk(r.code, "weatherforecast");
       if (r.daily !== undefined && r.daily.length === 0) {
         // 空 daily 视为失败，继续 Open-Meteo 兜底，而不是把空数组返回给上层（N12）
         throw new Error("QWeather forecast returned empty daily");
@@ -425,9 +419,7 @@ export async function fetchAlerts(city: string, lat: number, lon: number): Promi
         `https://${config.qweatherApiHost}/weatheralert/v1/current/${lat.toFixed(2)}/${lon.toFixed(2)}?key=${config.qweatherKey}`,
       );
       // 和风业务错误：HTTP 200 + code 字段（如 401/402/403）→ 抛出后走阈值推断降级
-      if (r.code !== undefined && r.code !== null && String(r.code) !== "200") {
-        throw new Error(`QWeather weatheralert error code ${r.code}`);
-      }
+      assertQweatherOk(r.code, "weatheralert");
       const attributions = r.metadata?.attributions ?? [];
       return (r.alerts ?? []).map((w): OfficialWeatherAlert => ({
         kind: "official",

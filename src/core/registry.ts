@@ -1,4 +1,4 @@
-import type { ZodRawShape } from "zod";
+import { z, type ZodRawShape } from "zod";
 import type { ProfileContext } from "./profile.js";
 
 export interface ToolResult {
@@ -26,6 +26,30 @@ export interface JobDef {
   cron: string;
   timezone?: string;
   handler: (ctx: JobContext) => Promise<void>;
+}
+
+/**
+ * 工具定义的统一构造器：schema 只声明一次，注册与参数解析共用同一形状；
+ * args 归一化为对象后交给业务函数，异常统一转 isError 结果。
+ */
+export function withTool<S extends ZodRawShape>(
+  def: { name: string; description: string },
+  schema: S,
+  run: (args: z.output<z.ZodObject<S>>, context?: ProfileContext) => Promise<ToolResult> | ToolResult,
+): ToolDef {
+  const parser = z.object(schema);
+  return {
+    name: def.name,
+    description: def.description,
+    schema,
+    handler: async (args, context) => {
+      try {
+        return await run(parser.parse(args ?? {}), context);
+      } catch (error) {
+        return fail((error as Error).message);
+      }
+    },
+  };
 }
 
 /**

@@ -6,7 +6,7 @@ import { httpJson } from "../../core/http.js";
 import { publishNotification } from "../../core/notification-publisher.js";
 import type { DailyWeatherPayload, NotificationEnvelope } from "../../core/notification.js";
 import { publishGlobal } from "../../core/notifier.js";
-import { registerModule, ok, fail, type AssistantModule } from "../../core/registry.js";
+import { registerModule, ok, withTool, type AssistantModule } from "../../core/registry.js";
 import {
   fetchCurrent,
   fetchForecast,
@@ -226,65 +226,55 @@ export async function resolveLocation(city?: string): Promise<{ city: string; la
 const weatherModule: AssistantModule = {
   name: "weather",
   tools: [
-    {
-      name: "current",
-      description: "查询实时天气。默认查询已保存位置；也可传 city 查询任意城市（如 朔城区/北京），临时查询不改变已保存位置。",
-      schema: { city: z.string().optional().describe("城市名（可选），如 朔城区/北京；不传则查已保存位置") },
-      handler: async (args) => {
-        try {
-          const { city } = z.object({ city: z.string().optional() }).parse(args ?? {});
-          const loc = await resolveLocation(city);
-          const w = await fetchCurrent(loc.lat, loc.lon, loc.city);
-          return ok({ city: loc.city, ...w, unit: { temperature: "℃", windSpeed: w.windSpeedUnit } });
-        } catch (e) {
-          return fail((e as Error).message);
-        }
+    withTool(
+      {
+        name: "current",
+        description: "查询实时天气。默认查询已保存位置；也可传 city 查询任意城市（如 朔城区/北京），临时查询不改变已保存位置。",
       },
-    },
-    {
-      name: "forecast",
-      description: "查询未来 N 天天气预报。默认查询已保存位置；也可传 city 查询任意城市（如 朔城区/北京），临时查询不改变已保存位置。",
-      schema: { days: z.number().int().min(1).max(7).default(3).describe("预报天数 1-7"), city: z.string().optional().describe("城市名（可选），如 朔城区/北京；不传则查已保存位置") },
-      handler: async (args) => {
-        try {
-          const { days, city } = z.object({ days: z.number().int().min(1).max(7).default(3), city: z.string().optional() }).parse(args ?? {});
-          const loc = await resolveLocation(city);
-          return ok({ city: loc.city, forecast: await fetchForecast(loc.lat, loc.lon, days, loc.city) });
-        } catch (e) {
-          return fail((e as Error).message);
-        }
+      { city: z.string().optional().describe("城市名（可选），如 朔城区/北京；不传则查已保存位置") },
+      async ({ city }) => {
+        const loc = await resolveLocation(city);
+        const w = await fetchCurrent(loc.lat, loc.lon, loc.city);
+        return ok({ city: loc.city, ...w, unit: { temperature: "℃", windSpeed: w.windSpeedUnit } });
       },
-    },
-    {
-      name: "alerts",
-      description: "查询当前生效的气象预警（暴雨/台风/高温/大风等）。默认查询已保存位置；也可传 city 查询任意城市，临时查询不改变已保存位置。",
-      schema: { city: z.string().optional().describe("城市名（可选），如 朔城区/北京；不传则查已保存位置") },
-      handler: async (args) => {
-        try {
-          const { city } = z.object({ city: z.string().optional() }).parse(args ?? {});
-          const loc = await resolveLocation(city);
-          const alerts = await fetchAlerts(loc.city, loc.lat, loc.lon);
-          return ok({ city: loc.city, count: alerts.length, alerts });
-        } catch (e) {
-          return fail((e as Error).message);
-        }
+    ),
+    withTool(
+      {
+        name: "forecast",
+        description: "查询未来 N 天天气预报。默认查询已保存位置；也可传 city 查询任意城市（如 朔城区/北京），临时查询不改变已保存位置。",
       },
-    },
-    {
-      name: "indices",
-      description: "查询今日生活指数（穿衣/紫外线/洗车/运动/感冒等）。和风生活指数需 QWEATHER_KEY；未配置时降级为 Open-Meteo 紫外线指数（degraded=true 标注）。默认查询已保存位置；也可传 city 查询任意城市，临时查询不改变已保存位置。",
-      schema: { city: z.string().optional().describe("城市名（可选），如 朔城区/北京；不传则查已保存位置") },
-      handler: async (args) => {
-        try {
-          const { city } = z.object({ city: z.string().optional() }).parse(args ?? {});
-          const loc = await resolveLocation(city);
-          const result = await fetchIndices(loc.city, loc.lat, loc.lon);
-          return ok({ city: loc.city, ...result });
-        } catch (e) {
-          return fail((e as Error).message);
-        }
+      {
+        days: z.number().int().min(1).max(7).default(3).describe("预报天数 1-7"),
+        city: z.string().optional().describe("城市名（可选），如 朔城区/北京；不传则查已保存位置"),
       },
-    },
+      async ({ days, city }) => {
+        const loc = await resolveLocation(city);
+        return ok({ city: loc.city, forecast: await fetchForecast(loc.lat, loc.lon, days, loc.city) });
+      },
+    ),
+    withTool(
+      {
+        name: "alerts",
+        description: "查询当前生效的气象预警（暴雨/台风/高温/大风等）。默认查询已保存位置；也可传 city 查询任意城市，临时查询不改变已保存位置。",
+      },
+      { city: z.string().optional().describe("城市名（可选），如 朔城区/北京；不传则查已保存位置") },
+      async ({ city }) => {
+        const loc = await resolveLocation(city);
+        const alerts = await fetchAlerts(loc.city, loc.lat, loc.lon);
+        return ok({ city: loc.city, count: alerts.length, alerts });
+      },
+    ),
+    withTool(
+      {
+        name: "indices",
+        description: "查询今日生活指数（穿衣/紫外线/洗车/运动/感冒等）。和风生活指数需 QWEATHER_KEY；未配置时降级为 Open-Meteo 紫外线指数（degraded=true 标注）。默认查询已保存位置；也可传 city 查询任意城市，临时查询不改变已保存位置。",
+      },
+      { city: z.string().optional().describe("城市名（可选），如 朔城区/北京；不传则查已保存位置") },
+      async ({ city }) => {
+        const loc = await resolveLocation(city);
+        return ok({ city: loc.city, ...(await fetchIndices(loc.city, loc.lat, loc.lon)) });
+      },
+    ),
   ],
   jobs: [
     {

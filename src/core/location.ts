@@ -2,7 +2,7 @@ import { z } from "zod";
 import { config } from "../config.js";
 import { store } from "./store.js";
 import { httpJson } from "./http.js";
-import { registerModule, ok, fail, type AssistantModule } from "./registry.js";
+import { registerModule, ok, fail, withTool, type AssistantModule } from "./registry.js";
 
 export interface Location {
   city: string;
@@ -74,12 +74,14 @@ async function detectByIp(): Promise<{ city: string; lat: number; lon: number } 
 const locationModule: AssistantModule = {
   name: "location",
   tools: [
-    {
-      name: "get",
-      description:
-        "获取用户当前位置。首次使用天气/油价功能前必须调用。若返回 need_confirm，请把 suggestion 用自然语言复述给用户并请其确认，确认后将 city、province（如有）和经纬度传给 location.set 保存。",
-      schema: {},
-      handler: async () => {
+    withTool(
+      {
+        name: "get",
+        description:
+          "获取用户当前位置。首次使用天气/油价功能前必须调用。若返回 need_confirm，请把 suggestion 用自然语言复述给用户并请其确认，确认后将 city、province（如有）和经纬度传给 location.set 保存。",
+      },
+      {},
+      async () => {
         const loc = currentLocation();
         if (loc) return ok({ status: "confirmed", location: loc });
         const suggestion = await detectByIp();
@@ -89,13 +91,14 @@ const locationModule: AssistantModule = {
           hint: "请向用户确认所在地。用户确认后调用 location.set(city, province, lat, lon) 保存（province 缺失时可省略）；若 IP 建议不准确，请让用户告知城市名后再次调用 location.detect(city)，并把返回的 province 一并传回 location.set。",
         });
       },
-    },
-    {
-      name: "detect",
-      description: "按城市名解析经纬度和省级行政区（先和风 GeoAPI，再 Open-Meteo Geocoding 兜底），用于用户口述城市后补全位置；确认后请把 province 一并传给 location.set。",
-      schema: { city: z.string().describe("城市名，如 北京 / 上海 / 朔城区") },
-      handler: async (args) => {
-        const { city } = z.object({ city: z.string() }).parse(args);
+    ),
+    withTool(
+      {
+        name: "detect",
+        description: "按城市名解析经纬度和省级行政区（先和风 GeoAPI，再 Open-Meteo Geocoding 兜底），用于用户口述城市后补全位置；确认后请把 province 一并传给 location.set。",
+      },
+      { city: z.string().describe("城市名，如 北京 / 上海 / 朔城区") },
+      async ({ city }) => {
         // 优先和风 GeoAPI：对中文区县（如"朔城区"）支持好
         if (config.qweatherKey) {
           try {
@@ -128,18 +131,19 @@ const locationModule: AssistantModule = {
         }
         return ok({ city: hit.name, province: hit.admin1, lat, lon });
       },
-    },
-    {
-      name: "set",
-      description: "保存用户确认后的位置（城市、省级行政区〔如 detect 返回〕和经纬度）。",
-      schema: locationSetSchema.shape,
-      handler: async (args) => {
-        const p = locationSetSchema.parse(args);
-        const loc: Location = { ...p, source: "manual", confirmedAt: new Date().toISOString() };
+    ),
+    withTool(
+      {
+        name: "set",
+        description: "保存用户确认后的位置（城市、省级行政区〔如 detect 返回〕和经纬度）。",
+      },
+      locationSetSchema.shape,
+      ({ city, province, lat, lon }) => {
+        const loc: Location = { city, province, lat, lon, source: "manual", confirmedAt: new Date().toISOString() };
         store.set(KEY, loc);
         return ok({ status: "saved", location: loc });
       },
-    },
+    ),
   ],
 };
 

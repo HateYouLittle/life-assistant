@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { registerModule, ok, fail, type AssistantModule } from "../../core/registry.js";
+import { registerModule, ok, withTool, type AssistantModule } from "../../core/registry.js";
 import { requireProfileContext } from "../../core/profile.js";
 import {
   completeSchedule,
@@ -75,95 +75,57 @@ const updateFields = {
 const scheduleModule: AssistantModule = {
   name: "schedule",
   tools: [
-    {
-      name: "create",
-      description: "在当前 Hermes Profile 中创建私有待办、生日或纪念日。支持公历和中国农历；农历日期必须使用 lunarMonth/lunarDay，不要当作公历日期填写。recurrence.frequency 支持 workday（中国大陆法定工作日：周一至周五剔除法定节假日、加入调休上班的周末）与 holiday（仅法定节假日休假日，不含普通周末），两者仅支持公历与 Asia/Shanghai 时区。",
-      schema: commonFields,
-      handler: async (args, context) => {
-        try {
-          return ok(createSchedule(context ?? requireProfileContext(), z.object(commonFields).parse(args)));
-        } catch (error) {
-          return fail((error as Error).message);
-        }
+    withTool(
+      {
+        name: "create",
+        description: "在当前 Hermes Profile 中创建私有待办、生日或纪念日。支持公历和中国农历；农历日期必须使用 lunarMonth/lunarDay，不要当作公历日期填写。recurrence.frequency 支持 workday（中国大陆法定工作日：周一至周五剔除法定节假日、加入调休上班的周末）与 holiday（仅法定节假日休假日，不含普通周末），两者仅支持公历与 Asia/Shanghai 时区。",
       },
-    },
-    {
-      name: "list",
-      description: "列出当前 Hermes Profile 的私有日程，可按类型、状态、时间范围和 upcoming 数量筛选。",
-      schema: {
+      commonFields,
+      (args, context) => ok(createSchedule(context ?? requireProfileContext(), args)),
+    ),
+    withTool(
+      {
+        name: "list",
+        description: "列出当前 Hermes Profile 的私有日程，可按类型、状态、时间范围和 upcoming 数量筛选。",
+      },
+      {
         type: z.enum(["todo", "birthday", "anniversary"]).optional(),
         status: z.enum(["active", "completed", "archived"]).optional(),
         from: z.string().optional(),
         to: z.string().optional(),
         upcoming: z.number().int().min(1).max(500).optional(),
       },
-      handler: async (args, context) => {
-        try {
-          return ok(listSchedules(context ?? requireProfileContext(), z.object({
-            type: z.enum(["todo", "birthday", "anniversary"]).optional(),
-            status: z.enum(["active", "completed", "archived"]).optional(),
-            from: z.string().optional(),
-            to: z.string().optional(),
-            upcoming: z.number().int().min(1).max(500).optional(),
-          }).parse(args ?? {})));
-        } catch (error) {
-          return fail((error as Error).message);
-        }
+      (args, context) => ok(listSchedules(context ?? requireProfileContext(), args)),
+    ),
+    withTool(
+      { name: "get", description: "查看当前 Hermes Profile 的一条私有日程。" },
+      { id: z.string() },
+      (args, context) => ok(getSchedule(context ?? requireProfileContext(), args.id)),
+    ),
+    withTool(
+      {
+        name: "update",
+        description: "修改当前 Hermes Profile 的私有日程；不能通过参数切换到其他 Profile。",
       },
-    },
-    {
-      name: "get",
-      description: "查看当前 Hermes Profile 的一条私有日程。",
-      schema: { id: z.string() },
-      handler: async (args, context) => {
-        try {
-          return ok(getSchedule(context ?? requireProfileContext(), z.object({ id: z.string() }).parse(args).id));
-        } catch (error) {
-          return fail((error as Error).message);
-        }
+      { id: z.string(), ...updateFields },
+      (args, context) => {
+        const { id, ...changes } = args;
+        return ok(updateSchedule(context ?? requireProfileContext(), id, changes));
       },
-    },
-    {
-      name: "update",
-      description: "修改当前 Hermes Profile 的私有日程；不能通过参数切换到其他 Profile。",
-      schema: { id: z.string(), ...updateFields },
-      handler: async (args, context) => {
-        try {
-          const parsed = z.object({ id: z.string(), ...updateFields }).parse(args);
-          const { id, ...changes } = parsed;
-          return ok(updateSchedule(context ?? requireProfileContext(), id, changes));
-        } catch (error) {
-          return fail((error as Error).message);
-        }
+    ),
+    withTool(
+      { name: "complete", description: "完成当前 Profile 的一次性日程或某个重复 occurrence。" },
+      { id: z.string(), occurrenceKey: z.string().optional() },
+      (args, context) => ok(completeSchedule(context ?? requireProfileContext(), args.id, args.occurrenceKey)),
+    ),
+    withTool(
+      { name: "delete", description: "删除当前 Hermes Profile 的私有日程及其未投递提醒。" },
+      { id: z.string() },
+      (args, context) => {
+        deleteSchedule(context ?? requireProfileContext(), args.id);
+        return ok({ deleted: true, id: args.id });
       },
-    },
-    {
-      name: "complete",
-      description: "完成当前 Profile 的一次性日程或某个重复 occurrence。",
-      schema: { id: z.string(), occurrenceKey: z.string().optional() },
-      handler: async (args, context) => {
-        try {
-          const parsed = z.object({ id: z.string(), occurrenceKey: z.string().optional() }).parse(args);
-          return ok(completeSchedule(context ?? requireProfileContext(), parsed.id, parsed.occurrenceKey));
-        } catch (error) {
-          return fail((error as Error).message);
-        }
-      },
-    },
-    {
-      name: "delete",
-      description: "删除当前 Hermes Profile 的私有日程及其未投递提醒。",
-      schema: { id: z.string() },
-      handler: async (args, context) => {
-        try {
-          const id = z.object({ id: z.string() }).parse(args).id;
-          deleteSchedule(context ?? requireProfileContext(), id);
-          return ok({ deleted: true, id });
-        } catch (error) {
-          return fail((error as Error).message);
-        }
-      },
-    },
+    ),
   ],
 };
 

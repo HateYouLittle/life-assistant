@@ -1,5 +1,6 @@
 import { config } from "../../config.js";
 import { httpJson } from "../../core/http.js";
+import { assertQweatherOk } from "../../core/qweather.js";
 
 /** 空气质量观测：scale 标注 AQI 采用的量表（国标/美标），两种量表的数值不可直接比较。 */
 export interface AirQuality {
@@ -73,9 +74,7 @@ export function parseQweatherAqi(city: string, raw: unknown): AirQuality {
       so2?: string;
     };
   };
-  if (body.code !== undefined && body.code !== null && String(body.code) !== "200") {
-    throw new Error(`QWeather airnow error code ${body.code}`);
-  }
+  assertQweatherOk(body.code, "airnow");
   const now = body.now;
   if (!now) throw new Error("airquality provider: QWeather airnow response is missing now");
   const aqi = toFiniteNumber(now.aqi, "now.aqi");
