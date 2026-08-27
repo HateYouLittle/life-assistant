@@ -23,7 +23,7 @@ const {
 } = await import("../src/modules/schedule/service.js");
 const { ingestHolidayYear } = await import("../src/modules/holiday/calendar.js");
 const { parseDataset } = await import("../src/modules/holiday/provider.js");
-const { runDueSchedules } = await import("../src/scheduler.js");
+const { runDueSchedules } = await import("../src/modules/schedule/tick.js");
 
 const db = getDatabase();
 const profile = requireProfileContext("schedule-holiday");

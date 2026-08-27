@@ -60,6 +60,12 @@ export interface AssistantModule {
   name: string;
   tools?: ToolDef[];
   jobs?: JobDef[];
+  /**
+   * 可选：随 scheduler 每分钟 tick 执行的模块级扫描（如日程到期扫描）。
+   * 入参为本次 tick 的时间；scheduler 保证同一时刻只有一个 tick 在跑
+   * （重叠直接跳过），并按模块隔离异常后继续投递管道。
+   */
+  tick?: (at: Date) => Promise<void>;
   /** 可选：scheduler 取得租约后启动时执行一次（如引导抓取全局数据）；异常由 scheduler 隔离记录。 */
   onStart?: () => Promise<void>;
 }

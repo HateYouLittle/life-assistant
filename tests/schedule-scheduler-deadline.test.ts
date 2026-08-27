@@ -13,7 +13,7 @@ delete process.env.PROFILE_PUSH_ROUTES_JSON;
 const { requireProfileContext } = await import("../src/core/profile.js");
 const { getDatabase, resetDatabaseForTests } = await import("../src/core/database.js");
 const { completeSchedule, createSchedule } = await import("../src/modules/schedule/service.js");
-const { runDueSchedules } = await import("../src/scheduler.js");
+const { runDueSchedules } = await import("../src/modules/schedule/tick.js");
 
 const db = getDatabase();
 const profile = requireProfileContext("scheduler-deadline");

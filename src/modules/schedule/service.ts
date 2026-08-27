@@ -466,7 +466,8 @@ export function findOccurrence(item: ScheduleItem, from: ValidDateTime = DateTim
 }
 
 /** 与 scheduler 的 occurrenceCompleted 保持同一判断口径：occurrence_key 精确或前缀匹配 completed 行。 */
-function isScheduleOccurrenceCompleted(profileId: string, scheduleId: string, occurrenceAt: string): boolean {
+/** 该 occurrence（含子键，如 completed 标记）是否已完成；调度扫描与完成路径共用同一判定。 */
+export function isScheduleOccurrenceCompleted(profileId: string, scheduleId: string, occurrenceAt: string): boolean {
   return Boolean(getDatabase().prepare(`
     SELECT 1 FROM schedule_occurrences
     WHERE profile_id = ? AND schedule_id = ? AND status = 'completed'

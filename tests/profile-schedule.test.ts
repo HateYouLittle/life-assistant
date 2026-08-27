@@ -54,7 +54,9 @@ const databaseModule = await import("../src/core/database.js");
 const { getDatabase } = databaseModule;
 const migrateDatabaseSchema = (databaseModule as Record<string, unknown>).migrateDatabaseSchema as (db: DatabaseSync) => void;
 const schedulerModule = await import("../src/scheduler.js");
-const { runDueSchedules, acquireSchedulerLease, refreshSchedulerLease, releaseSchedulerLease } = schedulerModule;
+// runDueSchedules（到期扫描）的权威实现已迁入 schedule 模块，经 tick 扩展点接入。
+const { runDueSchedules } = await import("../src/modules/schedule/tick.js");
+const { acquireSchedulerLease, refreshSchedulerLease, releaseSchedulerLease } = schedulerModule;
 const runSchedulerTick = (schedulerModule as Record<string, unknown>).runSchedulerTick as (
   at: Date,
   fetchImpl: typeof fetch,
