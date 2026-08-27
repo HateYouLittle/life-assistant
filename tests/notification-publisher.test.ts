@@ -56,7 +56,7 @@ test("the semantic bridge renders before using the existing global publish contr
   };
 
   await publishNotification(notification, {
-    publishGlobal: async (source, title, body, dedupeKey) => {
+    publishGlobal: async ({ source, title, body, dedupeKey }) => {
       calls.push({ source, title, body, dedupeKey });
     },
   });
@@ -95,7 +95,7 @@ test("the semantic bridge accepts a render target and snapshots an injected rend
       assert.equal(target, "qq-markdown");
       return { title: "Rendered once", body: "Stored snapshot" };
     },
-    publishProfile: async (profileId, source, title, body, dedupeKey) => {
+    publishProfile: async ({ profileId, source, title, body, dedupeKey }) => {
       calls.push({ profileId, source, title, body, dedupeKey });
     },
   });
@@ -131,7 +131,7 @@ test("profile-scoped notifications render with the profile's configured renderTa
   const calls: Array<{ profileId: string; source: string; title: string; body: string; dedupeKey: string }> = [];
 
   await publishNotification(dailyBrief("profile-a:daily-1", { type: "profile", profileId: "profile-a" }), {
-    publishProfile: async (profileId, source, title, body, dedupeKey) => {
+    publishProfile: async ({ profileId, source, title, body, dedupeKey }) => {
       calls.push({ profileId, source, title, body, dedupeKey });
     },
   });
@@ -160,7 +160,7 @@ test("routes without renderTarget resolve to plain when no renderer or target is
   const calls: Array<{ profileId: string; source: string; title: string; body: string; dedupeKey: string }> = [];
 
   await publishNotification(dailyBrief("profile-b:daily-1", { type: "profile", profileId: "profile-b" }), {
-    publishProfile: async (profileId, source, title, body, dedupeKey) => {
+    publishProfile: async ({ profileId, source, title, body, dedupeKey }) => {
       calls.push({ profileId, source, title, body, dedupeKey });
     },
   });

@@ -1,7 +1,7 @@
 import { DateTime } from "luxon";
 import { currentLocation } from "../location/index.js";
 import { publishNotification } from "../../core/notification-publisher.js";
-import { publishGlobal } from "../../core/notifier.js";
+import type { GlobalPublishFn } from "../../core/notifier.js";
 import { store } from "../../core/store.js";
 import { advanceNoticeNotification, officialResultNotification } from "./notification.js";
 import {
@@ -14,14 +14,6 @@ import { nearestWindowDeviationDays, nextWindow } from "./schedule.js";
 
 const BUSINESS_TIMEZONE = "Asia/Shanghai";
 const FUEL_KEYS: FuelKey[] = ["p92", "p95", "p0"];
-
-type GlobalPublisher = (
-  source: string,
-  title: string,
-  body: string,
-  dedupeKey: string,
-  legacyDedupeKeys?: readonly string[],
-) => Promise<void>;
 
 export interface OilPriceState {
   schemaVersion: 1;
@@ -161,7 +153,7 @@ export async function observeOilPrice(
   options: {
     observedAt: Date;
     repository?: OilPriceStateRepository;
-    publish?: GlobalPublisher;
+    publish?: GlobalPublishFn;
   },
 ): Promise<OilPriceObservationOutcome> {
   // 与静态窗口表交叉校验：Provider 的 windowDate 应贴近表中最近窗口（±1 天容差），
@@ -229,7 +221,8 @@ export async function observeOilPrice(
     unit: observation.unit,
     fuels: observation.fuels,
   });
-  await publishNotification(notification, { publishGlobal: options.publish ?? publishGlobal });
+  // 未注入测试替身时交由核心默认实现，模块不再显式回注。
+  await publishNotification(notification, options.publish ? { publishGlobal: options.publish } : {});
   const nextState = baseline(observation, options.observedAt, observation.windowDate);
   if (!nextState) return "retry";
   repository.set(nextState);
@@ -241,12 +234,12 @@ export interface OilPriceWatchOptions {
   getLocation?: () => { city: string; province?: string } | null;
   fetchPrice?: (city: string, options?: FetchOilPriceOptions) => Promise<OilPriceObservation>;
   repository?: OilPriceStateRepository;
-  publish?: GlobalPublisher;
+  publish?: GlobalPublishFn;
 }
 
 export async function runOilPriceWatch(options: OilPriceWatchOptions = {}): Promise<void> {
   const at = options.at ?? new Date();
-  const publish = options.publish ?? publishGlobal;
+  const publishers = options.publish ? { publishGlobal: options.publish } : {};
   const errors: unknown[] = [];
   const window = nextWindow(at);
   if (!window) {
@@ -260,7 +253,7 @@ export async function runOilPriceWatch(options: OilPriceWatchOptions = {}): Prom
         windowDate: window.date,
         effectiveAt: window.effectiveAt,
         generatedAt: observedAt(at),
-      }), { publishGlobal: publish });
+      }), publishers);
     } catch (error) {
       errors.push(error);
     }
@@ -273,7 +266,7 @@ export async function runOilPriceWatch(options: OilPriceWatchOptions = {}): Prom
       await observeOilPrice(observation, {
         observedAt: at,
         repository: options.repository,
-        publish,
+        publish: options.publish,
       });
     }
   } catch (error) {

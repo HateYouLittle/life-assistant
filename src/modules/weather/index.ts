@@ -3,7 +3,7 @@ import { DateTime } from "luxon";
 import { config } from "../../config.js";
 import { publishNotification } from "../../core/notification-publisher.js";
 import type { EnvelopeFor } from "../../core/notification.js";
-import { publishGlobal } from "../../core/notifier.js";
+import type { GlobalPublishFn } from "../../core/notifier.js";
 import { registerModule, ok, withTool, type AssistantModule } from "../../core/registry.js";
 import { currentLocation, resolveLocation } from "../location/index.js";
 import {
@@ -17,7 +17,7 @@ import {
 } from "./provider.js";
 import { fetchAirQuality, type AirQuality } from "../airquality/provider.js";
 import type { DailyWeatherPayload } from "./notification.js";
-import { inferredAlertNotification, legacyWeatherAlertDedupeKeys, officialAlertNotification } from "./notification.js";
+import { inferredAlertNotification, officialAlertNotification } from "./notification.js";
 
 export interface DailyWeatherBriefOptions {
   at?: Date;
@@ -26,13 +26,8 @@ export interface DailyWeatherBriefOptions {
   getCurrent?: (lat: number, lon: number, city: string) => Promise<CurrentWeather>;
   getForecast?: (lat: number, lon: number, days: number, city: string) => Promise<ForecastDay[]>;
   getAirQuality?: (city: string, lat: number, lon: number) => Promise<AirQuality>;
-  publish?: (
-    source: string,
-    title: string,
-    body: string,
-    dedupeKey: string,
-    legacyDedupeKeys?: readonly string[],
-  ) => Promise<void>;
+  /** 测试注入用；缺省走核心通知引擎。 */
+  publish?: GlobalPublishFn;
 }
 
 /** 带伞建议：概率（Open-Meteo）、量级（和风，1mm 起滤掉痕量）、天气现象三信号任一命中。 */
@@ -123,15 +118,12 @@ export async function runDailyWeatherBrief(options: DailyWeatherBriefOptions = {
     scope: { type: "global" },
     headline: dailyHeadline(location.city, currentValue, today),
     generatedAt: at.toISOString(),
+    // 升级兼容：旧版本键形如 weather:daily-brief:{localDate}，同日升级会与带城市的新键
+    // 各产生一条通知；命中旧行会被改键复用，避免升级当天重复推送。
+    legacyDedupeKeys: [`weather:daily-brief:${localDate}`],
     payload,
   };
-  await publishNotification(
-    notification,
-    options.publish ? { publishGlobal: options.publish } : {},
-    // 升级兼容：旧版本键形如 weather:daily-brief:{localDate}，同日升级会与带城市的新键
-    // 各产生一条通知；传入 legacy 键让既有行被改键复用，避免升级当天重复推送。
-    [`weather:daily-brief:${localDate}`],
-  );
+  await publishNotification(notification, options.publish ? { publishGlobal: options.publish } : {});
 }
 
 export interface WeatherAlertsCheckOptions {
@@ -139,13 +131,8 @@ export interface WeatherAlertsCheckOptions {
   timezone?: string;
   getLocation?: () => { city: string; lat: number; lon: number } | null;
   getAlerts?: (city: string, lat: number, lon: number) => Promise<WeatherAlert[]>;
-  publish?: (
-    source: string,
-    title: string,
-    body: string,
-    dedupeKey: string,
-    legacyDedupeKeys?: readonly string[],
-  ) => Promise<void>;
+  /** 测试注入用；缺省走核心通知引擎。 */
+  publish?: GlobalPublishFn;
 }
 
 export async function runWeatherAlertsCheck(options: WeatherAlertsCheckOptions = {}): Promise<void> {
@@ -153,17 +140,16 @@ export async function runWeatherAlertsCheck(options: WeatherAlertsCheckOptions =
   if (!location) return;
   const at = options.at ?? new Date();
   const timezone = options.timezone ?? config.timezone;
-  const publish = options.publish ?? publishGlobal;
+  const publishers = options.publish ? { publishGlobal: options.publish } : {};
   const alerts = await (options.getAlerts ?? fetchAlerts)(location.city, location.lat, location.lon);
   for (const alert of alerts) {
-    const legacyDedupeKeys = legacyWeatherAlertDedupeKeys(alert, at);
     if (alert.kind === "inferred") {
       try {
         const notification = inferredAlertNotification(alert, {
           generatedAt: at.toISOString(),
           timezone,
         });
-        await publishNotification(notification, { publishGlobal: publish }, legacyDedupeKeys);
+        await publishNotification(notification, publishers);
       } catch (error) {
         // 推断分支连发布失败也一并隔离（不阻断其余告警）；official 分支仅隔离构建错误。
         console.error(`[weather] inferred alert omitted: ${(error as Error).message}`);
@@ -180,7 +166,7 @@ export async function runWeatherAlertsCheck(options: WeatherAlertsCheckOptions =
       console.error(`[weather] official alert omitted: ${(error as Error).message}`);
       continue;
     }
-    await publishNotification(notification, { publishGlobal: publish }, legacyDedupeKeys);
+    await publishNotification(notification, publishers);
   }
 }
 

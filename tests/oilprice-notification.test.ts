@@ -36,7 +36,7 @@ test("advance notice semantic publishing uses one stable identity for the window
       effectiveAt: "2026-08-15T00:00:00+08:00",
       generatedAt,
     }), {
-      publishGlobal: async (_source, _title, _body, dedupeKey) => { keys.push(dedupeKey); },
+      publishGlobal: async ({ dedupeKey }) => { keys.push(dedupeKey); },
     });
   }
 

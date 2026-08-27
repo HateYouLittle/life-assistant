@@ -168,7 +168,7 @@ test("daily brief includes an air-quality line when the AQI source succeeds", as
       city: "萍乡", scale: "CN", aqi: 42, category: "优",
       pollutants: { pm25: 8 }, source: "和风天气",
     }),
-    publish: async (_source, title, body, dedupeKey) => {
+    publish: async ({ title, body, dedupeKey }) => {
       published.push({ title, body, dedupeKey });
     },
   });
@@ -191,8 +191,8 @@ test("daily brief still publishes when the AQI source fails", async () => {
     getAirQuality: async () => {
       throw new Error("aqi provider down");
     },
-    publish: async (_source, title, body) => {
-      published.push({ title, body });
+    publish: async ({ body }) => {
+      published.push({ body });
     },
   });
   assert.equal(published.length, 1);

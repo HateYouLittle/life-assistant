@@ -142,7 +142,7 @@ test("schedule CRUD is isolated by Profile", () => {
 });
 
 test("global notices are visible once independently to each Profile", async () => {
-  await publishGlobal("weather", "shared alert", "global:test:1");
+  await publishGlobal({ title: "weather", body: "shared alert", dedupeKey: "global:test:1" });
   const a = pullPending(requireProfileContext("profile-a"));
   const b = pullPending(requireProfileContext("profile-b"));
   assert.equal(a.filter((n) => n.body === "shared alert").length, 1);
@@ -151,7 +151,7 @@ test("global notices are visible once independently to each Profile", async () =
 });
 
 test("the two-argument global form preserves its resolved fields for every Profile", async () => {
-  await publishGlobal("Two-argument title", "Two-argument body");
+  await publishGlobal({ title: "Two-argument title", body: "Two-argument body" });
 
   const rows = db.prepare(`
     SELECT profile_id, source, title, body, dedupe_key
@@ -179,8 +179,8 @@ test("the two-argument global form preserves its resolved fields for every Profi
 });
 
 test("a global event enqueues exactly one Hermes delivery per configured Profile route", async () => {
-  await publishGlobal("weather", "Public alert", "shared active push", "global:push:once");
-  await publishGlobal("weather", "Public alert", "shared active push", "global:push:once");
+  await publishGlobal({ source: "weather", title: "Public alert", body: "shared active push", dedupeKey: "global:push:once" });
+  await publishGlobal({ source: "weather", title: "Public alert", body: "shared active push", dedupeKey: "global:push:once" });
 
   const rows = db.prepare(`
     SELECT n.profile_id, n.source, n.title, n.body, d.route, d.status
@@ -218,7 +218,7 @@ test("republishing a retained legacy global event does not create Profile duplic
     VALUES(?, ?, ?, ?, ?)
   `).run("weather", "Legacy alert", "retained pull item", "2026-08-02T00:00:00.000Z", dedupeKey);
 
-  await publishGlobal("weather", "Republished alert", "duplicate profile item", dedupeKey);
+  await publishGlobal({ source: "weather", title: "Republished alert", body: "duplicate profile item", dedupeKey });
 
   const profileCopies = db.prepare(`
     SELECT COUNT(*) AS count FROM profile_notifications WHERE dedupe_key = ?
@@ -242,13 +242,7 @@ test("a retained global weather alert promotes an exact legacy alias without fan
     lastInsertRowid: number | bigint;
   };
 
-  await publishGlobal(
-    "weather",
-    "New rendered title",
-    "New rendered body",
-    stableKey,
-    [legacyKey, "weather:alert:保留的官方原始标题:2026-08-03"],
-  );
+  await publishGlobal({ source: "weather", title: "New rendered title", body: "New rendered body", dedupeKey: stableKey }, { legacyDedupeKeys: [legacyKey, "weather:alert:保留的官方原始标题:2026-08-03"] });
 
   const row = db.prepare(`
     SELECT id, title, body, dedupe_key FROM global_notifications WHERE id = ?
@@ -279,13 +273,7 @@ test("an existing stable key wins without deleting its legacy alias row", async 
     globalStableKey,
   );
 
-  await publishGlobal(
-    "weather",
-    "Ignored replacement",
-    "Ignored replacement body",
-    globalStableKey,
-    [globalLegacyKey],
-  );
+  await publishGlobal({ source: "weather", title: "Ignored replacement", body: "Ignored replacement body", dedupeKey: globalStableKey }, { legacyDedupeKeys: [globalLegacyKey] });
 
   const globalRows = db.prepare(`
     SELECT title, dedupe_key FROM global_notifications
@@ -298,16 +286,9 @@ test("an existing stable key wins without deleting its legacy alias row", async 
 
   const profileLegacyKey = "weather:alert:profile-conflict-title:2026-08-04";
   const profileStableKey = "weather:alert:id:profile-conflict";
-  await publishProfile("profile-a", "weather", "Profile legacy", "Legacy body", profileLegacyKey);
-  await publishProfile("profile-a", "weather", "Profile stable", "Stable body", profileStableKey);
-  await publishProfile(
-    "profile-a",
-    "weather",
-    "Ignored replacement",
-    "Ignored replacement body",
-    profileStableKey,
-    [profileLegacyKey],
-  );
+  await publishProfile({ profileId: "profile-a", source: "weather", title: "Profile legacy", body: "Legacy body", dedupeKey: profileLegacyKey });
+  await publishProfile({ profileId: "profile-a", source: "weather", title: "Profile stable", body: "Stable body", dedupeKey: profileStableKey });
+  await publishProfile({ profileId: "profile-a", source: "weather", title: "Ignored replacement", body: "Ignored replacement body", dedupeKey: profileStableKey }, { legacyDedupeKeys: [profileLegacyKey] });
 
   const profileRows = db.prepare(`
     SELECT title, dedupe_key FROM profile_notifications
@@ -383,7 +364,7 @@ test("the daily brief labels probability percent and precipitation amount millim
     getLocation: () => ({ city: "北京", lat: 39.9, lon: 116.4 }),
     getAirQuality: async () => { throw new Error("aqi provider unavailable"); },
     getCurrent: async () => { throw new Error("current unavailable"); },
-    publish: async (_source: string, _title: string, body: string) => {
+    publish: async ({ body }) => {
       bodies.push(body);
     },
   };
@@ -433,7 +414,7 @@ test("the daily brief survives a forecast provider failure", async () => {
       weatherText: "晴",
     }),
     getForecast: async () => { throw new Error("forecast unavailable"); },
-    publish: async (source, title, body, dedupeKey) => {
+    publish: async ({ source, title, body, dedupeKey }) => {
       published.push({ source, title, body, dedupeKey });
     },
   });
@@ -467,7 +448,7 @@ test("the daily brief leaves its dedupe key free when current weather fails and 
       };
     },
     getForecast: async () => [],
-    publish: async (source: string, title: string, body: string, dedupeKey: string) => {
+    publish: async ({ source, title, body, dedupeKey }) => {
       published.push({ source, title, body, dedupeKey });
     },
   };
@@ -622,7 +603,7 @@ test("an inferred weather risk is explicitly labeled and never rendered as an of
       level: "inferred",
       description: "未来48小时最高气温约36℃，注意防暑降温。",
     }],
-    publish: async (source, title, body, dedupeKey) => {
+    publish: async ({ source, title, body, dedupeKey }) => {
       published.push({ source, title, body, dedupeKey });
     },
   });
@@ -699,7 +680,7 @@ test("an alert without a usable identity is omitted without blocking later offic
       description: "完整的官方原文。",
       attributions: [],
     }],
-    publish: async (_source, _title, _body, dedupeKey) => {
+    publish: async ({ dedupeKey }) => {
       published.push({ dedupeKey });
     },
   });
@@ -723,7 +704,7 @@ test("the standard scheduler notify callback automatically uses Profile Hermes r
 });
 
 test("profile notices never cross the queue boundary", async () => {
-  await publishProfile("profile-a", "schedule", "A only", "profile:test:a");
+  await publishProfile({ profileId: "profile-a", title: "schedule", body: "A only", dedupeKey: "profile:test:a" });
   const a = pullPending(requireProfileContext("profile-a"));
   const b = pullPending(requireProfileContext("profile-b"));
   assert.equal(a.some((n) => n.body === "A only"), true);
@@ -731,7 +712,7 @@ test("profile notices never cross the queue boundary", async () => {
 });
 
 test("a Profile notification with no configured route remains in notify.pull", async () => {
-  await publishProfile("profile-c", "schedule", "No route", "pull fallback", "profile:missing-route:1");
+  await publishProfile({ profileId: "profile-c", source: "schedule", title: "No route", body: "pull fallback", dedupeKey: "profile:missing-route:1" });
   const notices = pullPending(requireProfileContext("profile-c"));
   assert.equal(notices.some((notice) => notice.title === "No route" && notice.body === "pull fallback"), true);
   const deliveries = db.prepare(`
@@ -743,9 +724,9 @@ test("a Profile notification with no configured route remains in notify.pull", a
 });
 
 test("configured profiles enqueue one idempotent QQ webhook delivery", async () => {
-  await publishProfile("profile-a", "schedule", "QQ push", "private body", "push:test:a");
-  await publishProfile("profile-a", "schedule", "QQ push", "private body", "push:test:a");
-  await publishProfile("profile-c", "schedule", "queue only", "fallback body", "push:test:c");
+  await publishProfile({ profileId: "profile-a", source: "schedule", title: "QQ push", body: "private body", dedupeKey: "push:test:a" });
+  await publishProfile({ profileId: "profile-a", source: "schedule", title: "QQ push", body: "private body", dedupeKey: "push:test:a" });
+  await publishProfile({ profileId: "profile-c", source: "schedule", title: "queue only", body: "fallback body", dedupeKey: "push:test:c" });
 
   const rows = db.prepare(`
     SELECT d.profile_id, d.route, d.status, n.title
@@ -764,7 +745,7 @@ test("configured profiles enqueue one idempotent QQ webhook delivery", async () 
 });
 
 test("a route change never re-enqueues a notification that was already sent", async () => {
-  await publishProfile("profile-a", "schedule", "Delivered before route change", "do not resend", "push:sent-before-route-change");
+  await publishProfile({ profileId: "profile-a", source: "schedule", title: "Delivered before route change", body: "do not resend", dedupeKey: "push:sent-before-route-change" });
   const notification = db.prepare(
     "SELECT id FROM profile_notifications WHERE profile_id = ? AND dedupe_key = ?",
   ).get("profile-a", "push:sent-before-route-change") as { id: number };
@@ -780,7 +761,7 @@ test("a route change never re-enqueues a notification that was already sent", as
     secret: testSecretA,
   };
   try {
-    await publishProfile("profile-a", "schedule", "Delivered before route change", "do not resend", "push:sent-before-route-change");
+    await publishProfile({ profileId: "profile-a", source: "schedule", title: "Delivered before route change", body: "do not resend", dedupeKey: "push:sent-before-route-change" });
   } finally {
     routes["profile-a"] = original;
   }
@@ -794,13 +775,7 @@ test("a route change never re-enqueues a notification that was already sent", as
 test("removed routes do not consume delivery batch capacity", async () => {
   db.prepare("UPDATE profile_notification_deliveries SET status = 'cancelled'").run();
   for (let index = 0; index < 101; index += 1) {
-    await publishProfile(
-      "profile-a",
-      "schedule",
-      `Removed route ${index}`,
-      "stale route",
-      `push:removed-route:${index}`,
-    );
+    await publishProfile({ profileId: "profile-a", source: "schedule", title: `Removed route ${index}`, body: "stale route", dedupeKey: `push:removed-route:${index}` });
   }
   db.prepare(`
     UPDATE profile_notification_deliveries
@@ -809,7 +784,7 @@ test("removed routes do not consume delivery batch capacity", async () => {
       SELECT id FROM profile_notifications WHERE dedupe_key LIKE 'push:removed-route:%'
     )
   `).run();
-  await publishProfile("profile-a", "schedule", "Valid after stale batch", "must send", "push:valid-after-stale");
+  await publishProfile({ profileId: "profile-a", source: "schedule", title: "Valid after stale batch", body: "must send", dedupeKey: "push:valid-after-stale" });
 
   let calls = 0;
   const result = await deliverPendingProfileNotifications({
@@ -831,7 +806,7 @@ test("removed routes do not consume delivery batch capacity", async () => {
 });
 
 test("QQ webhook delivery uses HMAC V2 and marks the outbox sent", async () => {
-  await publishProfile("profile-b", "schedule", "Deliver me", "private body", "push:deliver:b");
+  await publishProfile({ profileId: "profile-b", source: "schedule", title: "Deliver me", body: "private body", dedupeKey: "push:deliver:b" });
   const at = new Date("2100-01-01T00:00:00.000Z");
   const requests: Array<{ url: string; init: RequestInit }> = [];
   const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
@@ -879,8 +854,8 @@ test("QQ webhook delivery uses HMAC V2 and marks the outbox sent", async () => {
 });
 
 test("each webhook request uses a fresh HMAC timestamp", async () => {
-  await publishProfile("profile-a", "schedule", "Batch one", "body one", "push:batch:1");
-  await publishProfile("profile-a", "schedule", "Batch two", "body two", "push:batch:2");
+  await publishProfile({ profileId: "profile-a", source: "schedule", title: "Batch one", body: "body one", dedupeKey: "push:batch:1" });
+  await publishProfile({ profileId: "profile-a", source: "schedule", title: "Batch two", body: "body two", dedupeKey: "push:batch:2" });
   const ids = db.prepare(
     "SELECT id FROM profile_notifications WHERE profile_id = ? AND dedupe_key IN (?, ?) ORDER BY id",
   ).all("profile-a", "push:batch:1", "push:batch:2") as Array<{ id: number }>;
@@ -908,7 +883,7 @@ test("each webhook request uses a fresh HMAC timestamp", async () => {
 });
 
 test("failed QQ delivery waits for backoff before retrying", async () => {
-  await publishProfile("profile-a", "schedule", "Retry me", "retry body", "push:retry:a");
+  await publishProfile({ profileId: "profile-a", source: "schedule", title: "Retry me", body: "retry body", dedupeKey: "push:retry:a" });
   const notification = db.prepare(
     "SELECT id FROM profile_notifications WHERE profile_id = ? AND dedupe_key = ?",
   ).get("profile-a", "push:retry:a") as { id: number };
@@ -967,7 +942,7 @@ test("failed QQ delivery waits for backoff before retrying", async () => {
 });
 
 test("confirmed HTTP failures may retry a fresh request ID after a one-hour backoff", async () => {
-  await publishProfile("profile-b", "schedule", "HTTP retry", "fresh generation", "push:http-long-retry:b");
+  await publishProfile({ profileId: "profile-b", source: "schedule", title: "HTTP retry", body: "fresh generation", dedupeKey: "push:http-long-retry:b" });
   const notification = db.prepare(
     "SELECT id FROM profile_notifications WHERE profile_id = ? AND dedupe_key = ?",
   ).get("profile-b", "push:http-long-retry:b") as { id: number };
@@ -1009,7 +984,7 @@ test("confirmed HTTP failures may retry a fresh request ID after a one-hour back
 });
 
 test("confirmed HTTP failures stop after the bounded retry schedule and remain pullable", async () => {
-  await publishProfile("profile-b", "schedule", "Bounded HTTP failure", "recover by pull", "push:http-bounded:b");
+  await publishProfile({ profileId: "profile-b", source: "schedule", title: "Bounded HTTP failure", body: "recover by pull", dedupeKey: "push:http-bounded:b" });
   const notification = db.prepare(
     "SELECT id FROM profile_notifications WHERE profile_id = ? AND dedupe_key = ?",
   ).get("profile-b", "push:http-bounded:b") as { id: number };
@@ -1038,7 +1013,7 @@ test("confirmed HTTP failures stop after the bounded retry schedule and remain p
 });
 
 test("a transport timeout reuses the same webhook request ID", async () => {
-  await publishProfile("profile-b", "schedule", "Timeout me", "network uncertain", "push:timeout:b");
+  await publishProfile({ profileId: "profile-b", source: "schedule", title: "Timeout me", body: "network uncertain", dedupeKey: "push:timeout:b" });
   const notification = db.prepare(
     "SELECT id FROM profile_notifications WHERE profile_id = ? AND dedupe_key = ?",
   ).get("profile-b", "push:timeout:b") as { id: number };
@@ -1073,7 +1048,7 @@ test("a transport timeout reuses the same webhook request ID", async () => {
 });
 
 test("three transport-uncertain failures fall back before the idempotency window expires", async () => {
-  await publishProfile("profile-b", "schedule", "Fallback me", "avoid late duplicate", "push:fallback:b");
+  await publishProfile({ profileId: "profile-b", source: "schedule", title: "Fallback me", body: "avoid late duplicate", dedupeKey: "push:fallback:b" });
   const notification = db.prepare(
     "SELECT id FROM profile_notifications WHERE profile_id = ? AND dedupe_key = ?",
   ).get("profile-b", "push:fallback:b") as { id: number };
@@ -1117,7 +1092,7 @@ test("three transport-uncertain failures fall back before the idempotency window
 });
 
 test("repeated stale claims cannot extend a request ID beyond the idempotency window", async () => {
-  await publishProfile("profile-a", "schedule", "Old request", "must fall back", "push:old-request:a");
+  await publishProfile({ profileId: "profile-a", source: "schedule", title: "Old request", body: "must fall back", dedupeKey: "push:old-request:a" });
   const notification = db.prepare(
     "SELECT id FROM profile_notifications WHERE profile_id = ? AND dedupe_key = ?",
   ).get("profile-a", "push:old-request:a") as { id: number };
@@ -1156,7 +1131,7 @@ test("repeated stale claims cannot extend a request ID beyond the idempotency wi
 });
 
 test("an in-flight delivery is atomically claimed from other workers and notify.pull", async () => {
-  await publishProfile("profile-a", "schedule", "Claim me", "single sender", "push:claim:a");
+  await publishProfile({ profileId: "profile-a", source: "schedule", title: "Claim me", body: "single sender", dedupeKey: "push:claim:a" });
   const notification = db.prepare(
     "SELECT id FROM profile_notifications WHERE profile_id = ? AND dedupe_key = ?",
   ).get("profile-a", "push:claim:a") as { id: number };
@@ -1205,7 +1180,7 @@ test("an in-flight delivery is atomically claimed from other workers and notify.
 });
 
 test("a successfully pushed notification is not repeated by notify.pull", async () => {
-  await publishProfile("profile-a", "schedule", "Already pushed", "do not repeat", "push:sent:a");
+  await publishProfile({ profileId: "profile-a", source: "schedule", title: "Already pushed", body: "do not repeat", dedupeKey: "push:sent:a" });
   const notification = db.prepare(
     "SELECT id FROM profile_notifications WHERE profile_id = ? AND dedupe_key = ?",
   ).get("profile-a", "push:sent:a") as { id: number };
@@ -1220,7 +1195,7 @@ test("a successfully pushed notification is not repeated by notify.pull", async 
 });
 
 test("notify.pull suppression follows only the current Profile route", async () => {
-  await publishProfile("profile-a", "schedule", "Current route pending", "show once", "push:route-change:a");
+  await publishProfile({ profileId: "profile-a", source: "schedule", title: "Current route pending", body: "show once", dedupeKey: "push:route-change:a" });
   const notification = db.prepare(
     "SELECT id FROM profile_notifications WHERE profile_id = ? AND dedupe_key = ?",
   ).get("profile-a", "push:route-change:a") as { id: number };
@@ -1244,7 +1219,7 @@ test("notify.pull suppression follows only the current Profile route", async () 
 });
 
 test("notify.pull ignores historical sent routes when no current route exists", async () => {
-  await publishProfile("profile-a", "schedule", "Historical route", "recover through pull", "push:no-current-route:a");
+  await publishProfile({ profileId: "profile-a", source: "schedule", title: "Historical route", body: "recover through pull", dedupeKey: "push:no-current-route:a" });
   const notification = db.prepare(
     "SELECT id FROM profile_notifications WHERE profile_id = ? AND dedupe_key = ?",
   ).get("profile-a", "push:no-current-route:a") as { id: number };
@@ -1267,7 +1242,7 @@ test("notify.pull ignores historical sent routes when no current route exists", 
 });
 
 test("notify.pull cancels a pending QQ delivery after the user has seen it", async () => {
-  await publishProfile("profile-b", "schedule", "Seen in chat", "cancel QQ duplicate", "push:pull:b");
+  await publishProfile({ profileId: "profile-b", source: "schedule", title: "Seen in chat", body: "cancel QQ duplicate", dedupeKey: "push:pull:b" });
   const notification = db.prepare(
     "SELECT id FROM profile_notifications WHERE profile_id = ? AND dedupe_key = ?",
   ).get("profile-b", "push:pull:b") as { id: number };
@@ -1422,7 +1397,7 @@ test("a notification insert failure does not consume the schedule occurrence", a
 });
 
 test("a poison schedule does not starve healthy schedules or existing QQ outbox", async () => {
-  await publishProfile("profile-b", "schedule", "Existing outbox", "must still send", "push:existing:b");
+  await publishProfile({ profileId: "profile-b", source: "schedule", title: "Existing outbox", body: "must still send", dedupeKey: "push:existing:b" });
   const existingNotification = db.prepare(
     "SELECT id FROM profile_notifications WHERE profile_id = ? AND dedupe_key = ?",
   ).get("profile-b", "push:existing:b") as { id: number };
@@ -2086,7 +2061,7 @@ test("the daily brief reuses the legacy same-day key so an upgrade-day run does 
     }],
   };
   return (async () => {
-    await publishProfile("profile-a", "weather", "旧键简报", "旧正文", "weather:daily-brief:2026-08-09");
+    await publishProfile({ profileId: "profile-a", source: "weather", title: "旧键简报", body: "旧正文", dedupeKey: "weather:daily-brief:2026-08-09" });
     await runDailyWeatherBrief({ ...options, at: new Date("2026-08-09T07:00:00.000Z") });
     const rows = db.prepare(`
       SELECT dedupe_key, COUNT(*) AS count FROM profile_notifications
@@ -2388,7 +2363,7 @@ test("S1: deleteSchedule cancels pending schedule reminders and deletes unread n
   });
   const occurrenceAt = "2099-12-01T01:00:00.000Z";
   const dedupeKey = `schedule:${a.id}:${item.id}:${occurrenceAt}:reminder-1`;
-  await publishProfile(a.id, "schedule", "delete me", "body", dedupeKey);
+  await publishProfile({ profileId: a.id, source: "schedule", title: "delete me", body: "body", dedupeKey });
 
   const pending = db.prepare(`
     SELECT d.status
@@ -2430,7 +2405,7 @@ test("S1: deleteSchedule keeps read schedule notifications but cancels their pen
   });
   const occurrenceAt = "2099-12-02T01:00:00.000Z";
   const dedupeKey = `schedule:${a.id}:${item.id}:${occurrenceAt}:reminder-1`;
-  await publishProfile(a.id, "schedule", "read me", "body", dedupeKey);
+  await publishProfile({ profileId: a.id, source: "schedule", title: "read me", body: "body", dedupeKey });
   const notification = db.prepare(
     "SELECT id FROM profile_notifications WHERE profile_id = ? AND dedupe_key = ?",
   ).get(a.id, dedupeKey) as { id: number };

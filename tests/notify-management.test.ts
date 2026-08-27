@@ -93,7 +93,7 @@ test("isQuietAt handles same-day, cross-midnight and until-midnight windows", ()
 test("deliveries are withheld during quiet hours and released after the window", async () => {
   clearQuietHours("profile-a");
   saveQuietHours("profile-a", "22:00", "07:00", "UTC");
-  await publishProfile("profile-a", "schedule", "静默时段通知", "窗口内不应投递", "mgmt:quiet:1");
+  await publishProfile({ profileId: "profile-a", source: "schedule", title: "静默时段通知", body: "窗口内不应投递", dedupeKey: "mgmt:quiet:1" });
 
   const inWindow: Array<{ url: string }> = [];
   const duringQuiet = await deliverPendingProfileNotifications({
@@ -122,7 +122,7 @@ test("deliveries are withheld during quiet hours and released after the window",
 
 test("snooze defers the next delivery attempt until not_before passes", async () => {
   const at = new Date("2027-02-01T10:00:00.000Z");
-  await publishProfile("profile-a", "schedule", "稍后提醒", "10 分钟后开会", "mgmt:snooze:1");
+  await publishProfile({ profileId: "profile-a", source: "schedule", title: "稍后提醒", body: "10 分钟后开会", dedupeKey: "mgmt:snooze:1" });
   const notificationId = notificationIdFor("mgmt:snooze:1");
 
   const snoozed = snoozeProfileNotificationDelivery("profile-a", notificationId, 30, at);
@@ -151,7 +151,7 @@ test("snooze defers the next delivery attempt until not_before passes", async ()
 });
 
 test("snooze rejects uncertain in-flight failures within the idempotency window", async () => {
-  await publishProfile("profile-a", "schedule", "不确定失败", "结果不确定时不能推迟", "mgmt:uncertain:1");
+  await publishProfile({ profileId: "profile-a", source: "schedule", title: "不确定失败", body: "结果不确定时不能推迟", dedupeKey: "mgmt:uncertain:1" });
   const notificationId = notificationIdFor("mgmt:uncertain:1");
   db.prepare(`
     UPDATE profile_notification_deliveries
@@ -171,7 +171,7 @@ test("snooze rejects uncertain in-flight failures within the idempotency window"
 });
 
 test("snooze on a sent notification explains there is nothing to defer", async () => {
-  await publishProfile("profile-a", "schedule", "已投递通知", "已送达", "mgmt:sent:1");
+  await publishProfile({ profileId: "profile-a", source: "schedule", title: "已投递通知", body: "已送达", dedupeKey: "mgmt:sent:1" });
   const notificationId = notificationIdFor("mgmt:sent:1");
   await deliverPendingProfileNotifications({
     at: new Date("2027-04-01T09:00:00.000Z"),
@@ -187,7 +187,7 @@ test("snooze on a sent notification explains there is nothing to defer", async (
 });
 
 test("cancel stops pending delivery and keeps the notification out of notify.pull", async () => {
-  await publishProfile("profile-a", "schedule", "取消投递", "用户不需要这条提醒", "mgmt:cancel:1");
+  await publishProfile({ profileId: "profile-a", source: "schedule", title: "取消投递", body: "用户不需要这条提醒", dedupeKey: "mgmt:cancel:1" });
   const notificationId = notificationIdFor("mgmt:cancel:1");
 
   const cancelled = cancelProfileNotificationDelivery("profile-a", notificationId);
@@ -220,8 +220,8 @@ test("cancel rejects a notification that does not exist or belongs to another pr
 });
 
 test("listProfileNotifications returns recent entries with delivery status", async () => {
-  await publishProfile("profile-a", "schedule", "列表通知A", "正文A", "mgmt:list:a");
-  await publishProfile("profile-a", "schedule", "列表通知B", "正文B", "mgmt:list:b");
+  await publishProfile({ profileId: "profile-a", source: "schedule", title: "列表通知A", body: "正文A", dedupeKey: "mgmt:list:a" });
+  await publishProfile({ profileId: "profile-a", source: "schedule", title: "列表通知B", body: "正文B", dedupeKey: "mgmt:list:b" });
   await deliverPendingProfileNotifications({
     at: new Date("2027-06-01T09:00:00.000Z"),
     profileId: "profile-a",

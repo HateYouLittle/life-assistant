@@ -119,7 +119,7 @@ test("a published window revision refreshes the baseline so the next window can 
   const calls: Array<{ source: string; title: string; body: string; dedupeKey: string }> = [];
   const outcome = await observeOilPrice(nextObservation(), {
     observedAt: new Date("2026-08-15T01:00:00.000Z"), repository,
-    publish: async (source, title, body, dedupeKey) => { calls.push({ source, title, body, dedupeKey }); },
+    publish: async ({ source, title, body, dedupeKey }) => { calls.push({ source, title, body, dedupeKey }); },
   });
 
   assert.equal(outcome, "published");
@@ -138,7 +138,7 @@ test("a published window revision refreshes the baseline so the next window can 
   });
   assert.equal(await observeOilPrice(revised, {
     observedAt: new Date("2026-08-15T02:00:00.000Z"), repository,
-    publish: async (source, title, body, dedupeKey) => { calls.push({ source, title, body, dedupeKey }); },
+    publish: async ({ source, title, body, dedupeKey }) => { calls.push({ source, title, body, dedupeKey }); },
   }), "ignored");
   assert.equal(calls.length, 1);
   assert.deepEqual(repository.value?.fuels, { p92: "8.04", p95: "8.46", p0: "7.69" });
@@ -156,7 +156,7 @@ test("a published window revision refreshes the baseline so the next window can 
   });
   assert.equal(await observeOilPrice(following, {
     observedAt: new Date("2026-08-29T01:00:00.000Z"), repository,
-    publish: async (source, title, body, dedupeKey) => { calls.push({ source, title, body, dedupeKey }); },
+    publish: async ({ source, title, body, dedupeKey }) => { calls.push({ source, title, body, dedupeKey }); },
   }), "published");
   assert.equal(calls.length, 2);
   assert.equal(calls[1].dedupeKey, "oilprice:result:江西:2026-08-28");
@@ -211,7 +211,7 @@ test("an all-zero window quietly advances the baseline after 48 hours without ba
   const outcome = await observeOilPrice(strandedObservation(), {
     observedAt: new Date("2026-08-16T16:00:00.001Z"),
     repository,
-    publish: async (_source, _title, _body, dedupeKey) => { calls.push(dedupeKey); },
+    publish: async ({ dedupeKey }) => { calls.push(dedupeKey); },
   });
 
   assert.equal(outcome, "baseline");
@@ -240,7 +240,7 @@ test("a complete late result quietly advances the baseline so the next window ca
   const lateOutcome = await observeOilPrice(nextObservation(), {
     observedAt: new Date("2026-08-17T16:00:00.001Z"),
     repository,
-    publish: async (_source, _title, _body, dedupeKey) => { calls.push(dedupeKey); },
+    publish: async ({ dedupeKey }) => { calls.push(dedupeKey); },
   });
 
   assert.equal(lateOutcome, "baseline");
@@ -271,7 +271,7 @@ test("a complete late result quietly advances the baseline so the next window ca
   assert.equal(await observeOilPrice(following, {
     observedAt: new Date("2026-08-29T01:00:00.000Z"),
     repository,
-    publish: async (_source, _title, _body, dedupeKey) => { calls.push(dedupeKey); },
+    publish: async ({ dedupeKey }) => { calls.push(dedupeKey); },
   }), "published");
   assert.deepEqual(calls, ["oilprice:result:江西:2026-08-28"]);
   assert.equal(repository.value?.lastProcessedWindow, "2026-08-28");
@@ -285,7 +285,7 @@ test("the watch publishes an advance notice before rejecting a provider failure"
       getLocation: () => ({ city: "萍乡市安源区" }),
       fetchPrice: async () => { throw new Error("fixture provider unavailable"); },
       repository: memoryRepository(),
-      publish: async (source, _title, _body, dedupeKey) => { calls.push({ source, dedupeKey }); },
+      publish: async ({ source, dedupeKey }) => { calls.push({ source, dedupeKey }); },
     }),
     /fixture provider unavailable/,
   );
@@ -299,7 +299,7 @@ test("advance notice starts strictly inside 40 hours and does not block provider
   await runOilPriceWatch({
     at: new Date("2026-08-13T00:00:00.000Z"),
     getLocation: () => null,
-    publish: async (_source, _title, _body, dedupeKey) => { calls.push(dedupeKey); },
+    publish: async ({ dedupeKey }) => { calls.push(dedupeKey); },
   });
   assert.deepEqual(calls, []);
 
@@ -381,7 +381,7 @@ test("after the window table is exhausted the watch keeps observing without thro
       return tianObservation();
     },
     repository,
-    publish: async (_source, _title, _body, dedupeKey) => { calls.push(dedupeKey); },
+    publish: async ({ dedupeKey }) => { calls.push(dedupeKey); },
   });
 
   assert.equal(fetched, true);
@@ -476,7 +476,7 @@ test("a one-cent rounding deviation is accepted end to end and publishes the off
   }), {
     observedAt: new Date("2026-08-15T01:00:00.000Z"),
     repository,
-    publish: async (_source, _title, _body, dedupeKey) => { calls.push(dedupeKey); },
+    publish: async ({ dedupeKey }) => { calls.push(dedupeKey); },
   });
   assert.equal(outcome, "published");
   assert.deepEqual(calls, ["oilprice:result:江西:2026-08-14"]);
@@ -492,7 +492,7 @@ test("a one-cent rounding deviation is accepted end to end and publishes the off
   }), {
     observedAt: new Date("2026-08-15T01:00:00.000Z"),
     repository: twoCent,
-    publish: async (_source, _title, _body, dedupeKey) => { twoCentCalls.push(dedupeKey); },
+    publish: async ({ dedupeKey }) => { twoCentCalls.push(dedupeKey); },
   }), "retry");
   assert.equal(twoCentCalls.length, 0);
 });
@@ -506,7 +506,7 @@ test("a complete pre-upgrade state without schemaVersion keeps the in-flight win
   const outcome = await observeOilPrice(nextObservation(), {
     observedAt: new Date("2026-08-15T01:00:00.000Z"),
     repository,
-    publish: async (_source, _title, _body, dedupeKey) => { calls.push(dedupeKey); },
+    publish: async ({ dedupeKey }) => { calls.push(dedupeKey); },
   });
   assert.equal(outcome, "published");
   assert.deepEqual(calls, ["oilprice:result:江西:2026-08-14"]);

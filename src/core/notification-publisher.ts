@@ -1,5 +1,5 @@
 import { config, resolveRenderTarget } from "../config.js";
-import { publishGlobal, publishProfile } from "./notifier.js";
+import { publishGlobal, publishProfile, type GlobalPublishFn, type ProfilePublishFn } from "./notifier.js";
 import {
   renderNotification,
   type NotificationEnvelope,
@@ -7,27 +7,9 @@ import {
   type NotificationRenderTarget,
 } from "./notification.js";
 
-type GlobalPublisher = (
-  source: string,
-  title: string,
-  body: string,
-  dedupeKey: string,
-  legacyDedupeKeys?: readonly string[],
-  options?: { renderForProfile?: (profileId: string, shared: { title: string; body: string }) => { title: string; body: string } },
-) => Promise<void>;
-type ProfilePublisher = (
-  profileId: string,
-  source: string,
-  title: string,
-  body: string,
-  dedupeKey: string,
-  legacyDedupeKeys?: readonly string[],
-  envelope?: NotificationEnvelope,
-) => Promise<void>;
-
 export interface NotificationPublishers {
-  publishGlobal?: GlobalPublisher;
-  publishProfile?: ProfilePublisher;
+  publishGlobal?: GlobalPublishFn;
+  publishProfile?: ProfilePublishFn;
   renderTarget?: NotificationRenderTarget;
   /** 按 Profile 求渲染目标；返回 undefined 时继续回退到 renderTarget / 配置 / plain。 */
   renderTargetForProfile?: (profileId: string) => NotificationRenderTarget | undefined;
@@ -42,10 +24,16 @@ function resolveTargetForProfile(publishers: NotificationPublishers, profileId: 
     ?? "plain";
 }
 
+/**
+ * 把一条业务信封接入通知引擎：
+ * - 渲染发生在发布方进程：共享渲染作为 fan-out 的 title/body 契约入参，
+ *   每 Profile 落库快照由 renderForProfile 回调按各自 target 独立生成；
+ * - 信封随快照一并落库（envelope 列），供投递期钩子重渲染；
+ * - 迁移兼容键读取信封上的 legacyDedupeKeys（模块构造时附带），发布层无额外参数。
+ */
 export async function publishNotification(
   notification: NotificationEnvelope,
   publishers: NotificationPublishers = {},
-  legacyDedupeKeys: readonly string[] = [],
 ): Promise<void> {
   const dedupeKey = `${notification.source}:${notification.identity}`;
   if (notification.scope.type === "global") {
@@ -55,12 +43,16 @@ export async function publishNotification(
     const renderForProfile = (profileId: string): { title: string; body: string } =>
       (publishers.renderer ?? renderNotification)(notification, resolveTargetForProfile(publishers, profileId));
     await (publishers.publishGlobal ?? publishGlobal)(
-      notification.source,
-      shared.title,
-      shared.body,
-      dedupeKey,
-      legacyDedupeKeys,
-      { renderForProfile },
+      {
+        source: notification.source,
+        title: shared.title,
+        body: shared.body,
+        dedupeKey,
+      },
+      {
+        legacyDedupeKeys: notification.legacyDedupeKeys,
+        renderForProfile,
+      },
     );
     return;
   }
@@ -68,12 +60,13 @@ export async function publishNotification(
   const rendered = (publishers.renderer ?? renderNotification)(notification, resolveTargetForProfile(publishers, profileId));
   // envelope 随快照一并落库：schedule.reminder 在投递时据此重算相对时间（delivery-render）。
   await (publishers.publishProfile ?? publishProfile)(
-    profileId,
-    notification.source,
-    rendered.title,
-    rendered.body,
-    dedupeKey,
-    legacyDedupeKeys,
-    notification,
+    {
+      profileId,
+      source: notification.source,
+      title: rendered.title,
+      body: rendered.body,
+      dedupeKey,
+      envelope: notification,
+    },
   );
 }

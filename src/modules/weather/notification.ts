@@ -105,6 +105,9 @@ export function officialAlertNotification(
         ? `${subject}：${alert.publisher}已发布`
         : `${subject}已发布`,
     generatedAt: options.generatedAt,
+    // 迁移兼容：旧版本键形如 weather:alert:{label}:{date}；构造时随信封携带，
+    // 发布层命中旧行会改键复用，避免升级当天重复推送。
+    legacyDedupeKeys: legacyWeatherAlertDedupeKeys(alert, new Date(options.generatedAt)),
     provenance: { provider: "和风天气", publisher: alert.publisher },
     payload: {
       type: alert.eventType,
@@ -135,6 +138,7 @@ export function inferredAlertNotification(
     scope: { type: "global" },
     headline: `系统推断风险：${alert.title}`,
     generatedAt: options.generatedAt,
+    legacyDedupeKeys: legacyWeatherAlertDedupeKeys(alert, new Date(options.generatedAt)),
     payload: {
       title: alert.title,
       description: alert.description,

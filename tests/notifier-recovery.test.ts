@@ -65,7 +65,7 @@ test("notify without a dedupe key publishes title and body verbatim", async () =
 
 test("fallback deliveries re-enter the queue when the same route is restored", async () => {
   clearDeliveries();
-  await publishProfile("profile-a", "schedule", "临时故障", "恢复后应送达", "recovery:same-route:1");
+  await publishProfile({ profileId: "profile-a", source: "schedule", title: "临时故障", body: "恢复后应送达", dedupeKey: "recovery:same-route:1" });
 
   // 模拟 route 配置瞬时缺失：delivery 进入 fallback（route missing）。
   const original = routes["profile-a"];
@@ -103,7 +103,7 @@ test("fallback deliveries re-enter the queue when the same route is restored", a
 
 test("fallback rows caused by a route rename are re-activated when the original route returns", async () => {
   clearDeliveries();
-  await publishProfile("profile-a", "schedule", "改名恢复", "改名恢复正文", "recovery:renamed:1");
+  await publishProfile({ profileId: "profile-a", source: "schedule", title: "改名恢复", body: "改名恢复正文", dedupeKey: "recovery:renamed:1" });
   const original = routes["profile-a"];
   routes["profile-a"] = {
     route: "renamed-route",
@@ -112,7 +112,7 @@ test("fallback rows caused by a route rename are re-activated when the original 
   };
   try {
     // route 改名：旧 qqbot 行 → fallback（route changed），新 renamed-route 行 → pending。
-    await publishProfile("profile-a", "schedule", "改名恢复", "改名恢复正文", "recovery:renamed:1");
+    await publishProfile({ profileId: "profile-a", source: "schedule", title: "改名恢复", body: "改名恢复正文", dedupeKey: "recovery:renamed:1" });
   } finally {
     routes["profile-a"] = original;
   }
@@ -139,7 +139,7 @@ test("fallback rows caused by a route rename are re-activated when the original 
 
 test("fallback rows already pulled by notify.pull are not re-delivered", async () => {
   clearDeliveries();
-  await publishProfile("profile-a", "schedule", "拉取兜底", "已经拉取", "recovery:pulled:1");
+  await publishProfile({ profileId: "profile-a", source: "schedule", title: "拉取兜底", body: "已经拉取", dedupeKey: "recovery:pulled:1" });
   const original = routes["profile-a"];
   delete routes["profile-a"];
   try {
@@ -170,7 +170,7 @@ test("fallback rows already pulled by notify.pull are not re-delivered", async (
 
 test("transport-failure fallbacks stay terminal after route recovery", async () => {
   clearDeliveries();
-  await publishProfile("profile-a", "schedule", "传输失败", "不确定结果", "recovery:transport:1");
+  await publishProfile({ profileId: "profile-a", source: "schedule", title: "传输失败", body: "不确定结果", dedupeKey: "recovery:transport:1" });
   const at = new Date("2100-03-04T00:00:00.000Z");
   const times = [
     new Date("2100-03-04T00:00:00.000Z"),
@@ -214,7 +214,7 @@ function setDeliverySending(dedupeKey: string, claimedAt: string): void {
 
 test("N1: pull read prevents redelivery of an in-flight sending row on a restored route", async () => {
   clearDeliveries();
-  await publishProfile("profile-a", "schedule", "N1 in-flight", "N1 body", "recovery:n1:1");
+  await publishProfile({ profileId: "profile-a", source: "schedule", title: "N1 in-flight", body: "N1 body", dedupeKey: "recovery:n1:1" });
   const original = routes["profile-a"];
   const claimedAt = "2100-04-01T00:00:00.000Z";
   setDeliverySending("recovery:n1:1", claimedAt);
@@ -250,7 +250,7 @@ test("N1: pull read prevents redelivery of an in-flight sending row on a restore
 
 test("N2: idempotency-window fallback wins over route-missing fallback", async () => {
   clearDeliveries();
-  await publishProfile("profile-a", "schedule", "N2 idempotency", "N2 body", "recovery:n2:1");
+  await publishProfile({ profileId: "profile-a", source: "schedule", title: "N2 idempotency", body: "N2 body", dedupeKey: "recovery:n2:1" });
   const original = routes["profile-a"];
   const t0 = new Date("2100-05-01T00:00:00.000Z");
   const timeoutFetch = (async () => {
@@ -295,8 +295,8 @@ test("N2: idempotency-window fallback wins over route-missing fallback", async (
 
 test("N3: pullPending returns zombie sending claims older than two minutes", async () => {
   clearDeliveries();
-  await publishProfile("profile-a", "schedule", "N3 zombie", "N3 zombie body", "recovery:n3:zombie");
-  await publishProfile("profile-a", "schedule", "N3 fresh", "N3 fresh body", "recovery:n3:fresh");
+  await publishProfile({ profileId: "profile-a", source: "schedule", title: "N3 zombie", body: "N3 zombie body", dedupeKey: "recovery:n3:zombie" });
+  await publishProfile({ profileId: "profile-a", source: "schedule", title: "N3 fresh", body: "N3 fresh body", dedupeKey: "recovery:n3:fresh" });
   setDeliverySending("recovery:n3:zombie", new Date(Date.now() - 10 * 60 * 1000).toISOString());
   setDeliverySending("recovery:n3:fresh", new Date().toISOString());
 
@@ -308,7 +308,7 @@ test("N3: pullPending returns zombie sending claims older than two minutes", asy
 test("N4: due deliveries are attempted with bounded concurrency", async () => {
   clearDeliveries();
   for (let i = 1; i <= 5; i += 1) {
-    await publishProfile("profile-a", "schedule", `N4 concurrent ${i}`, `N4 body ${i}`, `recovery:n4:${i}`);
+    await publishProfile({ profileId: "profile-a", source: "schedule", title: `N4 concurrent ${i}`, body: `N4 body ${i}`, dedupeKey: `recovery:n4:${i}` });
   }
   let active = 0;
   let maxActive = 0;
@@ -336,7 +336,7 @@ test("N4: due deliveries are attempted with bounded concurrency", async () => {
 
 test("N8: 3xx is treated as a confirmed HTTP failure via redirect manual", async () => {
   clearDeliveries();
-  await publishProfile("profile-a", "schedule", "N8 redirect", "N8 body", "recovery:n8:1");
+  await publishProfile({ profileId: "profile-a", source: "schedule", title: "N8 redirect", body: "N8 body", dedupeKey: "recovery:n8:1" });
   let redirectMode: string | undefined;
   const redirectFetch = (async (_input: unknown, init?: { redirect?: string }) => {
     redirectMode = init?.redirect;

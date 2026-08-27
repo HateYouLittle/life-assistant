@@ -26,6 +26,8 @@ interface NotificationCore {
   generatedAt: string;
   provenance?: NotificationProvenance;
   details?: string;
+  /** 迁移期兼容键（旧版本 dedupe key）：命中时改键复用旧行，避免升级当天重复推送。由模块在构造信封时附带。 */
+  legacyDedupeKeys?: readonly string[];
 }
 
 /** 开放信封：kind/payload 由各业务模块通过 EnvelopeFor 收紧类型后构造。 */

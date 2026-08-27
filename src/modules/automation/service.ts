@@ -4,6 +4,7 @@ import { z } from "zod";
 import { config } from "../../config.js";
 import { getDatabase } from "../../core/database.js";
 import { publishNotification } from "../../core/notification-publisher.js";
+import type { ProfilePublishFn } from "../../core/notifier.js";
 import { asProfileContext, isWellFormedId, requireProfileContext, type ProfileContext } from "../../core/profile.js";
 import { automationActions } from "./actions.js";
 import { automationResultNotification, resultFields } from "./notification.js";
@@ -260,15 +261,6 @@ function itemTimezone(item: AutomationItem): string {
 // 扫描与手动执行
 // ---------------------------------------------------------------------------
 
-type ProfilePublisher = (
-  profileId: string,
-  source: string,
-  title: string,
-  body: string,
-  dedupeKey: string,
-  legacyDedupeKeys?: readonly string[],
-) => Promise<void>;
-
 export interface AutomationRunOutcome {
   id: string;
   profileId: string;
@@ -282,7 +274,7 @@ export interface AutomationScanOptions {
   /** 测试注入：覆盖 action 执行表 */
   actions?: Record<string, { run: (params: Record<string, unknown>) => Promise<Record<string, unknown>> }>;
   /** 测试注入：覆盖 Profile 发布通道 */
-  publishProfile?: ProfilePublisher;
+  publishProfile?: ProfilePublishFn;
 }
 
 async function executeAutomation(

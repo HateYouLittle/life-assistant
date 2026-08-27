@@ -35,12 +35,12 @@ interface Captured {
   dedupeKey: string;
 }
 
-function capture(): { calls: Captured[]; publishProfile: (profileId: string, source: string, title: string, body: string, dedupeKey: string) => Promise<void> } {
+function capture(): { calls: Captured[]; publishProfile: (input: { profileId: string; source?: string; title: string; body: string; dedupeKey?: string }) => Promise<void> } {
   const calls: Captured[] = [];
   return {
     calls,
-    publishProfile: async (profileId, source, title, body, dedupeKey) => {
-      calls.push({ profileId, source, title, body, dedupeKey });
+    publishProfile: async (input) => {
+      calls.push({ profileId: input.profileId, source: input.source ?? "schedule", title: input.title, body: input.body, dedupeKey: input.dedupeKey ?? "" });
     },
   };
 }
