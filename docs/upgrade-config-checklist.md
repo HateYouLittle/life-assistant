@@ -166,8 +166,9 @@ JUHE_KEY=
    systemctl --user restart hermes-gateway.service   # 或各 Profile 的 gateway 服务
    npm run start:scheduler
    ```
-   日志应出现 `holiday.refresh_calendar` 注册（v0.3 起共 6 个 job，含 `automation.scan`）、scheduler started；重复启动第二个
-   scheduler 应以退出码 1 早退。
+   日志应出现 5 行 `[scheduler] registered ...` 模块 cron 注册（weather.daily_brief / weather.alerts_check /
+   oilprice.watch / holiday.refresh_calendar / automation.scan），随后汇总行为 `started, 6 jobs`（多出的 1 个是
+   内置每分钟 tick）；重复启动第二个 scheduler 应以退出码 1 早退。
 
 3. **节假日抓取**
    ```bash
@@ -221,7 +222,7 @@ JUHE_KEY=
 | `PROFILE_PUSH_ROUTES_JSON is set but produced no valid routes` | JSON 非法、secret 非 64 hex、URL 非 loopback、route 名/Profile 名非法 | 按第 5 节修正 |
 | `notify.pull` 没有公共天气/油价通知 | 公共事件只为配置了 route 的 Profile materialize | 确认该 Profile 在 `PROFILE_PUSH_ROUTES_JSON` 中有合法条目 |
 | delivery 一直 `failed`/`fallback` | Gateway 未运行、端口错误、route 名不匹配、secret 不一致 | 执行 4.2 逐项核对 |
-| `database schema version X is newer than supported version 6` | 新库被旧程序打开 | 停止旧进程，使用当前版本 |
+| `database schema version X is newer than supported version 7` | 新库被旧程序打开 | 停止旧进程，使用当前版本 |
 | `HERMES_PROFILE is required...` | MCP 进程未注入 Profile 身份 | 在 `hermes mcp add --env` 或 `.env` 中显式设置 |
 | workday/holiday 日程创建后 `enabled=0` | 当年节假日数据未 ready | 先执行第 6 节第 3 步，或调用 `holiday.refresh` |
 
@@ -242,15 +243,20 @@ npm run build
 **v0.3（schema 5）**：v4→v5 迁移单向，旧代码打开 v5 库会被拒绝启动。若库已升级到
 v5，回滚必须：停服务 → 从升级前备份还原 v4 库 → 部署旧代码 → 确认 `version == 4`。
 
-**当前（schema 6）**：v5→v6 仅给 `profile_notifications` 表尾追加可空的 `envelope` 列，
+**schema 6**：v5→v6 仅给 `profile_notifications` 表尾追加可空的 `envelope` 列，
 无数据改写；旧代码无法打开 v6 库（版本护栏拒绝），回滚需还原 v5 备份或手工把
 `schema_meta.version` 改回 5 并删除 `envelope` 列。
+
+**当前（schema 7）**：v6→v7 仅给 `schedules` 表尾追加可空的
+`reminder_interval_minutes`/`reminder_max_attempts` 两列（待办强提醒配置，NULL = 未开启），
+无数据改写；旧代码无法打开 v7 库（版本护栏拒绝），回滚需还原 v6 备份或手工把
+`schema_meta.version` 改回 6 并删除这两列。
 
 ## 9. 验收签字
 
 - [ ] 4.1 route 解析输出包含全部目标 Profile
 - [ ] 4.2 Hermes subscription 与 `.env` 逐字段一致
-- [ ] 4.3 schema version=6、旧数据可读
+- [ ] 4.3 schema version=7、旧数据可读
 - [ ] 6.3 节假日 ready
 - [ ] 6.4 workday 日程 nextRunAt 正确
 - [ ] 6.5 Webhook delivery=sent、pull 不重复返回
