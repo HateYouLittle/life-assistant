@@ -276,7 +276,7 @@ systemctl status --no-pager life-assistant-scheduler.service
 
 - `notify.list`：查看最近通知与各 route 投递状态（sent/pending/failed/fallback/cancelled），用于排查「为什么没收到」；
 - `notify.snooze`：把未成功投递的通知推迟 1–1440 分钟再投递；幂等窗口内的不确定失败会被拒绝，避免重复推送；
-- `notify.cancel`：取消未投递通知的后续投递，取消后 `notify.pull` 也不再复述。
+- `notify.cancel`：取消未投递通知的后续投递，取消后 `notify.pull` 也不再复述；只取消单条通知，**不会停止强提醒重发**（停止重发请用 `schedule.complete` / `schedule.delete` / `schedule.update(clearStrongReminder: true)`）。
 
 ## 自动任务 automation
 
@@ -290,7 +290,7 @@ systemctl status --no-pager life-assistant-scheduler.service
 
 ## 备份与迁移
 
-`assistant.export` 导出当前 Profile 的 JSON 快照（日程全量含完成/归档状态、自动任务、静默时段和共享位置），`assistant.import` 按 ID 幂等导入：已存在的条目跳过不覆盖，非法条目跳过并计数；共享位置仅在 `applyLocation: true` 时覆盖（位置是全 Profile 共享数据）。快照不含通知历史与 Webhook secret；仅接受当前支持的快照版本，未来版本会显式拒绝；单类条目超过 1000 条时快照带 `truncated: true`（不完整，需分批处理）。
+`assistant.export` 导出当前 Profile 的 JSON 快照（日程全量含完成/归档状态与强提醒配置、自动任务、静默时段和共享位置），`assistant.import` 按 ID 幂等导入：已存在的条目跳过不覆盖，非法条目跳过并计数；共享位置仅在 `applyLocation: true` 时覆盖（位置是全 Profile 共享数据）。快照不含通知历史与 Webhook secret；当前导出格式 `EXPORT_VERSION=2`（v1 旧快照仍可导入，其中无强提醒字段，导入后强提醒视为未开启），超出支持范围的快照版本会显式拒绝；单类条目超过 1000 条时快照带 `truncated: true`（不完整，需分批处理）。
 
 ## 平台切换
 
@@ -346,6 +346,8 @@ hermes -p "<profile>" webhook subscribe "<route-name>" \
 示例：`schedule.create` 传 `recurrence: "workday"`、`time: "09:00"` 即「每个法定工作日早上 9 点提醒」；春节假期自动跳过，调休补班的周六正常触发。新一年数据入库后，scheduler 会自动重算所有受影响的 workday/holiday 日程并恢复此前因无数据停用的日程；`until`/`count` 规则真正耗尽的日程会自动标记为 `completed`，仅因数据缺失而停用的日程保持 `active` 等待恢复。
 
 查询工具：`holiday.next`（距离下次放假的天数、节日名、起止日期与调休上班日）、`holiday.list`（某年完整安排）、`holiday.is_workday`（判断某天是否法定工作日）、`holiday.refresh`（手动补抓某年，数据仍来自官方源）。
+
+待办强提醒：`schedule.create` 传 `intervalMinutes`（1–10080 分钟，默认 120）与/或 `maxAttempts`（1–99 轮，默认 3）即可开启；到期未确认完成时 scheduler 按间隔重复提醒，直至完成/删除/达上限；重发通知标题带轮次标记（如「（第 2 次提醒，共 3 次）」），与正式提醒可区分。强提醒需要一条 occurrence 正式提醒（`target: "occurrence"` 且 `minutesBefore: 0`，默认提醒即满足），否则创建/更新会被拒绝；`schedule.update` 传 `clearStrongReminder: true` 可随时关闭。注意 `intervalMinutes` 大于等于 recurrence 触发间隔（daily=1440 分钟、weekly=10080 分钟）时重发不生效，会被下一 occurrence 的正式提醒接管（创建/更新会输出可检测的警告；该间隔警告仅适用于未配 `byWeekday` 的 daily/weekly，配了 `byWeekday` 时实际触发间隔不定，无法廉价检测）。
 
 ## 工具一览
 

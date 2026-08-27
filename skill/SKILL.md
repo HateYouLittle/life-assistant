@@ -60,6 +60,9 @@ Hermes 将 MCP 工具注册为 `mcp_life_assistant_<tool>`，点号转换为下�
 - 普通待办默认公历。生日或纪念日若使用农历，传 `calendar: "lunar"`、`lunarMonth`、`lunarDay`。
 - 创建前确认用户说的是公历还是农历。`leapMonthPolicy: "leap"` 的事件仅在对应闰月年份触发。
 - 中国大陆法定工作日重复提醒用 `recurrence: "workday"`（如「每个法定工作日 09:00」）；仅放假日的提醒用 `recurrence: "holiday"`。两者只支持公历和 `Asia/Shanghai` 时区，不支持 interval/byWeekday/byMonthDay。
+- 用户想要「没确认就一直提醒」时用强提醒：`schedule.create` 传 `intervalMinutes`（1–10080 分钟，默认 120）与/或 `maxAttempts`（1–99 轮，默认 3），到期未确认完成会按间隔重复提醒直至完成/删除/达上限；`schedule.update` 传 `clearStrongReminder: true` 关闭。强提醒需要一条 occurrence 正式提醒（`target: "occurrence"` 且 `minutesBefore: 0`，默认提醒即满足），只配提前提醒/截止提醒会被拒绝。
+- 强提醒 `intervalMinutes` 大于等于 recurrence 触发间隔（daily=1440 分钟、weekly=10080 分钟）时重发不生效，会被下一 occurrence 的正式提醒接管；遇到该场景如实向用户说明（该间隔警告仅适用于未配 `byWeekday` 的 daily/weekly，配了 `byWeekday` 时实际触发间隔不定，不输出警告）。
+- 重发通知标题带轮次标记（如「（第 2 次提醒，共 3 次）」），与正式提醒可区分；`notify.list` 可据此辨认当前是第几轮强提醒。
 - 日程和日程通知只属于当前 Profile。不得因为天气/油价公共 fan-out 而扩大日程作用域。
 
 ## 自动任务 automation
@@ -82,12 +85,12 @@ Hermes 将 MCP 工具注册为 `mcp_life_assistant_<tool>`，点号转换为下�
 
 - 免打扰：`notify.quiet_hours` 设置（如 22:00–07:00，支持跨午夜与自定义时区）；窗口内不主动投递，窗口结束自动补投，`notify.pull` 不受影响。无参查询，`clear: true` 清除。
 - 「这个提醒晚点再说」：`notify.snooze`（1–1440 分钟），只对未成功投递的通知有效，已 sent/已取消的会返回错误说明。
-- 「这条提醒不要了」：`notify.cancel`；已 sent 的不受影响，取消后 pull 也不再复述。
+- 「这条提醒不要了」：`notify.cancel`；已 sent 的不受影响，取消后 pull 也不再复述。注意 `notify.cancel` 只取消单条通知的投递，**不会停止强提醒重发**；停止重发请用 `schedule.complete` / `schedule.delete` / `schedule.update(clearStrongReminder: true)`。
 - 排查「为什么没收到通知」：`notify.list` 查看通知与投递状态（sent/pending/failed/fallback/cancelled），再决定 snooze、cancel 还是等待补投。
 
 ## 备份与迁移
 
-- `assistant.export` 导出当前 Profile 快照（日程全量、自动任务、静默时段、位置），让用户保存 JSON 文件。
+- `assistant.export` 导出当前 Profile 快照（日程全量含状态与强提醒配置、自动任务、静默时段、位置），让用户保存 JSON 文件；当前导出格式 `EXPORT_VERSION=2`，v1 旧快照仍可导入（其中无强提醒字段，导入后强提醒视为未开启）。单类条目超过 1000 条时快照带 `truncated: true`，导入方应提示用户分批处理。
 - `assistant.import` 导入：按 ID 幂等（已存在跳过），位置是共享数据，只有用户明确同意时才传 `applyLocation: true`。
 
 ## 通知平台切换

@@ -15,8 +15,13 @@ import { createAutomation, getAutomation, type AutomationCreateInput } from "../
 import { automationScheduleSchema } from "../automation/service.js";
 
 export const EXPORT_FORMAT = "life-assistant.export";
-export const EXPORT_VERSION = 1;
-/** 单类条目导出上限；超出时快照带 truncated 标记，导入方应提示用户分批处理。 */
+/**
+ * 导出快照格式版本：v1（无强提醒字段，intervalMinutes/maxAttempts 缺失 = 未开启）→
+ * v2（含可选 intervalMinutes/maxAttempts，导入恢复强提醒）。仅影响导出文件格式，
+ * 不动 DB schema（保持 v7）。
+ */
+export const EXPORT_VERSION = 2;
+/** 单类条目导出上限；超过时快照带 truncated 标记，导入方应提示用户分批处理。 */
 export const EXPORT_ROW_LIMIT = 1000;
 
 /** 可移植日程条目：ScheduleItem 去掉运行时派生字段（profileId/version/enabled/nextRunAt 等）。 */
@@ -40,6 +45,10 @@ export interface PortableSchedule {
   reminders?: ScheduleItem["reminders"];
   deadlineAt?: string;
   deadlineOffsetMinutes?: number;
+  /** 强提醒重发间隔（分钟，1-10080）；v2 快照字段，v1 缺省 = 未开启 */
+  intervalMinutes?: number;
+  /** 最多重提醒轮数（1-99）；v2 快照字段，v1 缺省 = 未开启 */
+  maxAttempts?: number;
 }
 
 function toPortableSchedule(item: ScheduleItem): PortableSchedule {
@@ -63,6 +72,8 @@ function toPortableSchedule(item: ScheduleItem): PortableSchedule {
     reminders: item.reminders,
     deadlineAt: item.deadlineAt,
     deadlineOffsetMinutes: item.deadlineOffsetMinutes,
+    ...(item.reminderIntervalMinutes !== undefined ? { intervalMinutes: item.reminderIntervalMinutes } : {}),
+    ...(item.reminderMaxAttempts !== undefined ? { maxAttempts: item.reminderMaxAttempts } : {}),
   };
 }
 
@@ -76,7 +87,7 @@ export interface AssistantExport {
     automations: Array<Omit<AutomationCreateInput, "schedule"> & { schedule: AutomationCreateInput["schedule"] }>;
     quietHours: { start: string; end: string; timezone: string } | null;
     location: { city: string; province?: string; lat: number; lon: number } | null;
-    /** 任一类条目达到导出上限时为 true：快照不完整，导入方应提示 */
+    /** 任一类条目超过导出上限时为 true：快照不完整，导入方应提示 */
     truncated?: boolean;
   };
 }
@@ -85,10 +96,12 @@ export function buildAssistantExport(profile: ProfileContext): AssistantExport {
   const db = getDatabase();
   const rows = db.prepare(
     "SELECT * FROM schedules WHERE profile_id = ? ORDER BY created_at, id LIMIT ?",
-  ).all(profile.id, EXPORT_ROW_LIMIT) as Array<Record<string, unknown>>;
+  ).all(profile.id, EXPORT_ROW_LIMIT + 1) as Array<Record<string, unknown>>;
   const automations = db.prepare(
     "SELECT * FROM automations WHERE profile_id = ? ORDER BY created_at, id LIMIT ?",
-  ).all(profile.id, EXPORT_ROW_LIMIT) as Array<Record<string, unknown>>;
+  ).all(profile.id, EXPORT_ROW_LIMIT + 1) as Array<Record<string, unknown>>;
+  const schedulesTruncated = rows.length > EXPORT_ROW_LIMIT;
+  const automationsTruncated = automations.length > EXPORT_ROW_LIMIT;
   const quiet = getQuietHours(profile.id);
   const loc = currentLocation();
   return {
@@ -97,8 +110,8 @@ export function buildAssistantExport(profile: ProfileContext): AssistantExport {
     exportedAt: new Date().toISOString(),
     profile: profile.id,
     data: {
-      schedules: rows.map((row) => toPortableSchedule(hydrateRow(row))),
-      automations: automations.map((row) => ({
+      schedules: rows.slice(0, EXPORT_ROW_LIMIT).map((row) => toPortableSchedule(hydrateRow(row))),
+      automations: automations.slice(0, EXPORT_ROW_LIMIT).map((row) => ({
         id: String(row.id),
         name: String(row.name),
         action: String(row.action),
@@ -111,7 +124,7 @@ export function buildAssistantExport(profile: ProfileContext): AssistantExport {
       })),
       quietHours: quiet ? { start: quiet.start, end: quiet.end, timezone: quiet.timezone } : null,
       location: loc ? { city: loc.city, province: loc.province, lat: loc.lat, lon: loc.lon } : null,
-      truncated: rows.length >= EXPORT_ROW_LIMIT || automations.length >= EXPORT_ROW_LIMIT,
+      truncated: schedulesTruncated || automationsTruncated,
     },
   };
 }
@@ -140,6 +153,8 @@ const portableScheduleSchema = z.object({
   })).optional(),
   deadlineAt: z.string().optional(),
   deadlineOffsetMinutes: z.number().int().min(0).max(525600).optional(),
+  intervalMinutes: z.number().int().min(1).max(10080).optional(),
+  maxAttempts: z.number().int().min(1).max(99).optional(),
 });
 
 const portableAutomationSchema = z.object({
@@ -156,9 +171,11 @@ const portableAutomationSchema = z.object({
   enabled: z.boolean().optional(),
 });
 
+const SUPPORTED_EXPORT_VERSIONS = [1, 2] as const;
+
 const exportPayloadSchema = z.object({
   format: z.literal(EXPORT_FORMAT),
-  version: z.literal(EXPORT_VERSION),
+  version: z.union([z.literal(1), z.literal(2)]),
   data: z.object({
     // 导出侧单类型截断到 1000 条，导入侧同样封顶：防止超大/恶意快照长时间
     // 占住 MCP 调用（每条都有 SELECT+INSERT）并膨胀共享 SQLite。
@@ -198,9 +215,10 @@ export function importAssistantExport(
   if (head.format !== EXPORT_FORMAT) {
     throw new Error(`导入内容不是 ${EXPORT_FORMAT} 快照`);
   }
-  // 前置版本检查给出可读错误；schema 的 z.literal 再做一层防御。
-  if (head.version !== EXPORT_VERSION) {
-    throw new Error(`不支持的快照版本 ${String(head.version)}（当前支持版本 ${EXPORT_VERSION}）`);
+  // 前置版本检查给出可读错误；schema 的 z.union 再做一层防御。
+  // v1 快照无强提醒字段（导入后强提醒未开启）；v2 含 intervalMinutes/maxAttempts。
+  if (!SUPPORTED_EXPORT_VERSIONS.includes(head.version as (typeof SUPPORTED_EXPORT_VERSIONS)[number])) {
+    throw new Error(`不支持的快照版本 ${String(head.version)}（当前支持版本 1-${EXPORT_VERSION}）`);
   }
   const parsed = exportPayloadSchema.parse(payload);
   const summary: ImportSummary = {
@@ -224,6 +242,8 @@ export function importAssistantExport(
     } catch { /* 不存在则继续导入 */ }
     try {
       const { id, status, recurrence, ...rest } = entry;
+      // rest 含 v2 的 intervalMinutes/maxAttempts（v1 无此键 = 未开启），
+      // 直接透传给 createSchedule 恢复强提醒配置。
       const created = createSchedule(profile, {
         ...rest,
         id,
@@ -278,7 +298,7 @@ const assistantModule: AssistantModule = {
     withTool(
       {
         name: "export",
-        description: "导出当前 Profile 的数据快照（日程全量含状态、自动任务、静默时段和共享位置）为 JSON，用于备份或迁移。返回的 JSON 可原样传给 assistant.import。导出不包含通知历史与 Webhook secret。单类条目超过 1000 条时 truncated=true，快照不完整，应提示用户。",
+        description: "导出当前 Profile 的数据快照（日程全量含状态与强提醒配置、自动任务、静默时段和共享位置）为 JSON，用于备份或迁移。返回的 JSON 可原样传给 assistant.import。导出不包含通知历史与 Webhook secret。单类条目超过 1000 条时 truncated=true，快照不完整，应提示用户。",
       },
       {},
       (_args, context) => ok(buildAssistantExport(context ?? requireProfileContext())),
@@ -286,7 +306,7 @@ const assistantModule: AssistantModule = {
     withTool(
       {
         name: "import",
-        description: "导入 assistant.export 生成的快照（仅支持当前导出版本）：日程/自动任务按 ID 幂等导入（已存在的跳过，不覆盖），静默时段直接应用；applyLocation=true 时才覆盖共享位置（多 Profile 共享位置，默认不动）。非法条目跳过并计入 invalid；快照带 truncated=true 时应向用户说明数据不完整。",
+        description: "导入 assistant.export 生成的快照（支持 v1/v2：v1 无强提醒字段、导入后强提醒未开启；v2 恢复 intervalMinutes/maxAttempts）：日程/自动任务按 ID 幂等导入（已存在的跳过，不覆盖），静默时段直接应用；applyLocation=true 时才覆盖共享位置（多 Profile 共享位置，默认不动）。非法条目跳过并计入 invalid；快照带 truncated=true 时应向用户说明数据不完整。",
       },
       {
         data: z.unknown().describe("assistant.export 返回的快照对象"),

@@ -122,7 +122,7 @@ export function listAutomations(value: ProfileContext | string, options: Automat
     params.push(options.enabled ? 1 : 0);
   }
   const rows = getDatabase().prepare(
-    `SELECT * FROM automations WHERE ${clauses.join(" AND ")} ORDER BY created_at, id`,
+    `SELECT * FROM automations WHERE ${clauses.join(" AND ")} ORDER BY created_at, rowid`,
   ).all(...params as any[]) as Array<Record<string, unknown>>;
   return rows.map(rowToItem);
 }
@@ -323,7 +323,9 @@ function recordRun(profileId: string, id: string, at: Date, patch: { lastResult?
 export async function runAutomationScan(options: AutomationScanOptions = {}): Promise<AutomationRunOutcome[]> {
   const at = options.at ?? new Date();
   const db = getDatabase();
-  const rows = db.prepare("SELECT * FROM automations WHERE enabled = 1 ORDER BY created_at, id")
+  // 排序 tie-break 用 rowid（插入顺序）而不是随机 UUID id：同一毫秒创建的
+  // 多行 created_at 相同，按 id 排序结果不确定（曾导致 scan 用例 ~45% 概率失败）。
+  const rows = db.prepare("SELECT * FROM automations WHERE enabled = 1 ORDER BY created_at, rowid")
     .all() as Array<Record<string, unknown>>;
   const outcomes: AutomationRunOutcome[] = [];
   for (const row of rows) {

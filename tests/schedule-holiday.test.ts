@@ -619,6 +619,45 @@ test("S6: reconcileHolidaySchedules skips a completed future occurrence when rec
   db.prepare("DELETE FROM schedules WHERE profile_id = ? AND id = ?").run(profile.id, item.id);
 });
 
+test("P2-2: reconcileHolidaySchedules preserves the strong-reminder resend window", async () => {
+  const year = FIXED_TEST_YEAR;
+  clearYear(year);
+  clearYear(year + 1);
+  ingestYear(year);
+  ingestYear(year + 1);
+  const item = createSchedule(profile, {
+    title: "workday strong resend",
+    calendar: "solar",
+    date: `${year}-07-01`,
+    time: "09:00",
+    timezone: "Asia/Shanghai",
+    recurrence: "workday",
+    intervalMinutes: 120,
+    maxAttempts: 3,
+  }, FIXED_TEST_AT());
+  // 正式提醒 01:00Z 发布，进入重发窗口（next_run_at = 03:00Z → 05:00Z）。
+  await runDueSchedules(new Date(`${year}-07-01T01:00:00.000Z`));
+  await runDueSchedules(new Date(`${year}-07-01T03:00:00.000Z`)); // attempt-1
+  const row = db.prepare("SELECT next_run_at, enabled, status FROM schedules WHERE profile_id = ? AND id = ?")
+    .get(profile.id, item.id) as { next_run_at: string | null; enabled: number; status: string };
+  assert.deepEqual({ ...row }, { next_run_at: `${year}-07-01T05:00:00.000Z`, enabled: 1, status: "active" });
+
+  // 窗口内 reconcile（模拟 holiday.refresh / 新数据入库触发的重算）：不得跳到下一
+  // occurrence 触发、不得停用日程、剩余 attempts 不得丢弃。
+  reconcileHolidaySchedules(new Date(`${year}-07-01T04:00:00.000Z`));
+  const after = getSchedule(profile, item.id);
+  assert.equal(after.nextRunAt, `${year}-07-01T05:00:00.000Z`);
+  assert.equal(after.enabled, true);
+  assert.equal(after.status, "active");
+
+  // attempt-2 照常触发。
+  await runDueSchedules(new Date(`${year}-07-01T05:00:00.000Z`));
+  const keys = db.prepare("SELECT occurrence_key FROM schedule_occurrences WHERE profile_id = ? AND schedule_id = ? ORDER BY occurrence_key")
+    .all(profile.id, item.id) as Array<{ occurrence_key: string }>;
+  assert.equal(keys.some((entry) => entry.occurrence_key.includes(":attempt-2")), true);
+  db.prepare("DELETE FROM schedules WHERE profile_id = ? AND id = ?").run(profile.id, item.id);
+});
+
 // ---------------------------------------------------------------------------
 // M1：schedule 跨年窗口日期按标题年覆盖判断，不按自然年猜测
 // ---------------------------------------------------------------------------

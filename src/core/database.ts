@@ -104,6 +104,8 @@ export function migrateDatabaseSchema(db: DatabaseSync): void {
       reminders_json TEXT NOT NULL,
       deadline_at TEXT,
       deadline_offset_minutes INTEGER,
+      reminder_interval_minutes INTEGER,
+      reminder_max_attempts INTEGER,
       enabled INTEGER NOT NULL DEFAULT 1,
       next_run_at TEXT,
       version INTEGER NOT NULL DEFAULT 1,
@@ -177,8 +179,8 @@ export function migrateDatabaseSchema(db: DatabaseSync): void {
     const versionRow = db.prepare("SELECT value FROM schema_meta WHERE key = 'version'").get() as { value?: string } | undefined;
     if (versionRow?.value !== undefined) {
       const existingVersion = Number(versionRow.value);
-      if (Number.isFinite(existingVersion) && existingVersion > 6) {
-        throw new Error(`database schema version ${versionRow.value} is newer than supported version 6`);
+      if (Number.isFinite(existingVersion) && existingVersion > 7) {
+        throw new Error(`database schema version ${versionRow.value} is newer than supported version 7`);
       }
     }
 
@@ -198,8 +200,11 @@ export function migrateDatabaseSchema(db: DatabaseSync): void {
     ensureColumn(db, "profile_notification_deliveries", "not_before", "TEXT");
     // v6：结构化快照；投递时据此重渲染 schedule.reminder 的相对时间并附加顺延原因。
     ensureColumn(db, "profile_notifications", "envelope", "TEXT");
+    // v7：待办强提醒（schedules 可选列；NULL = 未开启强提醒）。
+    ensureColumn(db, "schedules", "reminder_interval_minutes", "INTEGER");
+    ensureColumn(db, "schedules", "reminder_max_attempts", "INTEGER");
 
-    db.prepare("INSERT OR REPLACE INTO schema_meta(key, value) VALUES('version', '6')").run();
+    db.prepare("INSERT OR REPLACE INTO schema_meta(key, value) VALUES('version', '7')").run();
     db.exec("COMMIT");
   } catch (error) {
     db.exec("ROLLBACK");

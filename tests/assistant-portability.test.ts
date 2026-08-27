@@ -160,15 +160,15 @@ test("invalid entries are counted and malformed payloads are rejected", () => {
   assert.equal(summary.automations.invalid, 1);
 
   assert.throws(() => importAssistantExport(profile, { format: "something.else", version: 1, data: {} }));
-  // 未来快照版本必须显式拒绝，不能被当成 v1 静默导入。
+  // 未来快照版本必须显式拒绝，不能被当成 v1/v2 静默导入。
   assert.throws(
-    () => importAssistantExport(profile, { format: "life-assistant.export", version: 2, data: {} }),
-    /不支持的快照版本 2/,
+    () => importAssistantExport(profile, { format: "life-assistant.export", version: 3, data: {} }),
+    /不支持的快照版本 3/,
   );
   assert.throws(() => importAssistantExport(profile, "not-an-object"), /不是有效的快照对象/);
 });
 
-test("export marks truncation when the row limit is reached", () => {
+test("export marks truncation when the row limit is exceeded", () => {
   const seed = createSchedule(profile, {
     title: "截断种子",
     calendar: "solar",
@@ -181,7 +181,7 @@ test("export marks truncation when the row limit is reached", () => {
   const insert = db.prepare(
     `INSERT INTO schedules(${columns.join(",")}) VALUES(${columns.map(() => "?").join(",")})`,
   );
-  const bulkCount = 1000; // 种子 + 1000 条 bulk，确保触达上限
+  const bulkCount = 1000; // 种子 + 1000 条 bulk，确保超过上限
   const tx = db.prepare("BEGIN");
   tx.run();
   for (let index = 0; index < bulkCount; index += 1) {
@@ -200,6 +200,40 @@ test("export marks truncation when the row limit is reached", () => {
   assert.equal(buildAssistantExport(profile).data.truncated, false);
 });
 
+test("export does not mark an exactly full category as truncated", () => {
+  const exactProfile = { id: "exact-limit-profile" };
+  const seed = createSchedule(exactProfile, {
+    title: "精确上限种子",
+    calendar: "solar",
+    date: "2099-12-01",
+    time: "09:00",
+    timezone: "Asia/Shanghai",
+  });
+  const row = db.prepare("SELECT * FROM schedules WHERE profile_id = ? AND id = ?").get(exactProfile.id, seed.id) as Record<string, unknown>;
+  const columns = Object.keys(row);
+  const insert = db.prepare(
+    `INSERT INTO schedules(${columns.join(",")}) VALUES(${columns.map(() => "?").join(",")})`,
+  );
+  let committed = false;
+  try {
+    db.exec("BEGIN");
+    for (let index = 0; index < 999; index += 1) {
+      insert.run(...columns.map((column) => (column === "id" ? `exact-${index}` : row[column])) as never);
+    }
+    db.exec("COMMIT");
+    committed = true;
+    const snapshot = buildAssistantExport(exactProfile);
+    assert.equal(snapshot.data.schedules.length, 1000);
+    assert.equal(snapshot.data.truncated, false);
+  } finally {
+    if (!committed) {
+      try { db.exec("ROLLBACK"); } catch { /* preserve the original assertion failure */ }
+    }
+    db.prepare("DELETE FROM schedules WHERE profile_id = ? AND id LIKE 'exact-%'").run(exactProfile.id);
+    db.prepare("DELETE FROM schedules WHERE profile_id = ? AND id = ?").run(exactProfile.id, seed.id);
+  }
+});
+
 test("import rejects snapshots exceeding 1000 entries per type", () => {
   // 导出侧单类型截断到 1000 条；导入侧同样封顶，超大/恶意快照直接拒绝
   // 而不是长时间占住 MCP 调用逐条 SELECT+INSERT。
@@ -211,5 +245,84 @@ test("import rejects snapshots exceeding 1000 entries per type", () => {
   assert.throws(
     () => importAssistantExport(profile, snapshot),
     /Too many|array|schedules/i,
+  );
+});
+
+test("P1: strong reminder config round-trips through export/import (v2)", () => {
+  const strong = createSchedule(profile, {
+    title: "强提醒待办",
+    calendar: "solar",
+    date: "2099-10-01",
+    time: "09:00",
+    timezone: "Asia/Shanghai",
+    intervalMinutes: 60,
+    maxAttempts: 5,
+  });
+  try {
+    const snapshot = buildAssistantExport(profile);
+    // 导出格式升到 v2，且快照携带强提醒字段。
+    assert.equal(snapshot.version, 2);
+    const portable = snapshot.data.schedules.find((entry) => entry.id === strong.id);
+    assert.ok(portable, "导出快照应包含强提醒日程");
+    assert.equal(portable.intervalMinutes, 60);
+    assert.equal(portable.maxAttempts, 5);
+
+    // 导入 v2 快照（换新 ID 避免与既有条目撞车跳过）→ 强提醒恢复。
+    const v2Payload = {
+      format: snapshot.format,
+      version: snapshot.version,
+      data: { schedules: [{ ...portable, id: "imported-strong" }] },
+    };
+    const summary = importAssistantExport(profile, v2Payload);
+    assert.deepEqual(summary.schedules, { imported: 1, skipped: 0, invalid: 0 });
+    const restored = getSchedule(profile, "imported-strong");
+    assert.equal(restored.reminderIntervalMinutes, 60);
+    assert.equal(restored.reminderMaxAttempts, 5);
+  } finally {
+    db.prepare("DELETE FROM schedules WHERE profile_id = ? AND id IN (?, ?)").run(profile.id, strong.id, "imported-strong");
+  }
+});
+
+test("P1: v1 snapshots import without strong reminder (columns stay NULL)", () => {
+  const v1 = {
+    format: "life-assistant.export",
+    version: 1,
+    data: {
+      schedules: [{
+        id: "legacy-v1",
+        title: "老快照待办",
+        calendar: "solar",
+        date: "2099-11-01",
+        time: "09:00",
+        timezone: "Asia/Shanghai",
+        reminders: [{ id: "r1", minutesBefore: 0 }],
+      }],
+    },
+  };
+  try {
+    const summary = importAssistantExport(profile, v1);
+    assert.deepEqual(summary.schedules, { imported: 1, skipped: 0, invalid: 0 });
+    const imported = getSchedule(profile, "legacy-v1");
+    // v1 无强提醒字段：导入后强提醒未开启（两列 NULL）。
+    assert.equal(imported.reminderIntervalMinutes, undefined);
+    assert.equal(imported.reminderMaxAttempts, undefined);
+    const row = db.prepare(
+      "SELECT reminder_interval_minutes, reminder_max_attempts FROM schedules WHERE profile_id = ? AND id = ?",
+    ).get(profile.id, "legacy-v1") as { reminder_interval_minutes: unknown; reminder_max_attempts: unknown };
+    assert.equal(row.reminder_interval_minutes, null);
+    assert.equal(row.reminder_max_attempts, null);
+  } finally {
+    db.prepare("DELETE FROM schedules WHERE profile_id = ? AND id = ?").run(profile.id, "legacy-v1");
+  }
+});
+
+test("P1: v1/v2 both accepted; out-of-range versions rejected with a clear message", () => {
+  // v1 与 v2 均放行（v1 上面已测内容，这里只验证不被版本门拒收）。
+  assert.doesNotThrow(() => importAssistantExport(profile, { format: "life-assistant.export", version: 1, data: {} }));
+  assert.doesNotThrow(() => importAssistantExport(profile, { format: "life-assistant.export", version: 2, data: {} }));
+  // 超出 [1,2] 的版本显式拒绝，错误信息带版本号。
+  assert.throws(
+    () => importAssistantExport(profile, { format: "life-assistant.export", version: 3, data: {} }),
+    /不支持的快照版本 3（当前支持版本 1-2）/,
   );
 });

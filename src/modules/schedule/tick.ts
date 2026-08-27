@@ -1,12 +1,14 @@
 import { DateTime } from "luxon";
 import { getDatabase } from "../../core/database.js";
 import { publishNotification } from "../../core/notification-publisher.js";
+import { cancelProfileNotificationDelivery } from "../../core/notifier.js";
 import {
   calculateNextRun,
   deadlineForOccurrence,
   holidayAwareRuleFinished,
   hydrateRow,
   isScheduleOccurrenceCompleted,
+  nextEventAfter,
   nextReminderTiming,
   normalizeVersion,
 } from "./service.js";
@@ -23,6 +25,45 @@ import type { ScheduleItem } from "./types.js";
 
 function reminderId(reminder: { id?: string; minutesBefore: number }, index: number): string {
   return reminder.id ?? `reminder-${index + 1}`;
+}
+
+/** LIKE 通配符转义（配合 ESCAPE '\\'），occurrence_key 中的用户可控片段（reminder id）安全匹配。 */
+export function escapeLike(value: string): string {
+  return value.replace(/[\\%_]/g, (char) => `\\${char}`);
+}
+
+/**
+ * P2-5：发布提醒后落 schedule_occurrences 行。publishNotification 是 await 点，期间
+ * deleteSchedule 可能已执行完毕（外键 PRAGMA foreign_keys=ON 使 INSERT 抛 FK 错误）。
+ * 此时取消刚发布的投递（复用 cancelProfileNotificationDelivery）并继续处理其余 due，
+ * 不中断整个 tick；日程仍存在时的其他落行失败照常抛出。
+ */
+function recordNotifiedOccurrence(item: ScheduleItem, occurrenceKey: string, occurrenceAt: string): void {
+  const db = getDatabase();
+  try {
+    db.prepare("INSERT OR IGNORE INTO schedule_occurrences(profile_id, schedule_id, occurrence_key, occurrence_at, status) VALUES(?, ?, ?, ?, 'notified')")
+      .run(item.profileId, item.id, occurrenceKey, occurrenceAt);
+  } catch (error) {
+    const stillExists = db.prepare("SELECT 1 FROM schedules WHERE profile_id = ? AND id = ?").get(item.profileId, item.id);
+    if (stillExists) throw error;
+    try {
+      const notice = db.prepare(`
+        SELECT id FROM profile_notifications
+        WHERE profile_id = ? AND dedupe_key = ?
+      `).get(item.profileId, `schedule:${item.profileId}:${item.id}:${occurrenceKey}`) as { id: number } | undefined;
+      if (notice) {
+        // P3-4：可直接整行删除（级联 deliveries/reads）——此分支只命中「同一 tick 内刚发布、
+        // 随后日程被并发删除」的孤儿通知，而 delivery 行在 runDueSchedules 之后的
+        // deliverPendingProfileNotifications 才落库，该时刻不可能已有 sent/sending 投递，
+        // 无需像 deleteSchedule 的 S1.2 那样保留已投递历史；先取消未投递投递（有 route 时）
+        // 再删除，保证不残留任何通知。
+        cancelProfileNotificationDelivery(item.profileId, notice.id);
+        db.prepare("DELETE FROM profile_notifications WHERE profile_id = ? AND id = ?").run(item.profileId, notice.id);
+      }
+    } catch (cleanupError) {
+      console.warn("[schedule] could not clean up notification published for concurrently deleted schedule:", cleanupError);
+    }
+  }
 }
 
 interface DueCursor {
@@ -60,6 +101,27 @@ function dueRows(at: Date, cursor?: DueCursor): Record<string, unknown>[] {
   ) as Record<string, unknown>[];
 }
 
+/**
+ * 从 from 起找下一个「存在未完成提醒触发」的 run 时刻（原 scheduler 实现的等价移植）。
+ */
+function calculateNextIncompleteRun(
+  item: ScheduleItem,
+  from: DateTime<true>,
+): DateTime<true> | null {
+  let cursor = from;
+  while (true) {
+    const candidate = calculateNextRun(item, cursor, true);
+    if (!candidate) return null;
+    const hasIncompleteOccurrence = item.reminders.some((reminder) => {
+      const timing = nextReminderTiming(item, reminder, candidate, true);
+      return timing?.triggerAt.equals(candidate)
+        && !isScheduleOccurrenceCompleted(item.profileId, item.id, timing.occurrenceAt.toISO());
+    });
+    if (hasIncompleteOccurrence) return candidate;
+    cursor = candidate.plus({ milliseconds: 1 }) as DateTime<true>;
+  }
+}
+
 async function processDue(item: ScheduleItem, at: DateTime<true>): Promise<void> {
   if (!item.nextRunAt) return;
   const db = getDatabase();
@@ -79,6 +141,73 @@ async function processDue(item: ScheduleItem, at: DateTime<true>): Promise<void>
   }
   const triggerAt = DateTime.fromISO(item.nextRunAt, { zone: "utc" }).toUTC() as DateTime<true>;
   const reminders = item.reminders.length ? item.reminders : [{ id: "reminder-1", minutesBefore: 0 }];
+  // 强提醒：正式提醒 = occurrence 目标且 minutesBefore=0 的提醒；重发只针对它，不重复触发提前提醒。
+  const formalReminder = reminders.find((reminder) =>
+    (reminder.target ?? "occurrence") === "occurrence" && reminder.minutesBefore === 0);
+  const formalId = formalReminder ? reminderId(formalReminder, reminders.indexOf(formalReminder)) : undefined;
+
+  // 强提醒重发（schedules.reminder_interval_minutes / reminder_max_attempts 均非空时启用）：
+  // 上一轮已把 next_run_at 推进到重发时刻；本 tick 若正式提醒已发布、该 occurrence 未 completed、
+  // 未达轮数上限且未被更新的 occurrence 接管，即以 :attempt-N 后缀发布新一轮提醒。
+  // 轮次计数 = schedule_occurrences 中该 occurrence 前缀的 attempt 行数，与现有去重/版本机制兼容。
+  let resendNextAt: DateTime<true> | null = null;
+  if (formalId !== undefined && item.reminderIntervalMinutes !== undefined && item.reminderMaxAttempts !== undefined) {
+    const targetRow = db.prepare(`
+      SELECT occurrence_at FROM schedule_occurrences
+      WHERE profile_id = ? AND schedule_id = ?
+        AND occurrence_key LIKE ? ESCAPE '\\'
+        AND occurrence_at <= ?
+      ORDER BY occurrence_at DESC LIMIT 1
+    `).get(item.profileId, item.id, `%:${escapeLike(formalId)}`, at.toISO()) as { occurrence_at: string } | undefined;
+    if (targetRow) {
+      const occurrenceIso = targetRow.occurrence_at;
+      const occurrenceAt = DateTime.fromISO(occurrenceIso, { zone: "utc" }).toUTC() as DateTime<true>;
+      // 重发只针对「当前 occurrence」：下一个 occurrence 已到（at >= 其触发时刻）则让位，
+      // 由主循环发布其正式提醒；once 恒无后继 occurrence。
+      const superseded = item.recurrence.frequency !== "once" && (() => {
+        const nextOccurrence = nextEventAfter(item, occurrenceAt);
+        return nextOccurrence !== null && at.toMillis() >= nextOccurrence.toMillis();
+      })();
+      if (!isScheduleOccurrenceCompleted(item.profileId, item.id, occurrenceIso) && !superseded) {
+        const attemptsDone = (db.prepare(`
+          SELECT COUNT(*) AS n FROM schedule_occurrences
+          WHERE profile_id = ? AND schedule_id = ?
+            AND occurrence_key LIKE ? ESCAPE '\\'
+        `).get(item.profileId, item.id, `${escapeLike(occurrenceIso)}:occurrence:${escapeLike(formalId)}:attempt-%`) as { n: number }).n;
+        // P3-7：attemptsDone 按 COUNT(attempt-%) 统计。正常路径 attempt 行只会顺序插入
+        // （发布前查 exists、发布后落行），计数不会错位；仅当 DB 被外部手工增删行时才
+        // 可能进入空转窗口（计数虚高跳过本轮或虚低补发），属外部干预，不做额外防御。
+        if (attemptsDone < item.reminderMaxAttempts) {
+          const attemptN = attemptsDone + 1;
+          const resendKey = `${occurrenceIso}:occurrence:${formalId}:attempt-${attemptN}`;
+          const exists = db.prepare(`
+            SELECT 1 FROM schedule_occurrences
+            WHERE profile_id = ? AND schedule_id = ? AND occurrence_key = ?
+          `).get(item.profileId, item.id, resendKey);
+          if (!exists) {
+            const notification = buildScheduleReminderNotification({
+              item,
+              occurrenceKey: resendKey,
+              occurrenceAt: occurrenceIso,
+              deadlineAt: deadlineForOccurrence(item, occurrenceAt)?.toISO(),
+              target: "occurrence",
+              reminderId: formalId,
+              reminderMinutes: 0,
+              generatedAt: at.toISO(),
+              // P3-5：重发轮次随通知下发，标题标注（第 N 次提醒，共 M 次）。
+              attemptN,
+            });
+            await publishNotification(notification);
+            recordNotifiedOccurrence(item, resendKey, occurrenceIso);
+          }
+          if (attemptN < item.reminderMaxAttempts) {
+            resendNextAt = at.plus({ minutes: item.reminderIntervalMinutes }) as DateTime<true>;
+          }
+        }
+      }
+    }
+  }
+
   for (let index = 0; index < reminders.length; index += 1) {
     const reminder = reminders[index];
     const timing = nextReminderTiming(item, reminder, triggerAt, true);
@@ -122,34 +251,33 @@ async function processDue(item: ScheduleItem, at: DateTime<true>): Promise<void>
         });
         await publishNotification(notification);
       }
-      db.prepare("INSERT OR IGNORE INTO schedule_occurrences(profile_id, schedule_id, occurrence_key, occurrence_at, status) VALUES(?, ?, ?, ?, 'notified')")
-        .run(item.profileId, item.id, key, occurrenceIso);
+      recordNotifiedOccurrence(item, key, occurrenceIso);
+      // 正式提醒发布后：开启强提醒则该 occurrence 保持 active，安排首轮重发。
+      if (formalId !== undefined && id === formalId
+        && item.reminderIntervalMinutes !== undefined && item.reminderMaxAttempts !== undefined) {
+        resendNextAt = at.plus({ minutes: item.reminderIntervalMinutes }) as DateTime<true>;
+      }
     }
   }
 
-  let cursor = at.plus({ milliseconds: 1 }) as DateTime<true>;
-  let nextRun: DateTime<true> | null = null;
-  while (true) {
-    const candidate = calculateNextRun(item, cursor, true);
-    if (!candidate) break;
-    const hasIncompleteOccurrence = item.reminders.some((reminder) => {
-      const timing = nextReminderTiming(item, reminder, candidate, true);
-      return timing?.triggerAt.equals(candidate)
-        && !isScheduleOccurrenceCompleted(item.profileId, item.id, timing.occurrenceAt.toISO());
-    });
-    if (hasIncompleteOccurrence) {
-      nextRun = candidate;
-      break;
-    }
-    cursor = candidate.plus({ milliseconds: 1 }) as DateTime<true>;
+  let nextRun: DateTime<true> | null;
+  let nextStatus: ScheduleItem["status"];
+  if (resendNextAt !== null) {
+    // 强提醒期间：下一 run = min(now + interval, 下一未完成 occurrence 触发)。
+    // 若下一 occurrence 先到则让位给它；否则持续重发直到完成/取消/达上限。
+    const candidate = calculateNextIncompleteRun(item, at.plus({ milliseconds: 1 }) as DateTime<true>);
+    nextRun = candidate !== null && candidate.toMillis() < resendNextAt.toMillis() ? candidate : resendNextAt;
+    nextStatus = item.status;
+  } else {
+    nextRun = calculateNextIncompleteRun(item, at.plus({ milliseconds: 1 }) as DateTime<true>);
+    // workday/holiday：无数据区间算不出 next run 时保持 active 并停用，等新一年节假日数据
+    // 入库后由 reconcileHolidaySchedules 恢复；until/count 真正耗尽才标记 completed。
+    nextStatus = nextRun
+      ? item.status
+      : (item.recurrence.frequency === "workday" || item.recurrence.frequency === "holiday")
+        ? (holidayAwareRuleFinished(item, at) ? "completed" : item.status)
+        : "completed";
   }
-  // workday/holiday：无数据区间算不出 next run 时保持 active 并停用，等新一年节假日数据
-  // 入库后由 reconcileHolidaySchedules 恢复；until/count 真正耗尽才标记 completed。
-  const nextStatus = nextRun
-    ? item.status
-    : (item.recurrence.frequency === "workday" || item.recurrence.frequency === "holiday")
-      ? (holidayAwareRuleFinished(item, at) ? "completed" : item.status)
-      : "completed";
   // P2-1：写回用归一化后的版本（脏行 version=0 → 2，自愈），WHERE 用原始列值防并发冲突。
   // N2：WHERE 用 version IS ? —— SQLite 的 IS 可匹配 NULL，NULL 脏行同样命中并自愈。
   const nextVersion = normalizeVersion(fresh.version) + 1;

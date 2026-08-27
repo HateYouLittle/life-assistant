@@ -13,7 +13,7 @@ import {
 } from "./service.js";
 
 const reminderSchema = z.object({
-  id: z.string().optional(),
+  id: z.string().regex(/^[^:]+$/, "reminder id must not contain ':' (reserved for occurrence key separators)").optional(),
   minutesBefore: z.number().int().min(0).max(525600),
   target: z.enum(["occurrence", "deadline"]).optional(),
 });
@@ -50,6 +50,8 @@ const commonFields = {
   deadlineAt: z.string().optional(),
   deadlineOffsetMinutes: z.number().int().min(0).max(525600).optional(),
   clearDeadline: z.boolean().optional(),
+  intervalMinutes: z.number().int().min(1).max(10080).optional(),
+  maxAttempts: z.number().int().min(1).max(99).optional(),
 };
 
 const updateFields = {
@@ -72,6 +74,9 @@ const updateFields = {
   deadlineAt: z.string().optional(),
   deadlineOffsetMinutes: z.number().int().min(0).max(525600).optional(),
   clearDeadline: z.boolean().optional(),
+  intervalMinutes: z.number().int().min(1).max(10080).optional(),
+  maxAttempts: z.number().int().min(1).max(99).optional(),
+  clearStrongReminder: z.boolean().optional(),
 };
 
 const scheduleModule: AssistantModule = {
@@ -80,7 +85,7 @@ const scheduleModule: AssistantModule = {
     withTool(
       {
         name: "create",
-        description: "在当前 Hermes Profile 中创建私有待办、生日或纪念日。支持公历和中国农历；农历日期必须使用 lunarMonth/lunarDay，不要当作公历日期填写。recurrence.frequency 支持 workday（中国大陆法定工作日：周一至周五剔除法定节假日、加入调休上班的周末）与 holiday（仅法定节假日休假日，不含普通周末），两者仅支持公历与 Asia/Shanghai 时区。",
+        description: "在当前 Hermes Profile 中创建私有待办、生日或纪念日。支持公历和中国农历；农历日期必须使用 lunarMonth/lunarDay，不要当作公历日期填写。recurrence.frequency 支持 workday（中国大陆法定工作日：周一至周五剔除法定节假日、加入调休上班的周末）与 holiday（仅法定节假日休假日，不含普通周末），两者仅支持公历与 Asia/Shanghai 时区。待办可开启强提醒：传 intervalMinutes（1-10080 分钟，默认 120）与/或 maxAttempts（1-99 轮，默认 3），到期未确认完成将按间隔重复提醒直至完成/取消/达上限；强提醒需要一条 occurrence 正式提醒（target=occurrence 且 minutesBefore=0），缺失会被拒绝。注意 intervalMinutes 大于等于 recurrence 触发间隔（daily=1440 分钟、weekly=10080 分钟）时重发不生效，会被下一 occurrence 的正式提醒接管。",
       },
       commonFields,
       (args, context) => ok(createSchedule(context ?? requireProfileContext(), args)),
@@ -108,6 +113,17 @@ const scheduleModule: AssistantModule = {
       {
         name: "update",
         description: "修改当前 Hermes Profile 的私有日程；不能通过参数切换到其他 Profile。",
+      },
+      { id: z.string(), ...updateFields },
+      (args, context) => {
+        const { id, ...changes } = args;
+        return ok(updateSchedule(context ?? requireProfileContext(), id, changes));
+      },
+    ),
+    withTool(
+      {
+        name: "update",
+        description: "修改当前 Hermes Profile 的私有日程；不能通过参数切换到其他 Profile。传 clearStrongReminder: true 可关闭已开启的强提醒（intervalMinutes/maxAttempts 同时被忽略）。",
       },
       { id: z.string(), ...updateFields },
       (args, context) => {
