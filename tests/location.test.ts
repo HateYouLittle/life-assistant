@@ -6,7 +6,7 @@ import test from "node:test";
 
 import { config } from "../src/config.js";
 import { resetDatabaseForTests } from "../src/core/database.js";
-import { currentLocation, locationSetSchema } from "../src/core/location.js";
+import { currentLocation, locationSetSchema } from "../src/modules/location/index.js";
 
 test("location.set accepts a detected province while preserving legacy inputs", () => {
   assert.deepEqual(

@@ -1,8 +1,9 @@
 import { z } from "zod";
-import { config } from "../config.js";
-import { store } from "./store.js";
-import { httpJson } from "./http.js";
-import { registerModule, ok, fail, withTool, type AssistantModule } from "./registry.js";
+import { config } from "../../config.js";
+import { store } from "../../core/store.js";
+import { httpJson } from "../../core/http.js";
+import { registerModule, ok, fail, withTool, type AssistantModule } from "../../core/registry.js";
+import { qweatherGeo } from "./geo.js";
 
 export interface Location {
   city: string;
@@ -22,7 +23,8 @@ export const locationSetSchema = z.object({
   lon: z.number().min(-180).max(180),
 });
 
-/** 获取已确认位置；未确认返回 null */export function currentLocation(): Location | null {
+/** 获取已确认位置；未确认返回 null */
+export function currentLocation(): Location | null {
   const saved = store.get<Location>(KEY);
   if (saved) {
     // 旧 schema 允许脏数据（空 city、越界/Infinity 坐标）：读取侧校验，
@@ -57,6 +59,45 @@ export function saveImportedLocation(loc: { city: string; province?: string; lat
   const saved: Location = { ...parsed, source: "manual", confirmedAt: new Date().toISOString() };
   store.set(KEY, saved);
   return saved;
+}
+
+/** 位置未确认时的统一守卫：weather/airquality/oilprice/automation 各查询入口共用同一文案。 */
+export function requireConfirmedLocation(): Location {
+  const loc = currentLocation();
+  if (!loc) throw new Error("位置未确认，请先调用 location.get 完成位置确认流程");
+  return loc;
+}
+
+/**
+ * 解析查询位置（供 airquality / automation 等模块复用的公共能力）：
+ * - 无 city → 全局已确认位置（不改变）
+ * - 有 city → 走和风 GeoAPI（对中文区县支持好，如"朔城区"），失败则回退 Open-Meteo；
+ *   只做临时查询，绝不写入 location:current（多 profile 共享 store 时避免互相污染）
+ */
+export async function resolveLocation(city?: string): Promise<{ city: string; lat: number; lon: number }> {
+  if (!city) {
+    const loc = requireConfirmedLocation();
+    return { city: loc.city, lat: loc.lat, lon: loc.lon };
+  }
+  if (config.qweatherKey) {
+    try {
+      const geo = await qweatherGeo(city);
+      return { city, lat: geo.lat, lon: geo.lon };
+    } catch (e) {
+      console.error(`[location] qweather geo failed for "${city}": ${(e as Error).message}`);
+    }
+  }
+  const r = await httpJson<{ results?: Array<{ name: string; latitude: number; longitude: number }> }>(
+    `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(city)}&count=1&language=zh`,
+  );
+  const hit = r.results?.[0];
+  if (!hit) throw new Error(`未找到城市：${city}`);
+  // 与 location.detect 同一校验口径：坐标非有限数或越界时拒绝
+  if (!Number.isFinite(hit.latitude) || !Number.isFinite(hit.longitude)
+    || hit.latitude < -90 || hit.latitude > 90 || hit.longitude < -180 || hit.longitude > 180) {
+    throw new Error(`城市坐标无效：${city}`);
+  }
+  return { city: hit.name, lat: hit.latitude, lon: hit.longitude };
 }
 
 /** IP 自动探测（ip-api.com，免费、无 Key、45 次/分钟，仅供建议值） */

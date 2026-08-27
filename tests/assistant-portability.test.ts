@@ -16,7 +16,7 @@ const {
 const { createSchedule, getSchedule, updateSchedule } = await import("../src/modules/schedule/service.js");
 const { createAutomation, getAutomation, listAutomations } = await import("../src/modules/automation/service.js");
 const { getQuietHours, clearQuietHours, saveQuietHours } = await import("../src/core/notification-settings.js");
-const { currentLocation, saveImportedLocation } = await import("../src/core/location.js");
+const { currentLocation, saveImportedLocation } = await import("../src/modules/location/index.js");
 const { store } = await import("../src/core/store.js");
 const { getDatabase } = await import("../src/core/database.js");
 const db = getDatabase();

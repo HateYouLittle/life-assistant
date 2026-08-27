@@ -1,5 +1,5 @@
 import { config } from "../../config.js";
-import { currentLocation } from "../../core/location.js";
+import { requireConfirmedLocation } from "../location/index.js";
 import { registerModule, ok, fail, withTool, type AssistantModule } from "../../core/registry.js";
 import { fetchOilPrice, type OilPriceObservation } from "./provider.js";
 import { nextWindow } from "./schedule.js";
@@ -45,8 +45,7 @@ const oilpriceModule: AssistantModule = {
       },
       {},
       async () => {
-        const loc = currentLocation();
-        if (!loc) throw new Error("位置未确认，请先调用 location.get");
+        const loc = requireConfirmedLocation();
         return ok(currentOilPriceResult(await fetchOilPrice(loc.city, { province: loc.province })));
       },
     ),

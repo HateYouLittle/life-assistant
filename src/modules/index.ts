@@ -3,7 +3,7 @@
  * 新增功能模块 = 在 modules/ 下新建目录实现 AssistantModule，
  * 然后在这里 import 一行（模块内部自注册）。核心代码零改动。
  */
-import "../core/location.js";   // 内建：位置服务
+import "./location/index.js";   // 内建：位置服务（含 resolveLocation 公共能力）
 import "./weather/index.js";
 import "./airquality/index.js"; // 空气质量：和风国标 AQI 优先，Open-Meteo 美标兜底
 import "./oilprice/index.js";

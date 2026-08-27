@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { registerModule, ok, fail, type AssistantModule } from "../../core/registry.js";
-import { resolveLocation } from "../weather/index.js";
+import { resolveLocation } from "../location/index.js";
 import { fetchAirQuality } from "./provider.js";
 
 export const airqualityModule: AssistantModule = {

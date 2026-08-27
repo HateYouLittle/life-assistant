@@ -2,7 +2,7 @@ import { z } from "zod";
 import { registerModule, ok, withTool, type AssistantModule } from "../../core/registry.js";
 import { requireProfileContext, type ProfileContext } from "../../core/profile.js";
 import { getDatabase } from "../../core/database.js";
-import { currentLocation, saveImportedLocation } from "../../core/location.js";
+import { currentLocation, saveImportedLocation } from "../location/index.js";
 import { getQuietHours, saveQuietHours } from "../../core/notification-settings.js";
 import {
   createSchedule,

@@ -1,5 +1,5 @@
 import { DateTime } from "luxon";
-import { currentLocation } from "../../core/location.js";
+import { currentLocation } from "../location/index.js";
 import { publishNotification } from "../../core/notification-publisher.js";
 import { publishGlobal } from "../../core/notifier.js";
 import { store } from "../../core/store.js";

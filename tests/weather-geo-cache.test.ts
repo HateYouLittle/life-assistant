@@ -12,7 +12,7 @@ process.env.HERMES_PROFILE = "profile-a";
 
 const { config } = await import("../src/config.js");
 const { store } = await import("../src/core/store.js");
-const { qweatherGeo } = await import("../src/modules/weather/provider.js");
+const { qweatherGeo } = await import("../src/modules/location/geo.js");
 const { getDatabase } = await import("../src/core/database.js");
 const db = getDatabase();
 

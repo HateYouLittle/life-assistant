@@ -1,6 +1,6 @@
 import { z } from "zod";
-import { currentLocation } from "../../core/location.js";
-import { resolveLocation } from "../weather/index.js";
+import { requireConfirmedLocation } from "../location/index.js";
+import { resolveLocation } from "../location/index.js";
 import { fetchCurrent, fetchForecast } from "../weather/provider.js";
 import { fetchAirQuality } from "../airquality/provider.js";
 import { fetchOilPrice } from "../oilprice/provider.js";
@@ -76,8 +76,7 @@ export const automationActions: Record<string, AutomationActionDef> = {
     description: "当前油价（使用已保存位置的省份）。结果字段：province、p92、p95、p0（数值，元/升）。",
     paramsSchema: z.object({}),
     run: async () => {
-      const loc = currentLocation();
-      if (!loc) throw new Error("位置未确认，请先调用 location.get 完成位置确认");
+      const loc = requireConfirmedLocation();
       const observation = await fetchOilPrice(loc.city, { province: loc.province });
       return {
         province: observation.province,
