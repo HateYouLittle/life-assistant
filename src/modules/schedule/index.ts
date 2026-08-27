@@ -112,17 +112,6 @@ const scheduleModule: AssistantModule = {
     withTool(
       {
         name: "update",
-        description: "修改当前 Hermes Profile 的私有日程；不能通过参数切换到其他 Profile。",
-      },
-      { id: z.string(), ...updateFields },
-      (args, context) => {
-        const { id, ...changes } = args;
-        return ok(updateSchedule(context ?? requireProfileContext(), id, changes));
-      },
-    ),
-    withTool(
-      {
-        name: "update",
         description: "修改当前 Hermes Profile 的私有日程；不能通过参数切换到其他 Profile。传 clearStrongReminder: true 可关闭已开启的强提醒（intervalMinutes/maxAttempts 同时被忽略）。",
       },
       { id: z.string(), ...updateFields },
