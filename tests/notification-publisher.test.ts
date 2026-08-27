@@ -27,6 +27,9 @@ process.env.PROFILE_PUSH_ROUTES_JSON = JSON.stringify({
 });
 
 const { publishNotification } = await import("../src/core/notification-publisher.js");
+// 模块渲染器注册：kind 渲染已下放各业务模块（生产由 modules/index 全量加载）。
+await import("../src/modules/weather/notification.js");
+await import("../src/modules/schedule/notification.js");
 const { getDatabase } = await import("../src/core/database.js");
 const db = getDatabase();
 

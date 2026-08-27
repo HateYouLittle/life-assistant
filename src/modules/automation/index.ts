@@ -3,6 +3,7 @@ import { config } from "../../config.js";
 import { registerModule, ok, withTool, type AssistantModule } from "../../core/registry.js";
 import { requireProfileContext } from "../../core/profile.js";
 import { automationActions } from "./actions.js";
+import "./notification.js"; // 注册自动化结果渲染器（fan-out 渲染需要）
 import {
   automationConditionSchema,
   automationScheduleSchema,

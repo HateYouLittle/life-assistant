@@ -1,18 +1,15 @@
-import { config, resolveRenderTarget } from "../config.js";
 import { getQuietHours, isQuietAt } from "./notification-settings.js";
-import { renderNotification, type NotificationEnvelope } from "./notification.js";
+import type { NotificationEnvelope } from "./notification.js";
 
 /**
  * 投递/拉取时的快照重渲染（方案 A）。
  *
- * profile_notifications 落库的是发布时渲染好的文本快照；对 schedule.reminder，
- * 快照里的"相对"行以发布时刻计算，勿扰顺延/重试/停机补发后推送会带着过期的相对时间。
- * 因此发布时同步落一份结构化 envelope（v6 envelope 列），投递时按投递时刻重算相对时间，
- * 并在推送晚于提醒触发时刻时附加原因。其余 kind 维持"快照即投递"契约，原样输出。
+ * profile_notifications 落库的是发布时渲染好的文本快照；个别 kind 的快照里带
+ * 相对发布时刻的内容（如 schedule.reminder 的"相对"行），勿扰顺延/重试/停机补发
+ * 后推送会过期。核心层因此只提供"结构化 envelope 列存在则交给注册的模块钩子
+ * 重渲染"的管道；schedule 模块在其 notification.ts 中注册自己的投递期钩子。
+ * 未注册钩子（或存量无 envelope 行）维持"快照即投递"契约，原样输出。
  */
-
-/** 投递参考时间的抖动容差：与 scheduler 发布参考时间的口径一致（60 秒）。 */
-const DELIVERY_RENDER_TOLERANCE_MS = 60_000;
 
 export interface DeliverySnapshotRow {
   profileId: string;
@@ -25,7 +22,7 @@ export interface DeliverySnapshotRow {
   envelope?: string | null;
 }
 
-/** 判定推送顺延原因：snooze > 勿扰时段 > 投递重试。 */
+/** 判定推送顺延原因：snooze > 勿扰时段 > 投递重试（投递语义，非业务语义，留在核心层）。 */
 export function deliveryDeferralReason(row: {
   profileId: string;
   /** 提醒的触发时刻（envelope 原始 payload.generatedAt）；判定勿扰顺延的依据。 */
@@ -46,54 +43,48 @@ export function deliveryDeferralReason(row: {
 }
 
 /**
- * 按 at（投递/拉取时刻）重渲染 schedule.reminder 快照：
- * 相对时间重算，亚分钟内的"逾期"钉回目标时刻（即时投递的抖动显示"现在"而非"已逾期 1 分钟"）；
- * 存在顺延原因时附加在相对行末尾。envelope 缺失/损坏/kind 不符/渲染异常一律回退原快照。
+ * 模块投递期重渲染钩子：返回 null/undefined 或抛错均回退原快照；
+ * 先注册者先尝试。
+ */
+export type DeliveryRerenderHook = (
+  row: DeliverySnapshotRow,
+  at: Date,
+) => { title: string; body: string } | undefined | null;
+
+const rerenderHooks: DeliveryRerenderHook[] = [];
+
+export function registerDeliveryRerender(hook: DeliveryRerenderHook): void {
+  rerenderHooks.push(hook);
+}
+
+/** 解析 envelope JSON；损坏行按无能力处理。 */
+export function parseDeliveryEnvelope(row: DeliverySnapshotRow): NotificationEnvelope | null {
+  if (!row.envelope) return null;
+  try {
+    const parsed = JSON.parse(row.envelope);
+    if (parsed && typeof parsed === "object" && typeof parsed.kind === "string") {
+      return parsed as NotificationEnvelope;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 按 at（投递/拉取时刻）重渲染：依次尝试已注册的模块钩子；任何异常回退原快照。
  */
 export function renderDeliveredNotification(
   row: DeliverySnapshotRow,
   at: Date,
 ): { title: string; body: string } {
-  const fallback = { title: row.title, body: row.body };
-  if (!row.envelope) return fallback;
-  let envelope: NotificationEnvelope;
-  try {
-    envelope = JSON.parse(row.envelope) as NotificationEnvelope;
-  } catch {
-    return fallback;
+  for (const hook of rerenderHooks) {
+    try {
+      const rendered = hook(row, at);
+      if (rendered) return rendered;
+    } catch {
+      // 单个钩子异常不阻断投递，继续回退。
+    }
   }
-  if (envelope?.kind !== "schedule.reminder") return fallback;
-  const payload = envelope.payload;
-  if (!payload.targetAt || !payload.generatedAt) return fallback;
-  const targetMs = Date.parse(payload.targetAt);
-  const firedAtMs = Date.parse(payload.generatedAt);
-  if (!Number.isFinite(targetMs) || !Number.isFinite(firedAtMs)) return fallback;
-  const nowMs = at.getTime();
-  const referenceMs = nowMs >= targetMs && nowMs - targetMs <= DELIVERY_RENDER_TOLERANCE_MS
-    ? targetMs
-    : nowMs;
-  const reference = new Date(referenceMs).toISOString();
-  const reason = deliveryDeferralReason({
-    profileId: row.profileId,
-    firedAt: payload.generatedAt,
-    notBefore: row.notBefore,
-    attempts: row.attempts,
-  });
-  const reRendered: NotificationEnvelope = {
-    ...envelope,
-    generatedAt: reference,
-    payload: {
-      ...payload,
-      generatedAt: reference,
-      ...(reason ? { deferralReason: reason } : {}),
-    },
-  };
-  try {
-    const route = Object.prototype.hasOwnProperty.call(config.profilePushRoutes, row.profileId)
-      ? config.profilePushRoutes[row.profileId]
-      : undefined;
-    return renderNotification(reRendered, resolveRenderTarget(route) ?? "plain");
-  } catch {
-    return fallback;
-  }
+  return { title: row.title, body: row.body };
 }

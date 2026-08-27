@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { registerModule, ok, withTool, type AssistantModule } from "../../core/registry.js";
 import { requireProfileContext } from "../../core/profile.js";
+import "./notification.js"; // 注册 schedule.reminder 渲染器与投递期重渲染钩子（MCP/pull 路径也需要）
 import {
   completeSchedule,
   createSchedule,

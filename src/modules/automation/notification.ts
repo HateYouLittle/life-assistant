@@ -1,5 +1,22 @@
-import type { NotificationEnvelope } from "../../core/notification.js";
+import {
+  registerNotificationBlocks,
+  type EnvelopeFor,
+  type RenderBlock,
+} from "../../core/notification.js";
 import type { AutomationItem } from "./types.js";
+
+// 载荷与渲染归本模块所有；core 只保留信封骨架与投影管道。
+
+export interface AutomationResultPayload {
+  name: string;
+  action: string;
+  schedule: string;
+  timezone: string;
+  condition?: { field: string; op: string; value: number | string };
+  fields: Array<{ label: string; value: string }>;
+}
+
+export type AutomationResultEnvelope = EnvelopeFor<"automation.result", AutomationResultPayload>;
 
 export function scheduleText(schedule: AutomationItem["schedule"]): string {
   return schedule.type === "daily"
@@ -31,7 +48,7 @@ export function automationResultNotification(input: {
   identity: string;
   generatedAt: string;
   timezone: string;
-}): NotificationEnvelope {
+}): AutomationResultEnvelope {
   const { item, fields } = input;
   return {
     kind: "automation.result",
@@ -50,3 +67,37 @@ export function automationResultNotification(input: {
     },
   };
 }
+
+// ---------------------------------------------------------------------------
+// RenderBlock[] 构造器（自 core/notification.ts 下放，逻辑逐行保留）
+// ---------------------------------------------------------------------------
+
+const AUTOMATION_OP_LABEL: Record<string, string> = {
+  ">": "大于",
+  ">=": "大于等于",
+  "<": "小于",
+  "<=": "小于等于",
+  "==": "等于",
+  "!=": "不等于",
+};
+
+function automationResultBlocks(payload: AutomationResultPayload): RenderBlock[] {
+  const blocks: RenderBlock[] = [
+    { type: "line", text: `自动提醒 · ${payload.name}` },
+  ];
+  if (payload.condition) {
+    const opLabel = AUTOMATION_OP_LABEL[payload.condition.op] ?? payload.condition.op;
+    blocks.push({
+      type: "label",
+      label: "触发条件",
+      value: `${payload.condition.field} ${opLabel} ${payload.condition.value}`,
+    });
+  }
+  for (const field of payload.fields) {
+    blocks.push({ type: "label", label: field.label, value: field.value });
+  }
+  blocks.push({ type: "label", label: "任务", value: `${payload.action}，${payload.schedule}` });
+  return blocks;
+}
+
+registerNotificationBlocks("automation.result", (n) => automationResultBlocks(n.payload as AutomationResultPayload));

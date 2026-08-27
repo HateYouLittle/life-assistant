@@ -1,4 +1,13 @@
-import { DateTime } from "luxon";
+/**
+ * 通知信封骨架与渲染管道（核心层不携带任何业务载荷）。
+ *
+ * 分工：
+ * - 各模块在自己的 notification.ts 中定义 payload 结构、构造 Envelope，
+ *   并通过 registerNotificationBlocks() 注册该 kind 的 RenderBlock[] 构造器；
+ * - 本文件只保留：Envelope 骨架（identity/source/scope/headline/provenance/details）、
+ *   RenderBlock[] 中间表示、plain / markdown 两种确定性投影。
+ * 新增一种通知不再需要改动核心层，只需在模块内注册渲染器并加载该模块。
+ */
 
 export type NotificationScope =
   | { type: "global" }
@@ -7,95 +16,6 @@ export type NotificationScope =
 export interface NotificationProvenance {
   provider?: string;
   publisher?: string;
-}
-
-export interface DailyWeatherPayload {
-  city: string;
-  current?: {
-    weather: string;
-    temperatureC: number;
-    apparentTemperatureC?: number;
-    humidityPercent?: number;
-  };
-  today?: {
-    weather: string;
-    minTemperatureC: number;
-    maxTemperatureC: number;
-  };
-  precipitation?: {
-    probabilityPercent?: number;
-    amountMm?: number;
-  };
-  airQuality?: {
-    scale: "CN" | "US";
-    aqi: number;
-    category: string;
-  };
-  advice?: string;
-}
-
-export interface OfficialWeatherAlertPayload {
-  type: string;
-  level?: string;
-  issuedAt?: string;
-  impactStartsAt?: string;
-  impactEndsAt?: string;
-  timezone: string;
-  area?: string;
-  risk?: string;
-  advice?: string;
-}
-
-export interface WeatherInferredAlertPayload {
-  title: string;
-  description: string;
-  timezone: string;
-}
-
-export interface OilPriceAdvanceNoticePayload {
-  windowDate: string;
-  effectiveAt: string;
-  timezone: string;
-  tip: string;
-}
-
-export interface OilPriceOfficialResultPayload {
-  province: string;
-  windowDate: string;
-  effectiveAt: string;
-  timezone: string;
-  unit: "元/升";
-  fuels: Record<"p92" | "p95" | "p0", { current: string; change: string }>;
-  source: string;
-}
-
-export interface ScheduleReminderPayload {
-  title: string;
-  eventAt: string;
-  occurrenceAt?: string;
-  deadlineAt?: string;
-  targetAt?: string;
-  target?: "occurrence" | "deadline";
-  reminderId?: string;
-  timezone: string;
-  reminderMinutes: number;
-  type?: "todo" | "birthday" | "anniversary";
-  status?: "active" | "completed" | "archived";
-  note?: string;
-  priority?: "low" | "normal" | "high";
-  allDay?: boolean;
-  generatedAt?: string;
-  /** 投递时由 delivery-render 附加：本次推送晚于提醒触发时刻的原因（如勿扰时段顺延）。 */
-  deferralReason?: string;
-}
-
-export interface AutomationResultPayload {
-  name: string;
-  action: string;
-  schedule: string;
-  timezone: string;
-  condition?: { field: string; op: string; value: number | string };
-  fields: Array<{ label: string; value: string }>;
 }
 
 interface NotificationCore {
@@ -108,15 +28,17 @@ interface NotificationCore {
   details?: string;
 }
 
-export type NotificationEnvelope = NotificationCore & (
-  | { kind: "weather.daily_brief"; payload: DailyWeatherPayload }
-  | { kind: "weather.official_alert"; payload: OfficialWeatherAlertPayload }
-  | { kind: "weather.inferred_alert"; payload: WeatherInferredAlertPayload }
-  | { kind: "oilprice.advance_notice"; payload: OilPriceAdvanceNoticePayload }
-  | { kind: "oilprice.official_result"; payload: OilPriceOfficialResultPayload }
-  | { kind: "schedule.reminder"; payload: ScheduleReminderPayload }
-  | { kind: "automation.result"; payload: AutomationResultPayload }
-);
+/** 开放信封：kind/payload 由各业务模块通过 EnvelopeFor 收紧类型后构造。 */
+export interface NotificationEnvelope extends NotificationCore {
+  kind: string;
+  payload: unknown;
+}
+
+/** 模块侧的类型收紧器：声明某 kind 的固定 payload 形状。 */
+export interface EnvelopeFor<K extends string, P> extends NotificationCore {
+  kind: K;
+  payload: P;
+}
 
 export interface RenderedNotification {
   title: string;
@@ -135,7 +57,7 @@ export type NotificationRenderer = (
 ) => RenderedNotification;
 
 // ============================================================================
-// 阶段 B：结构化块中间表示（RenderBlock[] IR）
+// 结构化块中间表示（RenderBlock[] IR）
 //
 // plain / qq-markdown / feishu-markdown / wechat-markdown 都是同一份 RenderBlock[]
 // 的确定性投影：qq/feishu/wechat 三平台统一同一套保守 markdown 渲染规则，plain 为兜底。
@@ -149,225 +71,31 @@ export type RenderBlock =
   | { type: "section"; title?: string }
   | { type: "raw"; text: string };
 
-function dailyWeatherBlocks(payload: DailyWeatherPayload): RenderBlock[] {
-  const blocks: RenderBlock[] = [];
-  if (payload.current) {
-    const current = payload.current;
-    const facts = [`${current.weather}，${current.temperatureC}℃`];
-    if (current.apparentTemperatureC !== undefined) facts.push(`体感${current.apparentTemperatureC}℃`);
-    if (current.humidityPercent !== undefined) facts.push(`湿度${current.humidityPercent}%`);
-    blocks.push({ type: "label", label: "当前", value: facts.join("，") });
+/**
+ * kind → RenderBlock[] 构造器注册表。各业务模块在 import 时自注册；
+ * 同一 kind 重复注册视为编程错误（两次 import 不可能重复，防手写冲突）。
+ */
+type BlockRenderer = (notification: NotificationEnvelope) => RenderBlock[];
+
+const blockRenderers = new Map<string, BlockRenderer>();
+
+export function registerNotificationBlocks(kind: string, render: BlockRenderer): void {
+  if (blockRenderers.has(kind)) {
+    throw new Error(`duplicate notification block renderer for kind: ${kind}`);
   }
-  if (payload.today) {
-    const today = payload.today;
-    blocks.push({
-      type: "label",
-      label: "今日",
-      value: `${today.minTemperatureC}～${today.maxTemperatureC}℃，${today.weather}`,
-    });
-  }
-  if (payload.precipitation?.probabilityPercent !== undefined) {
-    blocks.push({ type: "label", label: "降水", value: `最高概率${payload.precipitation.probabilityPercent}%` });
-  } else if (payload.precipitation?.amountMm !== undefined) {
-    blocks.push({ type: "label", label: "降水", value: `预计${payload.precipitation.amountMm}mm` });
-  }
-  if (payload.airQuality) {
-    const scale = payload.airQuality.scale === "CN" ? "国标" : "美标";
-    blocks.push({
-      type: "label",
-      label: "空气",
-      value: `AQI ${payload.airQuality.aqi}，${payload.airQuality.category}（${scale}）`,
-    });
-  }
-  if (payload.advice) blocks.push({ type: "label", label: "建议", value: payload.advice });
-  return blocks;
+  blockRenderers.set(kind, render);
 }
 
-function formatDateTime(value: string, timezone: string): string {
-  return DateTime.fromISO(value, { setZone: true }).setZone(timezone).toFormat("yyyy年M月d日 HH:mm");
-}
-
-function officialAlertBlocks(
-  notification: Extract<NotificationEnvelope, { kind: "weather.official_alert" }>,
-): RenderBlock[] {
-  const { payload, provenance } = notification;
-  const blocks: RenderBlock[] = [];
-  const timeParts: string[] = [];
-  if (payload.issuedAt) {
-    const issuedAt = formatDateTime(payload.issuedAt, payload.timezone);
-    timeParts.push(provenance?.publisher ? `${provenance.publisher}于 ${issuedAt} 发布` : `${issuedAt} 发布`);
-  }
-  if (payload.impactStartsAt && payload.impactEndsAt) {
-    timeParts.push(`影响时段：${formatDateTime(payload.impactStartsAt, payload.timezone)} 至 ${formatDateTime(payload.impactEndsAt, payload.timezone)}`);
-  } else if (payload.impactStartsAt) {
-    timeParts.push(`影响开始：${formatDateTime(payload.impactStartsAt, payload.timezone)}`);
-  } else if (payload.impactEndsAt) {
-    timeParts.push(`影响至：${formatDateTime(payload.impactEndsAt, payload.timezone)}`);
-  }
-  if (timeParts.length > 0) blocks.push({ type: "label", label: "时间", value: timeParts.join("；") });
-  if (payload.area) blocks.push({ type: "label", label: "区域", value: payload.area });
-  if (payload.risk) blocks.push({ type: "label", label: "风险", value: payload.risk });
-  if (payload.advice) blocks.push({ type: "label", label: "建议", value: payload.advice });
-  const publisher = provenance?.publisher;
-  const provider = provenance?.provider;
-  if (publisher && provider) {
-    blocks.push({ type: "label", label: "来源", value: `${publisher}（${provider}）` });
-  } else if (publisher) {
-    blocks.push({ type: "label", label: "来源", value: publisher });
-  } else if (provider) {
-    blocks.push({ type: "label", label: "来源", value: provider });
-  }
-  if (notification.details) {
-    blocks.push({ type: "section" });
-    blocks.push({ type: "line", text: "官方原文：" });
-    blocks.push({ type: "raw", text: notification.details });
-  }
-  return blocks;
-}
-
-function inferredAlertBlocks(payload: WeatherInferredAlertPayload): RenderBlock[] {
-  return [{ type: "label", label: "风险", value: payload.description, plainNoPrefix: true }];
-}
-
-function formatBusinessDate(value: string): string {
-  return DateTime.fromISO(value, { zone: "Asia/Shanghai" }).toFormat("yyyy年M月d日");
-}
-
-function oilPriceAdvanceBlocks(payload: OilPriceAdvanceNoticePayload): RenderBlock[] {
-  return [
-    { type: "label", label: "调整时间", value: `${formatBusinessDate(payload.windowDate)} 24:00（北京时间）` },
-    { type: "label", label: "正式涨跌", value: "尚未发布" },
-    { type: "label", label: "提示", value: payload.tip },
-  ];
-}
-
-function renderChange(value: string): string {
-  if (value.startsWith("-")) return `每升下降${value.slice(1)}元`;
-  if (/^0(?:\.0+)?$/.test(value)) return "每升价格不变";
-  return `每升上涨${value}元`;
-}
-
-function oilPriceResultBlocks(
-  notification: Extract<NotificationEnvelope, { kind: "oilprice.official_result" }>,
-): RenderBlock[] {
-  const { payload, provenance } = notification;
-  const effectiveAt = `${formatBusinessDate(payload.windowDate)} 24:00`;
-  const blocks: RenderBlock[] = ([
-    ["92号汽油", payload.fuels.p92],
-    ["95号汽油", payload.fuels.p95],
-    ["0号柴油", payload.fuels.p0],
-  ] as const).map(([label, fuel]) => ({
-    type: "label",
-    label,
-    value: `${fuel.current}${payload.unit}，${renderChange(fuel.change)}`,
-  } as const));
-  blocks.push({ type: "label", label: "生效时间", value: `${effectiveAt}（北京时间）` });
-  blocks.push({ type: "label", label: "地区", value: payload.province });
-  const provider = provenance?.provider?.trim();
-  const sourceIncludesProvider = provider
-    ? payload.source.toLocaleLowerCase().includes(provider.toLocaleLowerCase())
-    : false;
-  blocks.push({
-    type: "label",
-    label: "来源",
-    value: `${payload.source}${provider && !sourceIncludesProvider ? `（${provider}）` : ""}`,
-  });
-  return blocks;
-}
-
-function scheduleReminderBlocks(payload: ScheduleReminderPayload): RenderBlock[] {
-  if (!payload.target || !payload.occurrenceAt || !payload.targetAt || !payload.generatedAt) {
-    const localEvent = DateTime.fromISO(payload.eventAt, { setZone: true })
-      .setZone(payload.timezone)
-      .toFormat("yyyy-LL-dd HH:mm");
-    return [
-      { type: "line", text: payload.title },
-      { type: "label", label: "时间", value: localEvent },
-      { type: "label", label: "提醒", value: `提前 ${payload.reminderMinutes} 分钟` },
-    ];
-  }
-  const targetAt = DateTime.fromISO(payload.targetAt, { setZone: true }).setZone(payload.timezone);
-  const generatedAt = DateTime.fromISO(payload.generatedAt, { setZone: true }).setZone(payload.timezone);
-  const targetLabel = payload.target === "deadline" ? "截止提醒" : "发生提醒";
-  const typeLabel = { todo: "待办", birthday: "生日", anniversary: "纪念日" }[payload.type ?? "todo"];
-  const firstLine = `${typeLabel} · ${targetLabel}：${payload.title}`;
-  const sameDay = targetAt.toISODate() === generatedAt.toISODate();
-  const tomorrow = targetAt.toISODate() === generatedAt.plus({ days: 1 }).toISODate();
-  const clock = targetAt.toFormat("HH:mm");
-  const hideClock = payload.target === "occurrence" && payload.allDay === true;
-  let displayTime: string;
-  if (sameDay) displayTime = hideClock ? "今天" : `今天 ${clock}`;
-  else if (tomorrow) displayTime = hideClock ? "明天" : `明天 ${clock}`;
-  else displayTime = targetAt.toFormat(hideClock ? "yyyy-LL-dd" : "yyyy-LL-dd HH:mm");
-
-  const differenceMs = targetAt.toMillis() - generatedAt.toMillis();
-  let relative: string;
-  if (differenceMs === 0) {
-    relative = "现在";
-  } else if (differenceMs > 0 && differenceMs < 60_000) {
-    relative = "马上";
-  } else if (differenceMs > 0 && differenceMs < 24 * 60 * 60 * 1000) {
-    const totalMinutes = Math.floor(differenceMs / 60_000);
-    relative = `还有 ${Math.floor(totalMinutes / 60)} 小时 ${totalMinutes % 60} 分钟`;
-  } else if (differenceMs > 0) {
-    const calendarDays = Math.max(1, Math.round(
-      targetAt.startOf("day").diff(generatedAt.startOf("day"), "days").days,
-    ));
-    relative = `还有 ${calendarDays} 天`;
-  } else if (-differenceMs < 60 * 60 * 1000) {
-    relative = `已逾期 ${Math.max(1, Math.floor(-differenceMs / 60_000))} 分钟`;
-  } else if (-differenceMs < 24 * 60 * 60 * 1000) {
-    relative = `已逾期 ${Math.floor(-differenceMs / (60 * 60 * 1000))} 小时`;
-  } else {
-    relative = `已逾期 ${Math.floor(-differenceMs / (24 * 60 * 60 * 1000))} 天`;
-  }
-  if (payload.deferralReason) relative = `${relative}（${payload.deferralReason}）`;
-  const timeLabel = payload.target === "deadline" ? "截止时间" : "发生时间";
-  const blocks: RenderBlock[] = [
-    { type: "line", text: firstLine },
-    { type: "label", label: timeLabel, value: displayTime },
-    { type: "label", label: "相对", value: relative },
-  ];
-  if (payload.note) blocks.push({ type: "label", label: "备注", value: payload.note });
-  return blocks;
-}
-
-const AUTOMATION_OP_LABEL: Record<string, string> = {
-  ">": "大于",
-  ">=": "大于等于",
-  "<": "小于",
-  "<=": "小于等于",
-  "==": "等于",
-  "!=": "不等于",
-};
-
-function automationResultBlocks(payload: AutomationResultPayload): RenderBlock[] {
-  const blocks: RenderBlock[] = [
-    { type: "line", text: `自动提醒 · ${payload.name}` },
-  ];
-  if (payload.condition) {
-    const opLabel = AUTOMATION_OP_LABEL[payload.condition.op] ?? payload.condition.op;
-    blocks.push({
-      type: "label",
-      label: "触发条件",
-      value: `${payload.condition.field} ${opLabel} ${payload.condition.value}`,
-    });
-  }
-  for (const field of payload.fields) {
-    blocks.push({ type: "label", label: field.label, value: field.value });
-  }
-  blocks.push({ type: "label", label: "任务", value: `${payload.action}，${payload.schedule}` });
+function fallbackBlocks(notification: NotificationEnvelope): RenderBlock[] {
+  const blocks: RenderBlock[] = [{ type: "line", text: notification.headline }];
+  if (notification.details) blocks.push({ type: "raw", text: notification.details });
   return blocks;
 }
 
 function renderBlocks(notification: NotificationEnvelope): RenderBlock[] {
-  if (notification.kind === "weather.daily_brief") return dailyWeatherBlocks(notification.payload);
-  if (notification.kind === "weather.official_alert") return officialAlertBlocks(notification);
-  if (notification.kind === "weather.inferred_alert") return inferredAlertBlocks(notification.payload);
-  if (notification.kind === "oilprice.advance_notice") return oilPriceAdvanceBlocks(notification.payload);
-  if (notification.kind === "oilprice.official_result") return oilPriceResultBlocks(notification);
-  if (notification.kind === "automation.result") return automationResultBlocks(notification.payload);
-  return scheduleReminderBlocks(notification.payload);
+  const render = blockRenderers.get(notification.kind);
+  if (!render) return fallbackBlocks(notification);
+  return render(notification);
 }
 
 // ---------------------------------------------------------------------------

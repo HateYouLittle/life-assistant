@@ -31,6 +31,9 @@ process.env.PROFILE_PUSH_ROUTES_JSON = JSON.stringify({
 
 const { publishNotification } = await import("../src/core/notification-publisher.js");
 const { renderNotification } = await import("../src/core/notification.js");
+// 模块渲染器注册：kind 渲染已下放各业务模块（生产由 modules/index 全量加载）。
+await import("../src/modules/weather/notification.js");
+await import("../src/modules/schedule/notification.js");
 const { requireProfileContext } = await import("../src/core/profile.js");
 const configModule = await import("../src/config.js");
 const parseProfilePushRoutes = (configModule as Record<string, unknown>).parseProfilePushRoutes as (

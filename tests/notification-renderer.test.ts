@@ -3,6 +3,10 @@ import test from "node:test";
 
 import { renderNotification, type NotificationEnvelope } from "../src/core/notification.js";
 
+// 渲染器已下放各业务模块：此处显式加载以完成 kind 注册（生产进程由 modules/index 全量加载）。
+import "../src/modules/weather/notification.js";
+import "../src/modules/schedule/notification.js";
+
 test("daily weather rendering is deterministic and follows the weather decision order", () => {
   const notification: NotificationEnvelope = {
     kind: "weather.daily_brief",

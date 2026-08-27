@@ -27,6 +27,9 @@ const {
   cancelProfileNotificationDelivery,
   listProfileNotifications,
 } = await import("../src/core/notifier.js");
+// schedule.reminder 的投递期重渲染钩子由模块 notification 文件注册；
+// 生产进程经 modules/index 全量加载，直连单元测试需显式引入同一模块。
+await import("../src/modules/schedule/notification.js");
 const { pullPending } = await import("../src/core/notifier.js");
 const {
   isQuietAt,

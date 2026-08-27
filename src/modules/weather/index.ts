@@ -2,7 +2,7 @@ import { z } from "zod";
 import { DateTime } from "luxon";
 import { config } from "../../config.js";
 import { publishNotification } from "../../core/notification-publisher.js";
-import type { DailyWeatherPayload, NotificationEnvelope } from "../../core/notification.js";
+import type { EnvelopeFor } from "../../core/notification.js";
 import { publishGlobal } from "../../core/notifier.js";
 import { registerModule, ok, withTool, type AssistantModule } from "../../core/registry.js";
 import { currentLocation, resolveLocation } from "../location/index.js";
@@ -16,6 +16,7 @@ import {
   type WeatherAlert,
 } from "./provider.js";
 import { fetchAirQuality, type AirQuality } from "../airquality/provider.js";
+import type { DailyWeatherPayload } from "./notification.js";
 import { inferredAlertNotification, legacyWeatherAlertDedupeKeys, officialAlertNotification } from "./notification.js";
 
 export interface DailyWeatherBriefOptions {
@@ -114,7 +115,7 @@ export async function runDailyWeatherBrief(options: DailyWeatherBriefOptions = {
     } : undefined,
     advice: dailyAdvice(today),
   };
-  const notification: NotificationEnvelope = {
+  const notification: EnvelopeFor<"weather.daily_brief", DailyWeatherPayload> = {
     kind: "weather.daily_brief",
     // 同日换城市不再被旧键吞掉：dedupeKey 形如 weather:daily-brief:{city}:{localDate}
     identity: `daily-brief:${location.city}:${localDate}`,

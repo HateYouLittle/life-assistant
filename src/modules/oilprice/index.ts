@@ -1,6 +1,7 @@
 import { config } from "../../config.js";
 import { requireConfirmedLocation } from "../location/index.js";
 import { registerModule, ok, fail, withTool, type AssistantModule } from "../../core/registry.js";
+import "./notification.js"; // 注册油价通知渲染器（fan-out 渲染需要）
 import { fetchOilPrice, type OilPriceObservation } from "./provider.js";
 import { nextWindow } from "./schedule.js";
 import { runOilPriceWatch } from "./watch.js";
