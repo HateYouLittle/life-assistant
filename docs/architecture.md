@@ -9,7 +9,7 @@ Life Assistant 是 Hermes Agent 的 Skill + MCP 服务。查询面由 Hermes Pro
 Hermes Profile -> src/index.ts -> MCP tools -> SQLite / Provider
 
 主动通知面
-src/scheduler.ts -> module cron + schedule scan + outbox delivery
+src/scheduler.ts -> module cron + module tick + outbox delivery
                          |
                          v
               Profile notification + delivery
@@ -28,8 +28,10 @@ src/scheduler.ts -> module cron + schedule scan + outbox delivery
 `src/scheduler.ts` 是唯一常驻调度器，负责：
 
 - 执行模块定义的 cron job；
-- 每分钟扫描 Profile 私有日程；
+- 每分钟 tick：调用注册了 `tick(at)` 扩展点的各模块（日程到期扫描由 schedule 模块在自身 `modules/schedule/tick.ts` 中实现）；
 - 投递到期的 Profile outbox delivery。
+
+核心 scheduler 不 import 任何 `modules/*` 内部文件——模块知识全部留在模块目录内，经 registry 的 `tools/jobs/tick/onStart` 四个扩展点接入（该边界由契约测试守护）。
 
 同一 `DATA_DIR` 只运行一个 scheduler。SQLite scheduler lease 能阻止正常情况下的重复启动和接管失控，但不把多实例调度变成支持的部署方式。生产运行应由 systemd 等进程管理器负责重启。
 
@@ -70,7 +72,10 @@ interface JobDef {
 }
 ```
 
-`AssistantModule` 还支持可选 `onStart(): Promise<void>`：scheduler 取得租约后为每个模块调用一次（不阻塞启动，异常只记日志），用于启动引导类数据补齐（当前 holiday 模块用它确保当年节假日数据可用）。
+`AssistantModule` 还支持两个可选钩子：
+
+- `tick(at: Date): Promise<void>`：随 scheduler 每分钟 tick 调用的模块级扫描（入参为本次 tick 时间；scheduler 保证同一时刻只有一个 tick 在跑，重叠直接跳过）。日程到期扫描就是 schedule 模块经此接入的（`modules/schedule/tick.ts`）；
+- `onStart(): Promise<void>`：scheduler 取得租约后为每个模块调用一次（不阻塞启动，异常只记日志），用于启动引导类数据补齐（当前 holiday 模块用它确保当年节假日数据可用）。
 
 模块 job 使用 `ctx.notify` 后进入公共事件发布路径，无需知道 Profile route、HMAC 或 Gateway 平台。私有通知必须由明确的 Profile 所有者路径发布。每个 job 都应使用正确 timezone、稳定 dedupe key，并让单轮 Provider 失败不破坏后续调度。
 
@@ -148,9 +153,11 @@ secret 只来自环境变量或权限受限的配置文件，不得打印到日�
 
 渲染统一走「阶段 B」结构化块中间表示（`RenderBlock[]` IR）：plain 与三个 markdown 平台都是同一份 `RenderBlock[]` 的确定性投影，不是各平台各写一套模板。markdown 快照形态为：title 为 `# <headline>`，body 由 markdown 块组成（`**标签**：值`、块间 `\n\n` 分段等）；官方原文（details 字段）走 raw 块原样输出，不解析不转义。`renderNotification` 中 qq/feishu/wechat 走同一套保守 markdown 投影，任何异常都回退 plain 兜底、不允许 throw；plain 或未知/非法 target 也走 plain 投影。
 
-每 Profile 渲染通过 `publishGlobal` 的第 6 参 `renderForProfile(profileId, {title, body})` 回调实现：该回调只替换每个 Profile 的落库快照，suppressRetainedGlobal / legacy dedupe / delivery 创建逻辑一律不变；既有 5 参调用不受影响。通知快照在生成时按该 Profile 的 renderTarget 渲染并落库，之后不重渲染；因此 renderTarget 只影响配置变更之后新生成的通知，已落库的旧快照不会自动重渲染。
+每 Profile 渲染通过 `publishGlobal(input, { renderForProfile })` 的回调实现：该回调只替换每个 Profile 的落库快照，dedupe / legacy key 迁移 / delivery 创建逻辑一律不变。通知快照在生成时按该 Profile 的 renderTarget 渲染并落库，之后不重渲染；因此 renderTarget 只影响配置变更之后新生成的通知，已落库的旧快照不会自动重渲染。
 
-唯一例外是 `schedule.reminder`（v6）：profile 通知发布时同步落库结构化 envelope（`profile_notifications.envelope` 列），投递/拉取时由 `core/delivery-render.ts` 按投递时刻重算"相对"行——避免勿扰顺延、snooze、重试补投时推送过期的相对时间；推送晚于提醒触发时刻时附加原因（勿扰时段顺延 / 稍后提醒 / 投递重试延迟）。亚分钟抖动有 60 秒容差（与 scheduler 的发布参考时间同口径），准时提醒即时投递仍显示"现在"。其余 kind 与无 envelope 的存量行保持"快照即投递"，原样输出。
+**载荷与渲染归属**：信封骨架（identity/source/scope/headline/provenance/details）、`RenderBlock[]` IR 与 plain/markdown 投影属于核心层；各业务 kind 的 payload 结构与 blocks 构造器归所属模块，在其 `notification.ts` 中经 `registerNotificationBlocks(kind, fn)` 自注册（迁移兼容键 `legacyDedupeKeys` 同样由模块在构造信封时附带）。新增一种通知不需要改动核心层。
+
+唯一例外是 `schedule.reminder`（v6）：profile 通知发布时同步落库结构化 envelope（`profile_notifications.envelope` 列），投递/拉取时由 schedule 模块注册的投递期重渲染钩子（经 `core/delivery-render.ts` 的通用钩子管道分发）按投递时刻重算"相对"行——避免勿扰顺延、snooze、重试补投时推送过期的相对时间；推送晚于提醒触发时刻时附加原因（勿扰时段顺延 / 稍后提醒 / 投递重试延迟）。亚分钟抖动有 60 秒容差（与 scheduler 的发布参考时间同口径），准时提醒即时投递仍显示"现在"。其余 kind 与无 envelope 的存量行保持"快照即投递"，原样输出。
 
 天气推断预警已信封化为 `weather.inferred_alert`（builder `inferredAlertNotification()`），经 `publishNotification`（publishGlobal 路径）按 Profile fan-out；identity 为 `inferred:<title>:<date>`，与 source 前缀组合成 dedupe key `weather:inferred:<title>:<date>`，与旧路径 dedupe 兼容（旧 legacy dedupe keys 保留）。plain 下 description 原样输出；markdown（qq/feishu/wechat 同集）下 label 块为 `**风险**` 加粗前缀。
 

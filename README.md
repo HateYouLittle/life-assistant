@@ -33,7 +33,7 @@ Hermes Profile -> stdio MCP -> 查询工具 / Profile 私有日程
 ```
 
 - MCP 进程只处理查询和工具调用，不运行 cron。
-- `src/scheduler.ts` 是唯一常驻调度器，执行模块 cron、日程扫描和 outbox 投递。
+- `src/scheduler.ts` 是唯一常驻调度器：执行模块 cron、每分钟调用注册了 `tick` 的模块（如 schedule 到期扫描）、排空 outbox 投递；核心不 import 任何模块内部文件。
 - 所有进程必须使用同一个绝对 `DATA_DIR`。同一 `DATA_DIR` 只能运行一个 scheduler。
 - 位置、天气和油价数据共享；日程及日程通知严格按 `HERMES_PROFILE` 隔离。
 - 公共天气、油价和生活简报事件只为 `PROFILE_PUSH_ROUTES_JSON` 中的 Profile 独立 materialize；未配置 route 的 Profile 不会通过 `notify.pull` 收到这些公共事件。
@@ -358,8 +358,10 @@ hermes -p "<profile>" webhook subscribe "<route-name>" \
 选择与需求匹配的层级：
 
 1. 静态或重复的个人提醒：使用现有 `schedule.*`，数据和通知属于当前 Profile。
-2. 需要实时天气、油价或其他外部数据的用户可配置任务：优先使用 `automation.*`（白名单 action + 条件 DSL，无需写代码）。白名单之外的实时数据需求：实现 `AssistantModule` job，在指定 timezone 下运行，并通过 `ctx.notify` 发布。公共 job 会按配置 Profile fan-out；私有事件必须显式使用 Profile 发布路径。
+2. 需要实时天气、油价或其他外部数据的用户可配置任务：优先使用 `automation.*`（白名单 action + 条件 DSL，无需写代码）。白名单之外的实时数据需求：实现 `AssistantModule` job，在指定 timezone 下运行，并通过 `ctx.notify` 发布。公共 job 会按配置 Profile fan-out；私有事件必须显式使用 Profile 发布路径。需要每分钟颗粒度的扫描（而非 cron）时，实现模块的 `tick(at)` 扩展点（参考 `src/modules/schedule/tick.ts`）。
 3. 新的白名单 action：在 `src/modules/automation/actions.ts` 注册（复用模块 Provider），即自动对全部 Profile 的 automation 开放。
+
+新增一种通知类型时，payload 结构与 `RenderBlock[]` 渲染器写在模块自己的 `notification.ts` 里并经 `registerNotificationBlocks(kind, fn)` 自注册——核心层只提供信封骨架与 plain/markdown 投影，无需改动。
 
 模块、job、Provider 和通知作用域的贡献要求见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
