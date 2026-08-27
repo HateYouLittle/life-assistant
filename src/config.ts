@@ -107,8 +107,8 @@ export const config = {
     weatherAlerts: "*/15 * * * *",
     dailyWeatherBrief: nonBlankOrDefault(process.env.DAILY_WEATHER_BRIEF_CRON, "0 7 * * *"),
     oilWatch: "0 9 * * *",
-    expressPoll: "0 * * * *",
     holidayRefresh: nonBlankOrDefault(process.env.HOLIDAY_REFRESH_CRON, "0 2 * * *"),
     automationScan: nonBlankOrDefault(process.env.AUTOMATION_SCAN_CRON, "*/10 * * * *"),
+    // expressPoll 随快递模块封存一并移除；如恢复快递追踪，在模块侧自带默认 cron。
   },
 };

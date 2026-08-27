@@ -17,8 +17,8 @@ export interface ToolDef {
 }
 
 export interface JobContext {
+  /** Profile 级发布通道（fan-out 到该 Profile 的全部 route/pull）。当前唯一消费者是封存的 express 模块。 */
   notify: (title: string, body: string, dedupeKey?: string) => Promise<void>;
-  notifyGlobal?: (source: string, title: string, body: string, dedupeKey?: string) => Promise<void>;
 }
 
 export interface JobDef {

@@ -1,5 +1,4 @@
 import { z } from "zod";
-import { config } from "../../config.js";
 import { store } from "../../core/store.js";
 import { registerModule, ok, fail, type AssistantModule } from "../../core/registry.js";
 import { queryExpress, detectCompany, type ExpressResult } from "./provider.js";
@@ -85,7 +84,8 @@ const expressModule: AssistantModule = {
   jobs: [
     {
       name: "poll",
-      cron: config.cron.expressPoll,
+      // 模块已封存（modules/index 未注册）：cron 固定在此，不再占用共享配置。
+      cron: "0 * * * *",
       handler: async ({ notify }) => {
         const list = getTracked();
         for (const t of list) {

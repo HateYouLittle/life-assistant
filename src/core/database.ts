@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { config } from "../config.js";
+import { isWellFormedId } from "./profile.js";
 
 export interface SqlRow {
   [key: string]: unknown;
@@ -234,7 +235,9 @@ function migrateLegacyJson(db: DatabaseSync): void {
   db.exec("BEGIN IMMEDIATE");
   try {
     const insertKv = db.prepare("INSERT OR IGNORE INTO kv(key, value) VALUES(?, ?)");
-    const globalKeys = new Set(["location:current", "notify:sent_keys", "notify:seq"]);
+    // notify:sent_keys / notify:seq 在 SQLite 版通知去重落地后已无任何读取者，
+    // 不再搬入 kv；旧文件保留原样，靠备份即可追溯。
+    const globalKeys = new Set(["location:current"]);
     for (const [key, value] of Object.entries(legacy)) {
       if (key.startsWith("qweather:geo:") || globalKeys.has(key)) {
         insertKv.run(key, JSON.stringify(value));
@@ -270,7 +273,7 @@ function migrateLegacyJson(db: DatabaseSync): void {
     for (const [key, value] of Object.entries(legacy)) {
       if (!key.startsWith("notify:read:") || !Array.isArray(value)) continue;
       const profileId = key.slice("notify:read:".length);
-      if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(profileId)) continue;
+      if (!isWellFormedId(profileId)) continue;
       for (const oldId of value) {
         if (typeof oldId !== "number") continue;
         const newId = legacyToNew.get(oldId);
