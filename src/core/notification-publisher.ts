@@ -16,12 +16,11 @@ export interface NotificationPublishers {
   renderer?: NotificationRenderer;
 }
 
-/** 解析单个 Profile 的渲染目标：注入回调 > 共享 renderTarget > 配置 renderTarget > plain。 */
+/** 解析单个 Profile 的渲染目标：注入回调 > 共享 renderTarget > 配置 renderTarget（resolveRenderTarget 恒回退 plain）。 */
 function resolveTargetForProfile(publishers: NotificationPublishers, profileId: string): NotificationRenderTarget {
   return publishers.renderTargetForProfile?.(profileId)
     ?? publishers.renderTarget
-    ?? resolveRenderTarget(config.profilePushRoutes[profileId])
-    ?? "plain";
+    ?? resolveRenderTarget(config.profilePushRoutes[profileId]);
 }
 
 /**

@@ -8,7 +8,6 @@ import {
   createSchedule,
   getSchedule,
   hydrateRow,
-  updateSchedule,
 } from "../schedule/service.js";
 import type { ScheduleItem } from "../schedule/types.js";
 import { createAutomation, getAutomation, type AutomationCreateInput } from "../automation/service.js";
@@ -292,17 +291,17 @@ export function importAssistantExport(
       continue;
     } catch { /* 不存在则继续导入 */ }
     try {
-      const { id, status, recurrence, ...rest } = entry;
+      const { id, recurrence, ...rest } = entry;
+      // status（含 completed/archived）随 createSchedule 一步落库：normalizeInput 接受
+      // 三种状态且派生逻辑一致，消除「先建 active 再补 update」的瞬态窗口——两步之间
+      // scheduler tick 可能对即将被标记 completed/archived 的日程发布窗口内补发提醒。
       // rest 含 v2 的 intervalMinutes/maxAttempts（v1 无此键 = 未开启），
       // 直接透传给 createSchedule 恢复强提醒配置。
-      const created = createSchedule(profile, {
+      createSchedule(profile, {
         ...rest,
         id,
         recurrence: recurrence as PortableSchedule["recurrence"],
       });
-      if (status && status !== created.status) {
-        updateSchedule(profile, id, { status });
-      }
       summary.schedules.imported += 1;
     } catch {
       summary.schedules.invalid += 1;

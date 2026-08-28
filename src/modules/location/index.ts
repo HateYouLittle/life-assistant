@@ -101,7 +101,12 @@ export async function resolveLocation(city?: string): Promise<{ city: string; la
   return { city: hit.name, lat: hit.latitude, lon: hit.longitude };
 }
 
-/** IP 自动探测（ip-api.com，免费、无 Key、45 次/分钟，仅供建议值） */
+/**
+ * IP 自动探测（ip-api.com，免费、无 Key、45 次/分钟，仅供建议值）。
+ * 传输层注记：ip-api 免费档仅提供 HTTP，HTTPS 为付费功能（实测 https 端点返回 403），
+ * 无法在本数据源上升级传输层；本结果只作为 need_confirm 的建议值展示给用户，
+ * 绝不自动落库。若要消除明文查询，应整体替换为支持 HTTPS 的探测源。
+ */
 async function detectByIp(): Promise<{ city: string; lat: number; lon: number } | null> {
   try {
     const r = await httpJson<{ status: string; city: string; lat: number; lon: number }>(

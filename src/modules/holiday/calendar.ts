@@ -275,20 +275,26 @@ export interface EnsureHolidayYearOptions {
   requireOfficialPapers?: boolean;
   cooldownMs?: number;
   at?: Date;
+  /**
+   * force=true：即使该年已 ready 也重新抓取入库（用于上游数据更正后的主动重拉）；
+   * payload_hash 未变化时入库层按哈希去重，不产生数据写放大；同时跳过失败冷却。
+   * 缺省（自动刷新/查询补齐路径）保持「已 ready 即短路」语义。
+   */
+  force?: boolean;
 }
 
-/** 确保某年数据可用：已 ready 直接返回；未 ready 且超过冷却时间则抓取入库。 */
+/** 确保某年数据可用：已 ready 直接返回（force 除外）；未 ready 且超过冷却时间则抓取入库。 */
 export async function ensureHolidayYear(
   year: number,
   options: EnsureHolidayYearOptions = {},
 ): Promise<HolidayYearRecord> {
   const ready = readHolidayYear(year);
-  if (ready) return ready;
+  if (ready && !options.force) return ready;
 
   const at = options.at ?? new Date();
   const cooldownMs = options.cooldownMs ?? DEFAULT_ATTEMPT_COOLDOWN_MS;
   const status = yearStatus(year);
-  if (status?.lastAttemptAt) {
+  if (!options.force && status?.lastAttemptAt) {
     const elapsed = at.getTime() - Date.parse(status.lastAttemptAt);
     if (Number.isFinite(elapsed) && elapsed < cooldownMs) {
       throw new Error(

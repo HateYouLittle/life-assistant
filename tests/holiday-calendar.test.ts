@@ -212,6 +212,39 @@ test("ensureHolidayYear skips fetching when the year is already ready", async ()
   assert.deepEqual(calls, [2030]);
 });
 
+test("ensureHolidayYear force refetches a ready year and stays idempotent on unchanged payloads", async () => {
+  const calls: number[] = [];
+  const fetch = async (year: number): Promise<HolidayYearDataset> => {
+    calls.push(year);
+    return syntheticDataset(year);
+  };
+  await ensureHolidayYear(2050, { fetch });
+  assert.deepEqual(calls, [2050]);
+  // 缺省路径：ready 即短路，不抓取（既有语义不回归）。
+  await ensureHolidayYear(2050, { fetch });
+  assert.deepEqual(calls, [2050]);
+
+  // force：已 ready 也重新抓取；payload 未变 → 入库层按哈希去重，数据行数不变。
+  const unchanged = await ensureHolidayYear(2050, { fetch, force: true });
+  assert.deepEqual(calls, [2050, 2050]);
+  assert.equal(unchanged.year, 2050);
+  assert.equal(readHolidayYear(2050)?.days.length, unchanged.days.length);
+
+  // force + payload 变化：数据被替换为新内容（国庆段 10-01..10-08 连续，仍通过结构校验）。
+  const changed = await ensureHolidayYear(2050, {
+    force: true,
+    fetch: async (year) => parseDataset("holiday-cn", {
+      ...syntheticRaw(year),
+      days: [
+        ...(syntheticRaw(year).days as Array<Record<string, unknown>>),
+        { name: "国庆节", date: `${year}-10-08`, isOffDay: true },
+      ],
+    }),
+  });
+  assert.notEqual(changed.payloadHash, unchanged.payloadHash);
+  assert.equal(readHolidayYear(2050)?.days.length, changed.days.length);
+});
+
 test("ensureHolidayYear records failures and respects the attempt cooldown", async () => {
   const calls: number[] = [];
   const fetch = async (year: number): Promise<HolidayYearDataset> => {

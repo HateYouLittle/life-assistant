@@ -118,7 +118,3 @@ export const automationActions: Record<string, AutomationActionDef> = {
     },
   },
 };
-
-export function listAutomationActionNames(): string[] {
-  return Object.keys(automationActions);
-}

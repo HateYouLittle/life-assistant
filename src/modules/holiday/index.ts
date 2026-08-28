@@ -188,7 +188,7 @@ const holidayModule: AssistantModule = {
     withTool(
       {
         name: "refresh",
-        description: "手动触发补抓指定年份（默认当年）的中国大陆法定节假日安排并重算受影响的 workday/holiday 日程；force=true 会跳过失败冷却立即重试。数据仍来自官方数据源。",
+        description: "手动触发补抓指定年份（默认当年）的中国大陆法定节假日安排并重算受影响的 workday/holiday 日程。数据缺失时自动补齐；数据已就绪时仅确认不重抓，force=true 会重新抓取（内容未变化则按哈希幂等入库）并跳过失败冷却立即重试。数据仍来自官方数据源。",
       },
       {
         year: z.number().int().min(2004).max(2100).optional(),
@@ -199,7 +199,9 @@ const holidayModule: AssistantModule = {
         const record = await ensureHolidayYear(targetYear, {
           allowFallback: targetYear <= localYear(),
           requireOfficialPapers: targetYear > localYear(),
-          cooldownMs: force ? 0 : undefined,
+          // force：已 ready 的年份也重新抓取（payload_hash 未变时入库层幂等），
+          // 并跳过失败冷却立即重试（LOW-1）。
+          force: force === true,
         });
         const summary = reconcileHolidaySchedules();
         return ok({

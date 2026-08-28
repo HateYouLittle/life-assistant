@@ -1320,7 +1320,3 @@ export function hydrateRow(
 export function nextEventAfter(item: ScheduleItem, event: ValidDateTime): ValidDateTime | null {
   return findOccurrence(item, event.plus({ milliseconds: 1 }), true);
 }
-
-export function reminderMinutes(item: ScheduleItem): number[] {
-  return item.reminders.map((reminder) => reminder.minutesBefore).sort((a, b) => b - a);
-}

@@ -6,9 +6,9 @@ import cron, { type ScheduledTask } from "node-cron";
 import { getModules } from "./modules/index.js";
 import { getDatabase } from "./core/database.js";
 import { deliverPendingProfileNotifications, notify, type DeliverySummary } from "./core/notifier.js";
-import { notifyModule } from "./core/notify-module.js";
-
-export { notifyModule };
+// notify 模块当前仅工具面（无 job/tick/onStart）；引入以保持 scheduler 与 MCP 进程
+// 同一份模块清单，未来 notify 增加常驻职责时无需改动本文件。
+import "./core/notify-module.js";
 
 const LEASE_NAME = "scheduler";
 const LEASE_TTL_MS = 2 * 60 * 1000;

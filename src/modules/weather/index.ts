@@ -153,7 +153,7 @@ export async function runWeatherAlertsCheck(options: WeatherAlertsCheckOptions =
         });
         await publishNotification(notification, publishers);
       } catch (error) {
-        // 推断分支连发布失败也一并隔离（不阻断其余告警）；official 分支仅隔离构建错误。
+        // 两个分支的构建与发布失败均逐条隔离（不阻断其余告警）；下一轮按 dedupe key 幂等重试。
         console.error(`[weather] inferred alert omitted: ${(error as Error).message}`);
       }
       continue;
@@ -168,7 +168,13 @@ export async function runWeatherAlertsCheck(options: WeatherAlertsCheckOptions =
       console.error(`[weather] official alert omitted: ${(error as Error).message}`);
       continue;
     }
-    await publishNotification(notification, publishers);
+    try {
+      await publishNotification(notification, publishers);
+    } catch (error) {
+      // 发布与构建同口径逐条隔离：单条预警发布异常（如 DB 忙）不阻断本轮其余预警；
+      // 下一轮检查按 dedupe key 幂等重试，不会重复已发布条目。
+      console.error(`[weather] official alert publish failed: ${(error as Error).message}`);
+    }
   }
 }
 

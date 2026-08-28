@@ -513,6 +513,48 @@ test("an official alert ID publishes one weather event through every Profile rou
   assert.doesNotMatch(String(rows[0].body), /区域：|undefined/);
 });
 
+test("official alert publish failure is isolated so the remaining alerts still publish", async () => {
+  const base = {
+    publisher: "江西省气象台",
+    issuedAt: "2026-08-04T06:11Z",
+    attributions: ["国家预警信息发布中心"],
+  };
+  const alertA: WeatherAlert = {
+    kind: "official",
+    id: "isolation-provider-id-1",
+    eventType: "雷电",
+    level: "橙色",
+    headline: "隔离测试第一条官方标题",
+    description: "第一条官方完整原文。",
+    ...base,
+  };
+  const alertB: WeatherAlert = {
+    kind: "official",
+    id: "isolation-provider-id-2",
+    eventType: "大风",
+    level: "蓝色",
+    headline: "隔离测试第二条官方标题",
+    description: "第二条官方完整原文。",
+    ...base,
+  };
+  const published: string[] = [];
+  let calls = 0;
+  await runWeatherAlertsCheck({
+    at: new Date("2026-08-04T11:30:00Z"),
+    timezone: "Asia/Shanghai",
+    getLocation: () => ({ city: "萍乡", lat: 27.62, lon: 113.85 }),
+    getAlerts: async () => [alertA, alertB],
+    publish: async ({ dedupeKey }: { dedupeKey?: string }) => {
+      calls += 1;
+      if (calls === 1) throw new Error("simulated transient publish failure");
+      if (dedupeKey) published.push(dedupeKey);
+    },
+  });
+  // 第一条发布抛错被逐条隔离，第二条照常发布；本条用例注入 publish，不产生 DB 行。
+  assert.equal(calls, 2);
+  assert.deepEqual(published, ["weather:alert:id:isolation-provider-id-2"]);
+});
+
 test("an official alert upgrades an exact legacy Profile key without resending", async () => {
   const alert: WeatherAlert = {
     kind: "official",
