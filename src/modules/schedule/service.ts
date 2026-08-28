@@ -222,6 +222,13 @@ function normalizeRecurrence(input: ScheduleInput, calendar: CalendarType, type:
       throw new Error("count must be a positive integer");
     }
   }
+  // interval 与 MCP 层 schema（z.number().int().min(1)）同口径：直调 service 的路径
+  // （如 assistant.import 透传）不得把 NaN/非整数写进 recurrence_json（Math.max(1, NaN)
+  // 会静默落 NaN，读取侧虽自愈为 1，但写/读口径不一致）。
+  if (raw.interval !== undefined
+    && (!Number.isInteger(raw.interval) || (raw.interval as number) < 1)) {
+    throw new Error("interval must be a positive integer");
+  }
   const policy = input.leapMonthPolicy ?? (input.isLeapMonth ? "leap" : "normal");
   // N3/D1-A：both/prefer-leap 未实现，输入路径明确拒绝（MCP schema 已只开放 normal/leap，
   // 此处兜底直接调用 service 的路径）
@@ -968,7 +975,10 @@ export function listSchedules(value: ProfileContext | string, options: ScheduleL
   if (options.status) { clauses.push("status = ?"); values.push(options.status); }
   if (options.from) { clauses.push("COALESCE(next_run_at, '9999-12-31T23:59:59.999Z') >= ?"); values.push(options.from); }
   if (options.to) { clauses.push("COALESCE(next_run_at, '0000-01-01T00:00:00.000Z') <= ?"); values.push(options.to); }
-  const limit = Math.min(Math.max(options.upcoming ?? 100, 1), 500);
+  // Number.isInteger 防护：NaN 会穿透 Math.min/Math.max 链拼进 SQL 变语法错误
+  //（与 listEntries 的 limit/offset 兜底同口径）；直调路径传入非数字时回退默认值。
+  const rawUpcoming = Number(options.upcoming ?? 100);
+  const limit = Math.min(Math.max(Number.isInteger(rawUpcoming) && rawUpcoming >= 1 ? rawUpcoming : 100, 1), 500);
   const rows = getDatabase().prepare(`SELECT * FROM schedules WHERE ${clauses.join(" AND ")} ORDER BY COALESCE(next_run_at, '9999-12-31T23:59:59.999Z'), created_at LIMIT ${limit}`).all(...values) as Record<string, unknown>[];
   return rows.map((row) => rowToItem(row));
 }

@@ -22,7 +22,7 @@ async function main(): Promise<void> {
         try {
           return await tool.handler(args as Record<string, unknown>, profile);
         } catch (error) {
-          return fail((error as Error).message);
+          return fail(error instanceof Error ? error.message : String(error));
         }
       });
       toolCount += 1;

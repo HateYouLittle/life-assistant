@@ -60,7 +60,7 @@ const oilpriceModule: AssistantModule = {
       {},
       () => {
         const summary = nextAdjustmentSummary();
-        if (!summary) return fail("年度窗口表未覆盖当前日期，请更新 src/modules/oilprice/schedule.ts");
+        if (!summary) return fail("调价窗口已超出可推演范围（静态表与候选生成均耗尽），请更新 src/modules/oilprice/schedule.ts 的年度窗口表");
         return ok(summary);
       },
     ),

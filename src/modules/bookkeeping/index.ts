@@ -213,7 +213,7 @@ const bookkeepingModule: AssistantModule = {
       {
         name: "summary",
         description:
-          "账本月度汇总：收入/支出/结余、分类聚合与账户实时余额清单（金额已换算为元）。ledgerId 缺省本人个人账本；month 格式 yyyy-LL（按 Asia/Shanghai 所配时区的自然月切分），缺省当月。",
+          "账本月度汇总：收入/支出/结余、分类聚合与账户实时余额清单（金额已换算为元）。ledgerId 缺省本人个人账本；month 格式 yyyy-LL（按 LIFE_ASSISTANT_TIMEZONE 配置时区切自然月），缺省当月。",
       },
       {
         ledgerId: z.string().optional().describe("账本 ID，缺省个人账本"),

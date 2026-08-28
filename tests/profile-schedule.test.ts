@@ -1326,6 +1326,47 @@ test("scheduler tick actively delivers a newly due Profile reminder", async () =
   assert.equal(delivery.status, "sent");
 });
 
+test("M7: runSchedulerTick skips delivery when the mid-tick lease check fails, delivers when it passes", async () => {
+  const schedule = createSchedule(requireProfileContext("profile-a"), {
+    title: "leaseCheck gated reminder",
+    calendar: "solar",
+    date: "2020-01-02",
+    time: "00:00",
+    timezone: "Asia/Shanghai",
+    reminders: [{ minutesBefore: 0 }],
+  });
+  const requests: string[] = [];
+  db.prepare("UPDATE schedules SET enabled = 0 WHERE NOT (profile_id = ? AND id = ?)")
+    .run("profile-a", schedule.id);
+  const fetchImpl = (async (url: string | URL | Request) => {
+    requests.push(String(url));
+    return new Response("ok", { status: 200 });
+  }) as typeof fetch;
+  const deliveryOf = () => db.prepare(`
+    SELECT d.status FROM profile_notification_deliveries d
+    JOIN profile_notifications n ON n.id = d.notification_id AND n.profile_id = d.profile_id
+    WHERE n.dedupe_key LIKE ?
+  `).get(`schedule:profile-a:${schedule.id}:%`) as Record<string, unknown> | undefined;
+
+  try {
+    // 租约复核失败：模块 tick 照常扫描发布（提醒行已物化），但投递整体跳过、行保持
+    // pending——防止租约已被第二实例接管后的并行投递（M7 后半）。
+    const skipped = await runSchedulerTick(new Date("2100-03-02T00:00:00.000Z"), fetchImpl, { leaseCheck: () => false });
+    assert.deepEqual(skipped, { attempted: 0, sent: 0, failed: 0 });
+    assert.deepEqual(requests, []);
+    const pending = deliveryOf();
+    assert.ok(pending, "提醒已发布，delivery 行应存在");
+    assert.equal(pending.status, "pending");
+
+    // 租约复核通过：同一投递正常发送。
+    const delivered = await runSchedulerTick(new Date("2100-03-02T00:01:00.000Z"), fetchImpl, { leaseCheck: () => true });
+    assert.deepEqual(delivered, { attempted: 1, sent: 1, failed: 0 });
+    assert.equal(deliveryOf()?.status, "sent");
+  } finally {
+    db.prepare("UPDATE schedules SET enabled = 0 WHERE profile_id = ? AND id = ?").run("profile-a", schedule.id);
+  }
+});
+
 test("a due reminder stores the new semantic snapshot with Profile-scoped target identity", async () => {
   // 动态"明天"：避免固定日期过期后 createSchedule 跳到下一年（日期炸弹）
   const tomorrowShanghai = DateTime.now().setZone("Asia/Shanghai").plus({ days: 1 }).startOf("day");

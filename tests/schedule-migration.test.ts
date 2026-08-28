@@ -230,3 +230,37 @@ test("L38: service-direct recurrence validation matches the MCP layer ranges (by
   });
   getSchedule(profile, ok.id);
 });
+
+test("L38: service-direct recurrence validates interval like the MCP layer", () => {
+  const profile = requireProfileContext("migration-profile");
+  // interval 与 MCP 层 z.number().int().min(1) 同口径：此前 Math.max(1, NaN) 会把
+  // 非整数 interval 静默落库（读取侧自愈为 1），写/读口径不一致。
+  assert.throws(
+    () => createSchedule(profile, {
+      title: "bad interval type",
+      calendar: "solar",
+      date: "2099-03-01",
+      time: "09:00",
+      recurrence: { frequency: "daily", interval: "2" as unknown as number },
+    }),
+    /interval must be a positive integer/,
+  );
+  assert.throws(
+    () => createSchedule(profile, {
+      title: "bad interval zero",
+      calendar: "solar",
+      date: "2099-03-01",
+      time: "09:00",
+      recurrence: { frequency: "weekly", interval: 0 },
+    }),
+    /interval must be a positive integer/,
+  );
+  const ok = createSchedule(profile, {
+    title: "ok interval",
+    calendar: "solar",
+    date: "2099-03-01",
+    time: "09:00",
+    recurrence: { frequency: "daily", interval: 2 },
+  });
+  assert.equal(ok.recurrence.interval, 2);
+});

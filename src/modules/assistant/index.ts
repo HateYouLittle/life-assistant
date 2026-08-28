@@ -60,6 +60,21 @@ function parseSnapshotJson<T>(value: unknown, fallback: T): T {
   }
 }
 
+/**
+ * 可空 JSON 列解析：区分「列为 NULL（合法，无值）」与「列存在但 JSON 损坏」。
+ * 后者由调用方按行级损坏处理（跳过并计数），不得静默降级成缺省值——
+ * 例如 condition 损坏若导出成 undefined，导入后会变成「到点必提醒」，语义漂移。
+ */
+function parseNullableJsonColumn(value: unknown): { value: unknown; corrupt: boolean } {
+  if (value == null) return { value: undefined, corrupt: false };
+  if (typeof value !== "string") return { value: undefined, corrupt: true };
+  try {
+    return { value: JSON.parse(value) as unknown, corrupt: false };
+  } catch {
+    return { value: undefined, corrupt: true };
+  }
+}
+
 function toPortableSchedule(item: ScheduleItem): PortableSchedule {
   return {
     id: item.id,
@@ -115,20 +130,21 @@ export function buildAssistantExport(profile: ProfileContext): AssistantExport {
   const automationsTruncated = automations.length > EXPORT_ROW_LIMIT;
   const quiet = getQuietHours(profile.id);
   const loc = currentLocation();
-  // L10：params/condition/schedule 列损坏只是该行跳过（并计入 invalidAutomations），
-  // 不得让 JSON.parse 抛出拖垮整个导出（对照 schedule/service.ts parseJson 容错）。
+  // L10：单行 JSON 列损坏不得让 JSON.parse 抛出拖垮整个导出（对照 schedule/service.ts
+  // parseJson 容错）。params 损坏降级为 {}（导入侧 paramsSchema 校验兜底）；
+  // condition/schedule 损坏按行跳过并计入 invalidAutomations（语义不可静默降级）。
   const exportedAutomations: AssistantExport["data"]["automations"] = [];
   let invalidAutomationRows = 0;
   for (const row of automations.slice(0, EXPORT_ROW_LIMIT)) {
     const params = parseSnapshotJson(String(row.params_json ?? "{}"), {}) as Record<string, unknown>;
-    const condition = row.condition_json == null
-      ? undefined
-      : parseSnapshotJson(String(row.condition_json), undefined) as AutomationCreateInput["condition"];
+    const conditionColumn = parseNullableJsonColumn(row.condition_json);
     const schedule = parseSnapshotJson(
       String(row.schedule_json),
       undefined as AutomationCreateInput["schedule"] | undefined,
     );
-    if (schedule === undefined) {
+    // schedule 列损坏无法还原调度、condition 列损坏会让导入后的任务从「条件触发」
+    // 漂移成「到点必提醒」：两者都与 params 损坏同口径跳过该行并计入 invalidAutomations。
+    if (schedule === undefined || conditionColumn.corrupt) {
       invalidAutomationRows += 1;
       continue;
     }
@@ -137,7 +153,7 @@ export function buildAssistantExport(profile: ProfileContext): AssistantExport {
       name: String(row.name),
       action: String(row.action),
       params,
-      condition,
+      condition: conditionColumn.value as AutomationCreateInput["condition"],
       schedule,
       enabled: Number(row.enabled) === 1,
     });

@@ -386,6 +386,45 @@ test("L36: condition fields are validated against the action result whitelist at
   deleteAutomation(profile, okArrayIndex.id);
 });
 
+test("M-A: changing the action revalidates the retained condition against the new whitelist", () => {
+  const item = createAutomation(profile, {
+    name: "换 action 复检",
+    action: "oilprice.current",
+    condition: { field: "p92", op: ">=", value: 8 },
+    schedule: { type: "interval", minutes: 30 },
+  });
+  // 换 action 且未显式处理条件：旧字段不在新 action 结果白名单内必须明确报错，
+  // 否则 getPath 恒取不到值，任务到点静默不提醒（无任何错误线索）。
+  assert.throws(
+    () => updateAutomation(profile, item.id, { action: "weather.current" }),
+    /不在 action weather\.current 的结果字段白名单内/,
+  );
+  assert.throws(
+    () => updateAutomation(profile, item.id, { action: "weather.current" }),
+    /传 null 清除/,
+  );
+  // 同 action 的无关更新不触发复检，条件原样保留。
+  const renamed = updateAutomation(profile, item.id, { name: "只改名字" });
+  assert.equal(renamed.action, "oilprice.current");
+  assert.deepEqual(renamed.condition, { field: "p92", op: ">=", value: 8 });
+  // 显式传 null 清除后可正常换 action。
+  const cleared = updateAutomation(profile, item.id, { action: "weather.current", condition: null });
+  assert.equal(cleared.action, "weather.current");
+  assert.equal(cleared.condition, undefined);
+  // 沿用条件在新 action 白名单内时复检通过。
+  const compatible = createAutomation(profile, {
+    name: "兼容字段",
+    action: "weather.current",
+    condition: { field: "city", op: "==", value: "北京" },
+    schedule: { type: "interval", minutes: 30 },
+  });
+  const switched = updateAutomation(profile, compatible.id, { action: "airquality.current" });
+  assert.equal(switched.action, "airquality.current");
+  assert.deepEqual(switched.condition, { field: "city", op: "==", value: "北京" });
+  deleteAutomation(profile, item.id);
+  deleteAutomation(profile, compatible.id);
+});
+
 test("L36: string condition values reject ordering ops; numeric coercion keeps deterministic semantics", async () => {
   // 字符串值 + 大小比较（字典序 "9" > "10" 为 true，语义不可控）创建即拒绝。
   assert.throws(

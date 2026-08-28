@@ -42,7 +42,11 @@ export function releaseSchedulerLease(owner: string): void {
   getDatabase().prepare("DELETE FROM scheduler_lease WHERE name = ? AND owner = ?").run(LEASE_NAME, owner);
 }
 
-export async function runSchedulerTick(at = new Date(), fetchImpl: typeof fetch = fetch): Promise<DeliverySummary> {
+export async function runSchedulerTick(
+  at: Date = new Date(),
+  fetchImpl: typeof fetch = fetch,
+  options: { leaseCheck?: () => boolean } = {},
+): Promise<DeliverySummary> {
   const errors: unknown[] = [];
   for (const module of getModules()) {
     if (!module.tick) continue;
@@ -52,15 +56,18 @@ export async function runSchedulerTick(at = new Date(), fetchImpl: typeof fetch 
       errors.push(error);
     }
   }
-  // 投递在所有模块扫描之后统一执行；扫描失败不阻断在途投递排空，
-  // 汇总错误在投递后抛出（与既有"先扫后投、错后抛"语义一致）。
-  let summary: DeliverySummary;
-  try {
-    summary = await deliverPendingProfileNotifications({ at, fetchImpl });
-  } catch (error) {
-    // L4：投递异常加入 errors 一并聚合上报，不得让投递抛错吞掉已收集的模块 tick 错误。
-    errors.push(error);
-    summary = { attempted: 0, sent: 0, failed: 0 };
+  // M7（后半）：长 tick（模块扫描 + 模块内网络调用）期间不复核租约的话，第二实例
+  // 可能在 TTL 过期后接管并并行投递。投递前复核一次租约（scheduler 传入的检查会
+  // 顺带续租）；租约已丢失或续租失败时跳过本轮投递，行保持 pending 由持锁实例接管，
+  // 已收集的模块错误仍按原语义在返回前抛出。
+  let summary: DeliverySummary = { attempted: 0, sent: 0, failed: 0 };
+  if (!options.leaseCheck || options.leaseCheck()) {
+    try {
+      summary = await deliverPendingProfileNotifications({ at, fetchImpl });
+    } catch (error) {
+      // L4：投递异常加入 errors 一并聚合上报，不得让投递抛错吞掉已收集的模块 tick 错误。
+      errors.push(error);
+    }
   }
   if (errors.length === 1) throw errors[0];
   if (errors.length > 1) throw new AggregateError(errors, `${errors.length} module ticks failed`);
@@ -159,13 +166,14 @@ export function startScheduler(): SchedulerHandle {
     if (tickRunning) return;
     tickRunning = true;
     try {
-      await runFenced(async () => {
-        try {
-          await runSchedulerTick();
-        } catch (error) {
-          console.error("[scheduler.tick] failed:", error);
-        }
-      });
+    await runFenced(async () => {
+      try {
+        // 投递前租约复核（顺带续租）：长 tick 期间防止第二实例接管后并行投递（M7）。
+        await runSchedulerTick(new Date(), fetch, { leaseCheck: () => fence() });
+      } catch (error) {
+        console.error("[scheduler.tick] failed:", error);
+      }
+    });
     } finally {
       tickRunning = false;
     }

@@ -378,3 +378,24 @@ test("L10: export skips a corrupted automation row and flags invalidAutomations 
   }
   assert.equal(buildAssistantExport(profile).data.invalidAutomations, undefined, "无损坏行时不应带 invalidAutomations 标记");
 });
+
+test("L1-fix: export skips a corrupted condition column row instead of exporting it unconditionally", () => {
+  // condition_json 截断、schedule_json 合法：修复前该行被导出成「无条件」，
+  // 导入后会从「条件触发」漂移成「到点必提醒」，语义静默改变。
+  db.prepare(`
+    INSERT INTO automations(profile_id, id, name, action, params_json, condition_json, schedule_json, enabled, created_at, updated_at)
+    VALUES(?, 'corrupt-condition-row', '条件损坏行', 'weather.current', '{}', '{"field":"humidity","op":', '{"type":"interval","minutes":30}', 1,
+      '2027-02-01T00:00:00.000Z', '2027-02-01T00:00:00.000Z')
+  `).run(profile.id);
+  try {
+    const snapshot = buildAssistantExport(profile);
+    assert.ok(!snapshot.data.automations.some((entry) => entry.id === "corrupt-condition-row"),
+      "condition 列损坏的行应被跳过而不是导出成无条件");
+    assert.equal(snapshot.data.invalidAutomations, 1, "condition 损坏行应计入 invalidAutomations");
+    // condition_json 为 NULL 的合法行不受影响，condition 正常缺省。
+    assert.ok(snapshot.data.automations.every((entry) => entry.condition !== null));
+  } finally {
+    db.prepare("DELETE FROM automations WHERE profile_id = ? AND id = ?").run(profile.id, "corrupt-condition-row");
+  }
+  assert.equal(buildAssistantExport(profile).data.invalidAutomations, undefined);
+});

@@ -80,6 +80,23 @@ export function validateCondition(
   return parsed;
 }
 
+/**
+ * 换 action 时对「沿用旧条件」的复检：旧条件是对旧 action 校验的，其 field 可能不在
+ * 新 action 的结果白名单内——届时 getPath 恒取不到值，条件永不满足，任务到点静默
+ * 不提醒。这里明确报错而不是静默失效（与强提醒缺失 occurrence 正式提醒同口径），
+ * 提示用户同步更新 condition 或传 null 清除。
+ */
+function revalidateRetainedCondition(
+  action: string,
+  condition: AutomationCondition | undefined,
+): AutomationCondition | undefined {
+  try {
+    return validateCondition(action, condition);
+  } catch (error) {
+    throw new Error(`${error instanceof Error ? error.message : String(error)}；更换 action 时请同步更新 condition，或传 null 清除`);
+  }
+}
+
 function rowToItem(row: Record<string, unknown>): AutomationItem {
   return {
     id: String(row.id),
@@ -178,7 +195,9 @@ export function updateAutomation(value: ProfileContext | string, id: string, cha
     ? { action: current.action, params: current.params }
     : validateAction(changes.action ?? current.action, changes.params ?? current.params);
   const condition = changes.condition === undefined
-    ? current.condition
+    ? (nextAction.action === current.action
+        ? current.condition
+        : revalidateRetainedCondition(nextAction.action, current.condition))
     : changes.condition === null
       ? undefined
       : validateCondition(nextAction.action, changes.condition);
