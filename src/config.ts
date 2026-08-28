@@ -109,6 +109,8 @@ export const config = {
     oilWatch: "0 9 * * *",
     holidayRefresh: nonBlankOrDefault(process.env.HOLIDAY_REFRESH_CRON, "0 2 * * *"),
     automationScan: nonBlankOrDefault(process.env.AUTOMATION_SCAN_CRON, "*/10 * * * *"),
+    // 每月 1 号推送上月记账月度账单（bookkeeping.monthly_report）。
+    bookkeepingReport: nonBlankOrDefault(process.env.BOOKKEEPING_REPORT_CRON, "0 9 1 * *"),
     // expressPoll 随快递模块封存一并移除；如恢复快递追踪，在模块侧自带默认 cron。
   },
 };

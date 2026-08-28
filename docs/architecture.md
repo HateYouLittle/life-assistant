@@ -44,6 +44,8 @@ src/scheduler.ts -> module cron + module tick + outbox delivery
 | 天气预警、油价预通知、每日生活简报 | 公共事件 | 为每个已配置 route 的 Profile 独立 materialize、去重和投递 |
 | 日程、occurrence、日程通知 | Profile 私有 | 所有读写均带 `profile_id`，不会跨 Profile 查询或投递 |
 | 自动任务 automation | Profile 私有 | `automations` 表按 `(profile_id, id)` 主键隔离；扫描覆盖全部 Profile，执行与通知严格按所属 Profile |
+| 记账个人账本 | Profile 私有 | 每个 Profile 一本（懒创建），账户/流水仅 owner 可见可写 |
+| 记账共享账本（成员/共享账户/流水/成员通知） | 跨 Profile 共享（首个可写资源） | `ledgers`/`ledger_members`/`ledger_accounts`/`ledger_entries`；读与记账限成员，成员管理与共享账户限 owner，改删流水限记录人或 owner；成员动态经 `publishProfile` 逐成员物化 |
 | 静默时段（profile_settings） | Profile 私有 | 每 Profile 独立窗口；只影响主动投递，不影响 `notify.pull` |
 | notification read、outbox delivery | Profile 私有 | 每个 Profile 独立确认、取消和 fallback |
 
@@ -189,4 +191,4 @@ secret 只来自环境变量或权限受限的配置文件，不得打印到日�
 
 ## 9. 演进原则
 
-迁移保持 additive，并保留旧数据读取兼容（当前 schema version 7：新增 `profile_settings`、`automations` 表、deliveries 的 `not_before` 列、`profile_notifications.envelope` 列与 `schedules` 的 `reminder_interval_minutes`/`reminder_max_attempts` 列；两列为强提醒重发配置，`NULL` = 未开启，可经 `schedule.update` 的 `clearStrongReminder: true` 清空）。新增模块不得直绑消息平台；新增私有数据必须带 Profile 所有权；新增公共 job 必须接受按配置 Profile 独立 materialize 的语义。automation 的 action 白名单是唯一扩展动态任务能力的入口，新增 action 必须复用模块 Provider 并保持无 LLM、确定性执行。
+迁移保持 additive，并保留旧数据读取兼容（当前 schema version 8：v8 新增 `ledgers`、`ledger_members`、`ledger_accounts`、`ledger_entries` 四表与索引（记账模块）；此前 v7 新增 `profile_settings`、`automations` 表、deliveries 的 `not_before` 列、`profile_notifications.envelope` 列与 `schedules` 的 `reminder_interval_minutes`/`reminder_max_attempts` 列，后两列为强提醒重发配置，`NULL` = 未开启，可经 `schedule.update` 的 `clearStrongReminder: true` 清空）。新增模块不得直绑消息平台；新增私有数据必须带 Profile 所有权；新增公共 job 必须接受按配置 Profile 独立 materialize 的语义。automation 的 action 白名单是唯一扩展动态任务能力的入口，新增 action 必须复用模块 Provider 并保持无 LLM、确定性执行。记账共享账本是首个跨 Profile 可写资源：授权统一在 service 层按 `ledger_members` 判定（读/记账限成员，成员管理与共享账户限 owner，改删流水限记录人或 owner），账户余额不落库、由流水实时派生。

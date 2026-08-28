@@ -10,6 +10,7 @@ import "./oilprice/index.js";
 import "./schedule/index.js";
 import "./holiday/index.js";   // 中国大陆法定节假日/工作日：共享历法数据 + 自动抓取
 import "./automation/index.js"; // 动态自动任务：白名单 action + 条件 DSL，scheduler 无 LLM 执行
+import "./bookkeeping/index.js"; // 记账：个人/共享账本、账户/流水/转账、月度账单；共享账本是首个跨 Profile 可写资源
 import "./assistant/index.js";  // 备份迁移：Profile 数据快照导出/导入
 // import "./express/index.js";  // 2026-08-01 封存：用户弃用快递追踪（电商自推送），省 TianAPI 额度；恢复时取消注释
 

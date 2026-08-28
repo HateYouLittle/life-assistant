@@ -1,6 +1,6 @@
 # Life Assistant - Hermes 个人生活助理
 
-Life Assistant 是面向 Hermes Agent 的 Skill + MCP 服务，提供天气、空气质量、生活指数、油价、Profile 私有日程和自动任务，并通过可靠 outbox 将主动通知交给 Hermes Gateway 投递。
+Life Assistant 是面向 Hermes Agent 的 Skill + MCP 服务，提供天气、空气质量、生活指数、油价、Profile 私有日程、自动任务、个人/共享记账，并通过可靠 outbox 将主动通知交给 Hermes Gateway 投递。
 
 | 能力 | 当前行为 |
 |---|---|
@@ -10,10 +10,11 @@ Life Assistant 是面向 Hermes Agent 的 Skill + MCP 服务，提供天气、�
 | 日程 | 待办、生日、纪念日；支持公历、中国农历、重复提醒和法定节假日/工作日频率 |
 | 节假日 | 中国大陆法定节假日与调休上班日历法；scheduler 每年自动获取下一年安排；放假倒计时查询 |
 | 自动任务 | Profile 私有 automation：白名单 action（天气/预报/空气/油价）+ 条件 DSL，scheduler 无 LLM 执行 |
+| 记账 | 个人账本（账户/收支/转账/汇总）与共享账本（成员共享公共账户、记账互相通知、每月 1 号月度账单） |
 | 通知 | Profile SQLite outbox、Hermes HMAC V2 `deliver-only` Webhook、`notify.pull` 失败兜底；静默时段、snooze、取消与通知列表 |
 | 备份 | `assistant.export` / `assistant.import`：日程、自动任务、静默时段与位置的 JSON 快照，按 ID 幂等导入 |
 
-当前共注册 32 个 MCP 工具。快递追踪已经封存，未注册到运行时。
+当前共注册 46 个 MCP 工具。快递追踪已经封存，未注册到运行时。
 
 ## 架构概览
 
@@ -254,6 +255,7 @@ systemctl status --no-pager life-assistant-scheduler.service
 | `DAILY_WEATHER_BRIEF_CRON` | 每日生活简报 cron，默认 `0 7 * * *` |
 | `HOLIDAY_REFRESH_CRON` | 节假日安排每日刷新 cron（Asia/Shanghai），默认 `0 2 * * *` |
 | `AUTOMATION_SCAN_CRON` | 自动任务扫描 cron，默认 `*/10 * * * *`；单任务调度在其 schedule 中定义 |
+| `BOOKKEEPING_REPORT_CRON` | 记账月度账单 cron，默认 `0 9 1 * *`（每月 1 号 09:00 推送上月收支汇总） |
 | `LOCATION_CITY/LAT/LON` | 可选预置共享位置；未设置时由 Agent 首次确认 |
 | `QWEATHER_KEY` | 可选，和风天气实时/预报/官方预警和 GeoAPI |
 | `QWEATHER_API_HOST` | 可选，和风天气 API host；**新式 API Key 绑定专属 host（如 `xxx.re.qweatherapi.com`），必须配置，否则全部 403 Invalid Host 静默降级 Open-Meteo（官方预警也不可用）**；旧订阅 key 保持默认 `devapi.qweather.com` |
@@ -349,9 +351,20 @@ hermes -p "<profile>" webhook subscribe "<route-name>" \
 
 待办强提醒：`schedule.create` 传 `intervalMinutes`（1–10080 分钟，默认 120）与/或 `maxAttempts`（1–99 轮，默认 3）即可开启；到期未确认完成时 scheduler 按间隔重复提醒，直至完成/删除/达上限；重发通知标题带轮次标记（如「（第 2 次提醒，共 3 次）」），与正式提醒可区分。强提醒需要一条 occurrence 正式提醒（`target: "occurrence"` 且 `minutesBefore: 0`，默认提醒即满足），否则创建/更新会被拒绝；`schedule.update` 传 `clearStrongReminder: true` 可随时关闭。注意 `intervalMinutes` 大于等于 recurrence 触发间隔（daily=1440 分钟、weekly=10080 分钟）时重发不生效，会被下一 occurrence 的正式提醒接管（创建/更新会输出可检测的警告；该间隔警告仅适用于未配 `byWeekday` 的 daily/weekly，配了 `byWeekday` 时实际触发间隔不定，无法廉价检测）。
 
+## 记账 bookkeeping
+
+`bookkeeping.*` 提供个人账本与多成员共享账本：
+
+- **个人账本**：每个 Profile 私有，首次使用记账工具时自动创建，含账户、收支、转账与月度汇总；
+- **共享账本**：`ledger_create` 创建（创建者即 owner），`member_add`/`member_remove` 管理成员（owner 专属，不能移除 owner 本人）；`account_create(ledgerId)` 在账本下创建**共享账户**（如家庭公共资金池），余额全员共享可见，任意成员可记账；
+- **流水**：`entry_add`/`entry_list`/`entry_get`/`entry_update`/`entry_delete`；金额单位是元（>0，最多两位小数，存储为分）；`transfer` 需要两个不同账户；修改/删除用 `version` 乐观锁，冲突后重新读取再重试。改/删权限：记录人本人，或共享账本 owner；
+- **余额**：永不落库，由全部流水实时派生（含转账双边），跨账本转账自动记入共享账本使双方成员可见；
+- **通知**：共享账本内记账/修改/删除会通知除记录人外的每个成员；每月 1 号（`BOOKKEEPING_REPORT_CRON`，默认 09:00）scheduler 推送上月个人 + 各共享账本收支汇总，上月无流水的 Profile 静默跳过；
+- **汇总**：`summary` 返回指定月（`yyyy-LL`，按配置时区切自然月）的收入/支出/结余、分类聚合与账户余额清单（单位为元）。
+
 ## 工具一览
 
-`location.get` · `location.set` · `location.detect` · `weather.current` · `weather.forecast` · `weather.alerts` · `weather.indices` · `airquality.current` · `oilprice.current` · `oilprice.next_adjustment` · `schedule.create` · `schedule.list` · `schedule.get` · `schedule.update` · `schedule.complete` · `schedule.delete` · `holiday.next` · `holiday.list` · `holiday.is_workday` · `holiday.refresh` · `notify.pull` · `notify.list` · `notify.snooze` · `notify.cancel` · `notify.quiet_hours` · `automation.create` · `automation.list` · `automation.update` · `automation.delete` · `automation.run` · `assistant.export` · `assistant.import`
+`location.get` · `location.set` · `location.detect` · `weather.current` · `weather.forecast` · `weather.alerts` · `weather.indices` · `airquality.current` · `oilprice.current` · `oilprice.next_adjustment` · `schedule.create` · `schedule.list` · `schedule.get` · `schedule.update` · `schedule.complete` · `schedule.delete` · `holiday.next` · `holiday.list` · `holiday.is_workday` · `holiday.refresh` · `notify.pull` · `notify.list` · `notify.snooze` · `notify.cancel` · `notify.quiet_hours` · `automation.create` · `automation.list` · `automation.update` · `automation.delete` · `automation.run` · `bookkeeping.ledger_list` · `bookkeeping.ledger_create` · `bookkeeping.member_add` · `bookkeeping.member_remove` · `bookkeeping.account_create` · `bookkeeping.account_list` · `bookkeeping.account_update` · `bookkeeping.account_delete` · `bookkeeping.entry_add` · `bookkeeping.entry_list` · `bookkeeping.entry_get` · `bookkeeping.entry_update` · `bookkeeping.entry_delete` · `bookkeeping.summary` · `assistant.export` · `assistant.import`
 
 日程工具不接受 `profileId`，而是绑定启动 MCP 时显式注入的 `HERMES_PROFILE`。农历生日或纪念日使用 `calendar: "lunar"`、`lunarMonth`、`lunarDay`；`leapMonthPolicy: "leap"` 仅在对应闰月年份触发。法定节假日/工作日频率使用 `recurrence.frequency: "workday"` 或 `"holiday"`，见上文。
 
@@ -369,7 +382,7 @@ hermes -p "<profile>" webhook subscribe "<route-name>" \
 
 ## 当前状态与计划
 
-已完成：SQLite 存储与旧数据迁移、Profile 私有日程、Profile notification/outbox、统一 Hermes HMAC V2 Webhook、`notify.pull` fallback、确定性生活简报（含空气质量行）、scheduler 单实例租约、中国大陆法定节假日/工作日历法（自动抓取 + workday/holiday 日程频率 + 放假倒计时查询）、静默时段与通知管理（list/snooze/cancel/quiet_hours）、动态自动任务 automation（白名单 action + 条件 DSL，无 LLM）、生活指数查询、Profile 数据导出/导入。
+已完成：SQLite 存储与旧数据迁移、Profile 私有日程、Profile notification/outbox、统一 Hermes HMAC V2 Webhook、`notify.pull` fallback、确定性生活简报（含空气质量行）、scheduler 单实例租约、中国大陆法定节假日/工作日历法（自动抓取 + workday/holiday 日程频率 + 放假倒计时查询）、静默时段与通知管理（list/snooze/cancel/quiet_hours）、动态自动任务 automation（白名单 action + 条件 DSL，无 LLM）、生活指数查询、个人/共享记账（共享账本成员通知与月度账单）、Profile 数据导出/导入。
 
 计划中：
 
