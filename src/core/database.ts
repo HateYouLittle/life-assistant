@@ -169,9 +169,55 @@ export function migrateDatabaseSchema(db: DatabaseSync): void {
       updated_at TEXT NOT NULL,
       PRIMARY KEY (profile_id, id)
     );
+    CREATE TABLE IF NOT EXISTS ledgers (
+      id TEXT PRIMARY KEY,
+      type TEXT NOT NULL,
+      name TEXT NOT NULL,
+      owner_profile_id TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS ledger_members (
+      ledger_id TEXT NOT NULL,
+      profile_id TEXT NOT NULL,
+      role TEXT NOT NULL DEFAULT 'member',
+      joined_at TEXT NOT NULL,
+      PRIMARY KEY (ledger_id, profile_id)
+    );
+    CREATE TABLE IF NOT EXISTS ledger_accounts (
+      id TEXT PRIMARY KEY,
+      kind TEXT NOT NULL,
+      owner_profile_id TEXT,
+      ledger_id TEXT,
+      name TEXT NOT NULL,
+      type TEXT NOT NULL DEFAULT 'other',
+      archived INTEGER NOT NULL DEFAULT 0,
+      version INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS ledger_entries (
+      ledger_id TEXT NOT NULL,
+      id TEXT NOT NULL,
+      profile_id TEXT NOT NULL,
+      type TEXT NOT NULL,
+      amount_cents INTEGER NOT NULL,
+      category TEXT,
+      account_id TEXT,
+      to_account_id TEXT,
+      occurred_at TEXT NOT NULL,
+      note TEXT,
+      version INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (ledger_id, id)
+    );
     CREATE INDEX IF NOT EXISTS idx_schedules_due ON schedules(enabled, next_run_at);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_profile_notifications_composite ON profile_notifications(profile_id, id);
     CREATE INDEX IF NOT EXISTS idx_profile_deliveries_due ON profile_notification_deliveries(status, next_attempt_at);
+    CREATE INDEX IF NOT EXISTS idx_ledger_entries_time ON ledger_entries(ledger_id, occurred_at);
+    CREATE INDEX IF NOT EXISTS idx_ledger_accounts_owner ON ledger_accounts(owner_profile_id);
+    CREATE INDEX IF NOT EXISTS idx_ledger_accounts_ledger ON ledger_accounts(ledger_id);
     `);
 
     // 版本护栏：schema_meta 表可能刚创建，读取现有 version 必须放在 CREATE 之后、事务内。
@@ -179,8 +225,8 @@ export function migrateDatabaseSchema(db: DatabaseSync): void {
     const versionRow = db.prepare("SELECT value FROM schema_meta WHERE key = 'version'").get() as { value?: string } | undefined;
     if (versionRow?.value !== undefined) {
       const existingVersion = Number(versionRow.value);
-      if (Number.isFinite(existingVersion) && existingVersion > 7) {
-        throw new Error(`database schema version ${versionRow.value} is newer than supported version 7`);
+      if (Number.isFinite(existingVersion) && existingVersion > 8) {
+        throw new Error(`database schema version ${versionRow.value} is newer than supported version 8`);
       }
     }
 
@@ -203,8 +249,9 @@ export function migrateDatabaseSchema(db: DatabaseSync): void {
     // v7：待办强提醒（schedules 可选列；NULL = 未开启强提醒）。
     ensureColumn(db, "schedules", "reminder_interval_minutes", "INTEGER");
     ensureColumn(db, "schedules", "reminder_max_attempts", "INTEGER");
+    // v8：记账模块（ledgers/ledger_members/ledger_accounts/ledger_entries 及索引，全量 CREATE IF NOT EXISTS）。
 
-    db.prepare("INSERT OR REPLACE INTO schema_meta(key, value) VALUES('version', '7')").run();
+    db.prepare("INSERT OR REPLACE INTO schema_meta(key, value) VALUES('version', '8')").run();
     db.exec("COMMIT");
   } catch (error) {
     db.exec("ROLLBACK");
