@@ -184,3 +184,49 @@ test("new schedule writes persist deadline columns and reminder targets", () => 
     { id: "due", minutesBefore: 10, target: "deadline" },
   ]);
 });
+
+test("L38: service-direct recurrence validation matches the MCP layer ranges (byMonthDay/byWeekday/count)", () => {
+  const profile = requireProfileContext("migration-profile");
+  // assistant.import 的 recurrence 是 z.unknown() 透传，直调 service 的路径必须
+  // 有与 MCP 层 schema 相同的范围校验；读取侧 sanitizeRecurrence 会静默丢弃越界值，
+  // 写入侧不校验会造成「写入 99 / 读取吞掉」的口径不一致。
+  assert.throws(
+    () => createSchedule(profile, {
+      title: "bad byMonthDay",
+      calendar: "solar",
+      date: "2099-03-01",
+      time: "09:00",
+      recurrence: { frequency: "monthly", byMonthDay: 99 },
+    }),
+    /byMonthDay must be an integer between 1 and 31/,
+  );
+  assert.throws(
+    () => createSchedule(profile, {
+      title: "bad count",
+      calendar: "solar",
+      date: "2099-03-01",
+      time: "09:00",
+      recurrence: { frequency: "weekly", count: 0 },
+    }),
+    /count must be a positive integer/,
+  );
+  assert.throws(
+    () => createSchedule(profile, {
+      title: "bad byWeekday",
+      calendar: "solar",
+      date: "2099-03-01",
+      time: "09:00",
+      recurrence: { frequency: "weekly", byWeekday: ["MO", "XX"] },
+    }),
+    /byWeekday must be an array of SU\/MO\/TU\/WE\/TH\/FR\/SA/,
+  );
+  // 合法边界值仍然通过：byMonthDay 1 与 31、count 1、标准 byWeekday。
+  const ok = createSchedule(profile, {
+    title: "ok recurrence bounds",
+    calendar: "solar",
+    date: "2099-03-01",
+    time: "09:00",
+    recurrence: { frequency: "monthly", byMonthDay: 31, count: 3, byWeekday: ["MO"] },
+  });
+  getSchedule(profile, ok.id);
+});

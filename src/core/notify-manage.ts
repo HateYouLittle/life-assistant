@@ -48,7 +48,8 @@ const UNCERTAIN_WINDOW_MS = 55 * 60 * 1000;
 /**
  * 稍后提醒：把未成功投递的通知的下次投递时间推迟 minutes 分钟。
  * 只作用于 pending/failed/fallback；幂等窗口内的不确定失败（request_started_at 较新）
- * 拒绝 snooze，避免换新 Request-ID 重复投递。
+ * 拒绝 snooze。窗口外的行被允许并重置幂等窗口/换代（request_started_at = NULL、
+ * request_generation + 1），与 route 恢复重新入队同口径。
  */
 export function snoozeProfileNotificationDelivery(
   value: ProfileContext | string,
@@ -88,9 +89,13 @@ export function snoozeProfileNotificationDelivery(
     }
   }
   const snoozedUntil = new Date(at.getTime() + minutes * 60_000).toISOString();
+  // 与 route 恢复重新入队（notify-delivery）同口径：request_started_at 置 NULL（重启幂等窗口）、
+  // request_generation + 1（换新 X-Request-ID）。能通过窗口校验的行 request_started_at 必已
+  // 过期，换新 Request-ID 不会引入重复投递风险。
   const updated = db.prepare(`
     UPDATE profile_notification_deliveries
     SET status = 'pending', attempts = 0, transport_failures = 0,
+        request_started_at = NULL, request_generation = request_generation + 1,
         next_attempt_at = ?, not_before = ?, last_error = NULL,
         claim_token = NULL, claimed_at = NULL, updated_at = ?
     WHERE profile_id = ? AND notification_id = ? AND status IN ('pending', 'failed', 'fallback')

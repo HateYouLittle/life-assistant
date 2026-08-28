@@ -5,3 +5,4 @@ data/
 .env.bak*
 *.log
 .npm-cache/
+.zcode/

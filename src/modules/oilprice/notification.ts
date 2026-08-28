@@ -13,6 +13,8 @@ export interface OilPriceAdvanceNoticePayload {
   effectiveAt: string;
   timezone: string;
   tip: string;
+  /** 候选窗口（表外按"每 10 个工作日"规则生成，未经官方日历校准）为 false */
+  calibrated?: boolean;
 }
 
 export interface OilPriceOfficialResultPayload {
@@ -23,6 +25,8 @@ export interface OilPriceOfficialResultPayload {
   unit: "元/升";
   fuels: Record<"p92" | "p95" | "p0", { current: string; change: string }>;
   source: string;
+  /** 结果迟到（超出窗口生效后 48 小时）延迟发布时为 true */
+  delayed?: boolean;
 }
 
 export type AdvanceNoticeEnvelope = EnvelopeFor<"oilprice.advance_notice", OilPriceAdvanceNoticePayload>;
@@ -38,19 +42,21 @@ export function advanceNoticeNotification(input: {
   windowDate: string;
   effectiveAt: string;
   generatedAt: string;
+  calibrated?: boolean;
 }): AdvanceNoticeEnvelope {
   return {
     kind: "oilprice.advance_notice",
     identity: `advance:${input.windowDate}`,
     source: "oilprice",
     scope: { type: "global" },
-    headline: `下一轮油价调整窗口：${displayDate(input.windowDate)}`,
+    headline: `下一轮油价调整窗口：${displayDate(input.windowDate)}${input.calibrated === false ? "（候选未校准）" : ""}`,
     generatedAt: input.generatedAt,
     payload: {
       windowDate: input.windowDate,
       effectiveAt: input.effectiveAt,
       timezone: TIMEZONE,
       tip: "如近期需要加油，请留意正式调价结果。",
+      ...(input.calibrated === false ? { calibrated: false } : {}),
     },
   };
 }
@@ -64,6 +70,8 @@ export interface OfficialResultInput {
   source: string;
   unit: "元/升";
   fuels: Record<"p92" | "p95" | "p0", { current: string; change: string }>;
+  /** 结果迟到（超出窗口生效后 48 小时）延迟发布时为 true */
+  delayed?: boolean;
 }
 
 function changeDirection(change: string): -1 | 0 | 1 | undefined {
@@ -87,12 +95,13 @@ function officialResultHeadline(input: OfficialResultInput): string {
 export function officialResultNotification(
   input: OfficialResultInput,
 ): OfficialResultEnvelope {
+  const delayedSuffix = input.delayed ? "（延迟发布）" : "";
   return {
     kind: "oilprice.official_result",
     identity: `result:${input.province}:${input.windowDate}`,
     source: "oilprice",
     scope: { type: "global" },
-    headline: officialResultHeadline(input),
+    headline: `${officialResultHeadline(input)}${delayedSuffix}`,
     generatedAt: input.generatedAt,
     provenance: { provider: input.provider },
     payload: {
@@ -103,6 +112,7 @@ export function officialResultNotification(
       unit: input.unit,
       fuels: input.fuels,
       source: input.source,
+      ...(input.delayed ? { delayed: true } : {}),
     },
   };
 }
@@ -116,11 +126,19 @@ function formatBusinessDate(value: string): string {
 }
 
 function oilPriceAdvanceBlocks(payload: OilPriceAdvanceNoticePayload): RenderBlock[] {
-  return [
+  const blocks: RenderBlock[] = [
     { type: "label", label: "调整时间", value: `${formatBusinessDate(payload.windowDate)} 24:00（北京时间）` },
     { type: "label", label: "正式涨跌", value: "尚未发布" },
-    { type: "label", label: "提示", value: payload.tip },
   ];
+  if (payload.calibrated === false) {
+    blocks.push({
+      type: "label",
+      label: "校准状态",
+      value: "候选未校准：按每 10 个工作日规则推演，待官方日历公布后校准",
+    });
+  }
+  blocks.push({ type: "label", label: "提示", value: payload.tip });
+  return blocks;
 }
 
 function renderChange(value: string): string {
@@ -143,6 +161,9 @@ function oilPriceResultBlocks(notification: NotificationEnvelope): RenderBlock[]
     value: `${fuel.current}${payload.unit}，${renderChange(fuel.change)}`,
   } as const));
   blocks.push({ type: "label", label: "生效时间", value: `${effectiveAt}（北京时间）` });
+  if (payload.delayed === true) {
+    blocks.push({ type: "label", label: "发布状态", value: "延迟发布（晚于窗口生效后 48 小时）" });
+  }
   blocks.push({ type: "label", label: "地区", value: payload.province });
   const provider = provenance?.provider?.trim();
   const sourceIncludesProvider = provider

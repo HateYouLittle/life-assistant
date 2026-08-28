@@ -1,4 +1,5 @@
 import path from "node:path";
+import { DateTime } from "luxon";
 import type { NotificationRenderTarget } from "./core/notification.js";
 
 function nonBlankOrDefault(value: string | undefined, fallback: string): string {
@@ -81,16 +82,51 @@ if (profilePushRoutesRaw && Object.keys(profilePushRoutes).length === 0) {
   console.warn("PROFILE_PUSH_ROUTES_JSON is set but produced no valid routes");
 }
 
-export const config = {
-  dataDir: path.resolve(nonBlankOrDefault(process.env.DATA_DIR, "./data")),
-  profilePushRoutes,
-  timezone: nonBlankOrDefault(process.env.LIFE_ASSISTANT_TIMEZONE, Intl.DateTimeFormat().resolvedOptions().timeZone),
+// M8：时区必须加载期校验——非法 IANA 时区会让所有 DateTime 计算静默失真，直接拒绝启动。
+const rawTimezone = nonBlankOrDefault(process.env.LIFE_ASSISTANT_TIMEZONE, Intl.DateTimeFormat().resolvedOptions().timeZone);
+if (!DateTime.now().setZone(rawTimezone).isValid) {
+  throw new Error(`LIFE_ASSISTANT_TIMEZONE="${rawTimezone}" is not a valid IANA timezone; refusing to start with an unusable clock`);
+}
 
-  location: {
-    city: process.env.LOCATION_CITY ?? "",
-    lat: process.env.LOCATION_LAT ? Number(process.env.LOCATION_LAT) : undefined,
-    lon: process.env.LOCATION_LON ? Number(process.env.LOCATION_LON) : undefined,
-  },
+// M8：DATA_DIR 必须为绝对路径（README 语义）；未设置/空白时落到绝对默认值。
+function resolveDataDir(): string {
+  const raw = process.env.DATA_DIR;
+  if (raw === undefined || raw.trim() === "") return path.resolve("./data");
+  if (!path.isAbsolute(raw)) {
+    throw new Error(`DATA_DIR="${raw}" must be an absolute path (got a relative path); DATA_DIR defines the directory for all runtime data and cannot be resolved against the process cwd`);
+  }
+  return raw;
+}
+const dataDir = resolveDataDir();
+
+// L6：坐标必须有限、在合法范围内且成对；非法或不成对视为未配置并告警（读取侧 location/index.ts 另有 isFinite 兜底）。
+const rawLat = process.env.LOCATION_LAT;
+const rawLon = process.env.LOCATION_LON;
+const location = {
+  city: process.env.LOCATION_CITY ?? "",
+  lat: rawLat !== undefined && rawLat.trim() !== "" ? Number(rawLat) : undefined,
+  lon: rawLon !== undefined && rawLon.trim() !== "" ? Number(rawLon) : undefined,
+};
+if (location.lat !== undefined && !(Number.isFinite(location.lat) && location.lat >= -90 && location.lat <= 90)) {
+  console.warn(`LOCATION_LAT="${rawLat}" is not a valid latitude (finite, -90..90); location treated as unset`);
+  location.lat = undefined;
+}
+if (location.lon !== undefined && !(Number.isFinite(location.lon) && location.lon >= -180 && location.lon <= 180)) {
+  console.warn(`LOCATION_LON="${rawLon}" is not a valid longitude (finite, -180..180); location treated as unset`);
+  location.lon = undefined;
+}
+if ((location.lat === undefined) !== (location.lon === undefined)) {
+  console.warn("LOCATION_LAT and LOCATION_LON must be provided as a pair; location treated as unset");
+  location.lat = undefined;
+  location.lon = undefined;
+}
+
+export const config = {
+  dataDir,
+  profilePushRoutes,
+  timezone: rawTimezone,
+
+  location,
 
   qweatherKey: process.env.QWEATHER_KEY ?? "",
   qweatherApiHost: process.env.QWEATHER_API_HOST ?? "devapi.qweather.com",

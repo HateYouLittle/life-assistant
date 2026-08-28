@@ -87,3 +87,42 @@ test("a valid fresh cache short-circuits the GeoAPI", async (t) => {
   assert.equal(calls, 0);
   assert.deepEqual(result, { id: "101010100", lat: 39.9, lon: 116.4 });
 });
+
+test("L8: a geo hit with a non-alphanumeric id is rejected and not cached", async (t) => {
+  const originalKey = config.qweatherKey;
+  const originalFetch = globalThis.fetch;
+  store.del(CACHE_KEY);
+  config.qweatherKey = "test-key";
+  // 非白名单字符（/; 等）会被 weather/provider.ts 原样拼进请求 URL → 直接拒绝
+  globalThis.fetch = (async () => Response.json({
+    location: [{ id: "101010100/../../etc;DROP", lat: "39.90", lon: "116.40" }],
+  })) as typeof fetch;
+  t.after(() => {
+    config.qweatherKey = originalKey;
+    globalThis.fetch = originalFetch;
+  });
+
+  await assert.rejects(() => qweatherGeo("北京"), /和风天气未找到城市：北京/);
+  assert.equal(store.get(CACHE_KEY), undefined, "非法 id 不得写入 7 天缓存");
+});
+
+test("L8: a cached entry with an out-of-whitelist id is treated as dirty and re-queried", async (t) => {
+  const originalKey = config.qweatherKey;
+  const originalFetch = globalThis.fetch;
+  config.qweatherKey = "test-key";
+  store.set(CACHE_KEY, { id: "101010100;nested", lat: 39.9, lon: 116.4, ts: Date.now() });
+  let calls = 0;
+  globalThis.fetch = (async () => {
+    calls += 1;
+    return Response.json({ location: [{ id: "101010100", lat: "39.90", lon: "116.40" }] });
+  }) as typeof fetch;
+  t.after(() => {
+    config.qweatherKey = originalKey;
+    globalThis.fetch = originalFetch;
+  });
+
+  const result = await qweatherGeo("北京");
+  assert.equal(calls, 1, "脏缓存 id 必须触发重新查询");
+  assert.deepEqual(result, { id: "101010100", lat: 39.9, lon: 116.4 });
+  assert.equal((store.get<{ id: string }>(CACHE_KEY))?.id, "101010100", "脏缓存被合法结果覆盖");
+});

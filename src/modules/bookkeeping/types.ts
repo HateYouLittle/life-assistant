@@ -203,10 +203,17 @@ export const accountTypeSchema = z.enum(ACCOUNT_TYPES);
 
 export const entryTypeSchema = z.enum(["expense", "income", "transfer"]);
 
-/** 元：> 0 且最多两位小数（存储层转分，拒绝三位以上小数与浮点噪声）。 */
+/**
+ * 金额上限（元）：9e12 元 = 9e14 分，远低于 Number.MAX_SAFE_INTEGER（≈9.0072e15），
+ * 保证转分后整数值精度无损；超过该上限的金额在存储层无法可靠表示，直接拒绝。
+ */
+export const MAX_AMOUNT_YUAN = 9e12;
+
+/** 元：> 0、≤ 9e12 且最多两位小数（存储层转分，拒绝三位以上小数与浮点噪声）。 */
 export const amountYuanSchema = z
   .number()
   .positive("amount must be greater than 0")
+  .max(MAX_AMOUNT_YUAN, "amount must be at most 9000000000000 yuan")
   .refine((value) => Math.abs(value * 100 - Math.round(value * 100)) < 1e-6, {
     message: "amount supports at most 2 decimal places",
   });

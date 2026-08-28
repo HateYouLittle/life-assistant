@@ -1,6 +1,6 @@
 {
   "name": "life-assistant",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Personal life assistant for Hermes Agent: weather, oil prices, Profile-private schedules, CN holidays/workdays, and reliable Hermes Webhook notifications.",
   "type": "module",
   "license": "MIT",
@@ -8,7 +8,7 @@
     "node": ">=22.13"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.json",
     "test": "node --import tsx/esm --test tests/*.test.ts",
     "start": "node dist/index.js",
     "start:scheduler": "node dist/scheduler.js",

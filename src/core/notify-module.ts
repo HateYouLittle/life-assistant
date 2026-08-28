@@ -23,7 +23,10 @@ export const notifyModule: AssistantModule = {
         description: "拉取当前 Hermes Profile 的未读通知：公共天气/油价通知和本 Profile 的私有日程通知。",
       },
       {},
-      (_args, context) => ok({ count: pullPending(context ?? requireProfileContext()).length }),
+      (_args, context) => {
+        const notices = pullPending(context ?? requireProfileContext());
+        return ok({ count: notices.length, notifications: notices });
+      },
     ),
     withTool(
       {

@@ -46,7 +46,7 @@ export function withTool<S extends ZodRawShape>(
       try {
         return await run(parser.parse(args ?? {}), context);
       } catch (error) {
-        return fail((error as Error).message);
+        return fail(error instanceof Error ? error.message : String(error));
       }
     },
   };

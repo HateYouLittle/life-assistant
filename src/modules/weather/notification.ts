@@ -78,14 +78,33 @@ export function weatherAlertIdentity(alert: OfficialWeatherAlert): string {
     .join(":")}`;
 }
 
-export function legacyWeatherAlertDedupeKeys(alert: WeatherAlert, at: Date): string[] {
+/**
+ * 迁移兼容旧键：旧版本键形如 weather:alert:{label}:{date}，日期为 UTC 日；
+ * 新 identity（inferredAlertNotification）用配置时区本地日。L7：本地与 UTC
+ * 日界错开时（如 UTC 20:00 = 本地次日 04:00），仅 UTC 键会让跨本地午夜的重扫
+ * 无法去重（双发）。因此同时生成本地 + UTC 两组键（超集）：
+ * - 本地键与 identity 同源，跨本地午夜重扫可命中；
+ * - UTC 键兼容升级前写入的旧行（命中旧键会改键复用）。
+ * timezone 缺省/非法时退化为仅 UTC 键（保持旧行为）。
+ */
+export function legacyWeatherAlertDedupeKeys(alert: WeatherAlert, at: Date, timezone?: string): string[] {
   const label = alert.kind === "official" ? alert.headline : alert.title;
-  const currentDate = at.toISOString().slice(0, 10);
-  const previousDate = new Date(at.getTime() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
-  return [
-    `weather:alert:${label}:${currentDate}`,
-    `weather:alert:${label}:${previousDate}`,
-  ];
+  const key = (date: string) => `weather:alert:${label}:${date}`;
+  const utcCurrent = at.toISOString().slice(0, 10);
+  const utcPrevious = new Date(at.getTime() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  let localCurrent: string | undefined;
+  let localPrevious: string | undefined;
+  if (timezone?.trim()) {
+    const local = DateTime.fromJSDate(at).setZone(timezone);
+    if (local.isValid) {
+      localCurrent = local.toISODate() ?? undefined;
+      localPrevious = local.minus({ days: 1 }).toISODate() ?? undefined;
+    }
+  }
+  if (localCurrent !== undefined && localPrevious !== undefined && (localCurrent !== utcCurrent || localPrevious !== utcPrevious)) {
+    return [key(localCurrent), key(localPrevious), key(utcCurrent), key(utcPrevious)];
+  }
+  return [key(utcCurrent), key(utcPrevious)];
 }
 
 export function officialAlertNotification(
@@ -107,7 +126,7 @@ export function officialAlertNotification(
     generatedAt: options.generatedAt,
     // 迁移兼容：旧版本键形如 weather:alert:{label}:{date}；构造时随信封携带，
     // 发布层命中旧行会改键复用，避免升级当天重复推送。
-    legacyDedupeKeys: legacyWeatherAlertDedupeKeys(alert, new Date(options.generatedAt)),
+    legacyDedupeKeys: legacyWeatherAlertDedupeKeys(alert, new Date(options.generatedAt), options.timezone),
     provenance: { provider: "和风天气", publisher: alert.publisher },
     payload: {
       type: alert.eventType,
@@ -138,7 +157,7 @@ export function inferredAlertNotification(
     scope: { type: "global" },
     headline: `系统推断风险：${alert.title}`,
     generatedAt: options.generatedAt,
-    legacyDedupeKeys: legacyWeatherAlertDedupeKeys(alert, new Date(options.generatedAt)),
+    legacyDedupeKeys: legacyWeatherAlertDedupeKeys(alert, new Date(options.generatedAt), options.timezone),
     payload: {
       title: alert.title,
       description: alert.description,

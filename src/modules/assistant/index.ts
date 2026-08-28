@@ -3,7 +3,7 @@ import { registerModule, ok, withTool, type AssistantModule } from "../../core/r
 import { requireProfileContext, type ProfileContext } from "../../core/profile.js";
 import { getDatabase } from "../../core/database.js";
 import { currentLocation, saveImportedLocation } from "../location/index.js";
-import { getQuietHours, saveQuietHours } from "../../core/notification-settings.js";
+import { getQuietHours, saveQuietHours, validateQuietHours } from "../../core/notification-settings.js";
 import {
   createSchedule,
   getSchedule,
@@ -51,6 +51,15 @@ export interface PortableSchedule {
   maxAttempts?: number;
 }
 
+/** 导出侧 JSON 列容错：单行损坏不得拖垮整个导出（对照 schedule parseJson 的容错口径）。 */
+function parseSnapshotJson<T>(value: unknown, fallback: T): T {
+  try {
+    return typeof value === "string" ? JSON.parse(value) as T : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
 function toPortableSchedule(item: ScheduleItem): PortableSchedule {
   return {
     id: item.id,
@@ -89,6 +98,8 @@ export interface AssistantExport {
     location: { city: string; province?: string; lat: number; lon: number } | null;
     /** 任一类条目超过导出上限时为 true：快照不完整，导入方应提示 */
     truncated?: boolean;
+    /** 因 JSON 列损坏被跳过的自动任务行数（>0 时快照缺少这些任务，导入方应提示） */
+    invalidAutomations?: number;
   };
 }
 
@@ -104,6 +115,33 @@ export function buildAssistantExport(profile: ProfileContext): AssistantExport {
   const automationsTruncated = automations.length > EXPORT_ROW_LIMIT;
   const quiet = getQuietHours(profile.id);
   const loc = currentLocation();
+  // L10：params/condition/schedule 列损坏只是该行跳过（并计入 invalidAutomations），
+  // 不得让 JSON.parse 抛出拖垮整个导出（对照 schedule/service.ts parseJson 容错）。
+  const exportedAutomations: AssistantExport["data"]["automations"] = [];
+  let invalidAutomationRows = 0;
+  for (const row of automations.slice(0, EXPORT_ROW_LIMIT)) {
+    const params = parseSnapshotJson(String(row.params_json ?? "{}"), {}) as Record<string, unknown>;
+    const condition = row.condition_json == null
+      ? undefined
+      : parseSnapshotJson(String(row.condition_json), undefined) as AutomationCreateInput["condition"];
+    const schedule = parseSnapshotJson(
+      String(row.schedule_json),
+      undefined as AutomationCreateInput["schedule"] | undefined,
+    );
+    if (schedule === undefined) {
+      invalidAutomationRows += 1;
+      continue;
+    }
+    exportedAutomations.push({
+      id: String(row.id),
+      name: String(row.name),
+      action: String(row.action),
+      params,
+      condition,
+      schedule,
+      enabled: Number(row.enabled) === 1,
+    });
+  }
   return {
     format: EXPORT_FORMAT,
     version: EXPORT_VERSION,
@@ -111,20 +149,11 @@ export function buildAssistantExport(profile: ProfileContext): AssistantExport {
     profile: profile.id,
     data: {
       schedules: rows.slice(0, EXPORT_ROW_LIMIT).map((row) => toPortableSchedule(hydrateRow(row))),
-      automations: automations.slice(0, EXPORT_ROW_LIMIT).map((row) => ({
-        id: String(row.id),
-        name: String(row.name),
-        action: String(row.action),
-        params: JSON.parse(String(row.params_json ?? "{}")) as Record<string, unknown>,
-        condition: row.condition_json == null
-          ? undefined
-          : JSON.parse(String(row.condition_json)) as AutomationCreateInput["condition"],
-        schedule: JSON.parse(String(row.schedule_json)) as AutomationCreateInput["schedule"],
-        enabled: Number(row.enabled) === 1,
-      })),
+      automations: exportedAutomations,
       quietHours: quiet ? { start: quiet.start, end: quiet.end, timezone: quiet.timezone } : null,
       location: loc ? { city: loc.city, province: loc.province, lat: loc.lat, lon: loc.lon } : null,
       truncated: schedulesTruncated || automationsTruncated,
+      ...(invalidAutomationRows > 0 ? { invalidAutomations: invalidAutomationRows } : {}),
     },
   };
 }
@@ -221,6 +250,12 @@ export function importAssistantExport(
     throw new Error(`不支持的快照版本 ${String(head.version)}（当前支持版本 1-${EXPORT_VERSION}）`);
   }
   const parsed = exportPayloadSchema.parse(payload);
+  // M6：quietHours 在任何写入之前预校验。saveQuietHours 对非法时区/时间格式 throw，
+  // 若放在导入循环之后，会出现「部分条目已落库 + 整体报错」，且 ImportSummary 丢失。
+  if (parsed.data.quietHours) {
+    const { start, end, timezone } = parsed.data.quietHours;
+    validateQuietHours(start, end, timezone);
+  }
   const summary: ImportSummary = {
     schedules: { imported: 0, skipped: 0, invalid: 0 },
     automations: { imported: 0, skipped: 0, invalid: 0 },

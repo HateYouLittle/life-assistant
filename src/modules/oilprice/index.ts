@@ -32,7 +32,9 @@ export function nextAdjustmentSummary(at = new Date()) {
     ...window,
     // 展示层保留 1 位小数，避免浮点误差；逻辑阈值使用精确值
     hoursUntil: Math.round(window.hoursUntil * 10) / 10,
-    note: "调价于窗口日 24:00 生效；正式结果发布时间不固定，请以正式调价数据为准。",
+    note: window.calibrated === false
+      ? "调价于窗口日 24:00 生效；该窗口按“每 10 个工作日”规则推演，未经法定节假日校准，请以发改委正式公告为准。"
+      : "调价于窗口日 24:00 生效；正式结果发布时间不固定，请以正式调价数据为准。",
   };
 }
 

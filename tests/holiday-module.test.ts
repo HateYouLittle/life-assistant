@@ -9,6 +9,9 @@ import type { HolidayYearDataset } from "../src/modules/holiday/provider.js";
 const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "life-assistant-holiday-module-"));
 process.env.DATA_DIR = dataDir;
 process.env.HERMES_PROFILE = "holiday-module";
+// L27：HOLIDAY_REFRESH_CRON 在 config.ts 模块级读取（default "0 2 * * *"）；CI/开发者 shell
+// 导出该变量会让 jobs[0].cron 断言假红，这里在模块 import 前显式清除。
+delete process.env.HOLIDAY_REFRESH_CRON;
 
 await import("../src/modules/index.js");
 const { getModules } = await import("../src/core/registry.js");

@@ -14,6 +14,17 @@ import { store } from "../../core/store.js";
 const GEO_CACHE_PREFIX = "qweather:geo:";
 const GEO_CACHE_TTL_MS = 7 * 24 * 3600 * 1000;
 
+/**
+ * 和风 location ID 白名单：字母数字（如 101010100、101060109）。weather/provider.ts
+ * 会把该 ID 原样拼进请求 URL（location=...查询参数），非白名单字符（/、;、= 等）
+ * 会污染 URL；读取侧与写入侧共用同一校验，脏缓存同样被拒（L8）。
+ */
+const QWEATHER_ID_PATTERN = /^[A-Za-z0-9]+$/;
+
+function isWellFormedLocationId(value: unknown): value is string {
+  return typeof value === "string" && QWEATHER_ID_PATTERN.test(value);
+}
+
 interface GeoCacheEntry {
   id: string;
   lat: number;
@@ -30,7 +41,7 @@ function isValidCoordinatePair(lat: unknown, lon: unknown): boolean {
 function isValidGeoCacheEntry(raw: unknown): raw is GeoCacheEntry {
   if (!raw || typeof raw !== "object") return false;
   const candidate = raw as Record<string, unknown>;
-  return typeof candidate.id === "string" && candidate.id.length > 0
+  return isWellFormedLocationId(candidate.id)
     && isValidCoordinatePair(candidate.lat, candidate.lon)
     && typeof candidate.ts === "number" && Number.isFinite(candidate.ts);
 }
@@ -57,7 +68,8 @@ export async function qweatherGeo(city: string): Promise<{ id: string; lat: numb
     `https://${config.qweatherApiHost}/geo/v2/city/lookup?location=${encodeURIComponent(city)}&key=${config.qweatherKey}`,
   );
   const hit = geo.location?.[0];
-  if (!hit || typeof hit.id !== "string" || !hit.id) throw new Error(`和风天气未找到城市：${city}`);
+  // L8：id 必须为字母数字（和风 location ID 白名单）；非白名单字符会污染下游请求 URL
+  if (!hit || !isWellFormedLocationId(hit.id)) throw new Error(`和风天气未找到城市：${city}`);
   const lat = Number(hit.lat);
   const lon = Number(hit.lon);
   // 坐标非有限数或越界：拒绝并避免把垃圾坐标写入 7 天缓存（与缓存读取侧同一口径）

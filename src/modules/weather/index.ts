@@ -24,7 +24,7 @@ export interface DailyWeatherBriefOptions {
   timezone?: string;
   getLocation?: () => { city: string; lat: number; lon: number } | null;
   getCurrent?: (lat: number, lon: number, city: string) => Promise<CurrentWeather>;
-  getForecast?: (lat: number, lon: number, days: number, city: string) => Promise<ForecastDay[]>;
+  getForecast?: (lat: number, lon: number, days: number, city: string, timezone?: string) => Promise<ForecastDay[]>;
   getAirQuality?: (city: string, lat: number, lon: number) => Promise<AirQuality>;
   /** 测试注入用；缺省走核心通知引擎。 */
   publish?: GlobalPublishFn;
@@ -70,7 +70,9 @@ export async function runDailyWeatherBrief(options: DailyWeatherBriefOptions = {
   const getAirQuality = options.getAirQuality ?? fetchAirQuality;
   const [current, forecast, airQuality] = await Promise.allSettled([
     getCurrent(location.lat, location.lon, location.city),
-    getForecast(location.lat, location.lon, 1, location.city),
+    // L9：把简报时区传给预报 provider，Open-Meteo 按同一时区切日，
+    // 保证「今天」与 identity 的本地日一致（缺省 getForecast 实现在 provider 内兜底 config.timezone）。
+    getForecast(location.lat, location.lon, 1, location.city, timezone),
     // 空气质量 best-effort：单源失败不阻断简报，仅在两侧天气可用时并入一行。
     getAirQuality(location.city, location.lat, location.lon),
   ]);

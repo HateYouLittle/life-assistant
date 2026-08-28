@@ -38,11 +38,13 @@ test("official alert identity prefers a stable provider ID", () => {
   assert.equal(weatherAlertIdentity(officialAlert({ publisher: "不同发布机构" })), "alert:id:provider-id-1");
 });
 
-test("official alert legacy aliases use the raw headline across UTC midnight", () => {
+test("official alert legacy aliases cover both local and UTC dates across midnight", () => {
+  // UTC 2026-08-05T00:03 = 上海 08:05（同一本地日）→ 本地与 UTC 日一致，仅两组键即可。
   assert.deepEqual(
     legacyWeatherAlertDedupeKeys(
       officialAlert({ headline: "萍乡暴雨橙色预警 / 请注意" }),
       new Date("2026-08-05T00:03:00.000Z"),
+      "Asia/Shanghai",
     ),
     [
       "weather:alert:萍乡暴雨橙色预警 / 请注意:2026-08-05",
@@ -51,7 +53,7 @@ test("official alert legacy aliases use the raw headline across UTC midnight", (
   );
 });
 
-test("inferred risk legacy aliases use the raw title for the same two UTC dates", () => {
+test("inferred risk legacy aliases cover both local and UTC dates for the same window", () => {
   const alert: WeatherAlert = {
     kind: "inferred",
     title: "萍乡高温推断提醒 / 体感风险",
@@ -59,12 +61,30 @@ test("inferred risk legacy aliases use the raw title for the same two UTC dates"
     description: "未来48小时注意防暑。",
   };
   assert.deepEqual(
-    legacyWeatherAlertDedupeKeys(alert, new Date("2026-08-05T00:03:00.000Z")),
+    legacyWeatherAlertDedupeKeys(alert, new Date("2026-08-05T00:03:00.000Z"), "Asia/Shanghai"),
     [
       "weather:alert:萍乡高温推断提醒 / 体感风险:2026-08-05",
       "weather:alert:萍乡高温推断提醒 / 体感风险:2026-08-04",
     ],
   );
+});
+
+test("L7: legacy dedupe keys include the local date when UTC and local day boundaries diverge", () => {
+  // UTC 2026-08-04T20:00 = 上海 2026-08-05 04:00：identity 的「今日」是 08-05（本地），
+  // 旧 UTC 键只有 08-04/08-03，跨本地午夜重扫会双发。修复后 legacy 键必须同时
+  // 携带本地日（与 identity 同源）和 UTC 日（兼容升级前存量）两组合集。
+  const alert: WeatherAlert = {
+    kind: "inferred",
+    title: "萍乡大风推断提醒",
+    level: "inferred",
+    description: "未来48小时注意防风。",
+  };
+  const keys = legacyWeatherAlertDedupeKeys(alert, new Date("2026-08-04T20:00:00.000Z"), "Asia/Shanghai");
+  assert.ok(keys.includes("weather:alert:萍乡大风推断提醒:2026-08-05"), "必须含本地日 08-05（与 identity 同源）");
+  // 本地前一日与 UTC 当日在此例中都是 08-04（上海 04:00 前一个本地日 = 08-04，UTC 日 = 08-04）
+  assert.ok(keys.includes("weather:alert:萍乡大风推断提醒:2026-08-04"), "必须含本地前一日 / UTC 日 08-04（兼容旧键）");
+  assert.ok(keys.includes("weather:alert:萍乡大风推断提醒:2026-08-03"), "必须含 UTC 前一日 08-03（兼容旧键）");
+  assert.equal(new Set(keys).size, 3, "本地与 UTC 日在 08-04 重合 → 3 个不重复键");
 });
 
 test("official alert fallback identity changes when only issued time changes", () => {

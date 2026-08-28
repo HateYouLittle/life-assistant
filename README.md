@@ -251,7 +251,7 @@ systemctl status --no-pager life-assistant-scheduler.service
 | `DATA_DIR` | SQLite/WAL 和旧 `store.json` 迁移源；生产必须使用绝对路径 |
 | `HERMES_PROFILE` | MCP 进程的 Profile 身份；必填且不得静默回退 |
 | `PROFILE_PUSH_ROUTES_JSON` | Profile 到 Hermes route、loopback URL、HMAC secret 的映射 |
-| `LIFE_ASSISTANT_TIMEZONE` | scheduler 简报/预警渲染时区，以及 schedule 创建/更新时未显式指定 timezone 的默认时区 |
+| `LIFE_ASSISTANT_TIMEZONE` | scheduler 简报/预警渲染时区，以及 schedule 创建/更新时未显式指定 timezone 的默认时区。**生产部署必须显式设置（IANA 名称，如 `Asia/Shanghai`）**：否则日报/去重按机器本地时区计算，跨时区部署会出现「今日」语义错位 |
 | `DAILY_WEATHER_BRIEF_CRON` | 每日生活简报 cron，默认 `0 7 * * *` |
 | `HOLIDAY_REFRESH_CRON` | 节假日安排每日刷新 cron（Asia/Shanghai），默认 `0 2 * * *` |
 | `AUTOMATION_SCAN_CRON` | 自动任务扫描 cron，默认 `*/10 * * * *`；单任务调度在其 schedule 中定义 |
@@ -287,7 +287,7 @@ systemctl status --no-pager life-assistant-scheduler.service
 - **白名单 action**：`weather.current`、`weather.forecast`（days 1–7）、`airquality.current`、`oilprice.current`，全部复用模块 Provider，不调用 LLM；
 - **条件 DSL**：`{ field, op, value }`，field 是 action 结果的 dot-path（如 `today.precipAmountMm`、`aqi`、`p92`；注意 `today.precipProb` 仅 Open-Meteo 数据源有值，和风路径用 `precipAmountMm`），支持 `> >= < <= == !=`；字段缺失视为不满足；缺省条件表示到点必提醒；
 - **调度**：`daily`（每天 HH:mm，可带 IANA 时区）或 `interval`（每 N 分钟，最小 5）；scheduler 按 `AUTOMATION_SCAN_CRON`（默认每 10 分钟）扫描到期任务；
-- **投递**：条件满足时走 Profile 私有通知通道（静默时段、outbox、`notify.pull` 兜底全部适用）；dedupe key 含任务本地日期，同一任务每个本地日期最多主动提醒一次；
+- **投递**：条件满足时走 Profile 私有通知通道（静默时段、outbox、`notify.pull` 兜底全部适用）；dedupe key 含任务本地日期，同一任务每个本地日期最多主动提醒一次；daily 任务当日执行失败不影响当日后续重试（失败不记为当日已完成，下次扫描仍会尝试），成功一次后当日不再重复执行；interval 任务失败则等待下一轮扫描；
 - **工具**：`automation.create / list / update / delete / run`；`run` 立即手动执行一次用于验证配置，不影响既定调度节奏；单任务失败只记录 `last_error`，不阻断其它任务。
 
 ## 备份与迁移
@@ -351,6 +351,10 @@ hermes -p "<profile>" webhook subscribe "<route-name>" \
 
 待办强提醒：`schedule.create` 传 `intervalMinutes`（1–10080 分钟，默认 120）与/或 `maxAttempts`（1–99 轮，默认 3）即可开启；到期未确认完成时 scheduler 按间隔重复提醒，直至完成/删除/达上限；重发通知标题带轮次标记（如「（第 2 次提醒，共 3 次）」），与正式提醒可区分。强提醒需要一条 occurrence 正式提醒（`target: "occurrence"` 且 `minutesBefore: 0`，默认提醒即满足），否则创建/更新会被拒绝；`schedule.update` 传 `clearStrongReminder: true` 可随时关闭。注意 `intervalMinutes` 大于等于 recurrence 触发间隔（daily=1440 分钟、weekly=10080 分钟）时重发不生效，会被下一 occurrence 的正式提醒接管（创建/更新会输出可检测的警告；该间隔警告仅适用于未配 `byWeekday` 的 daily/weekly，配了 `byWeekday` 时实际触发间隔不定，无法廉价检测）。
 
+## 油价调价窗口
+
+调价窗口表按年度校准维护：已校准年份使用发改委正式调价日历。超出已校准年份时，系统按「每 10 个工作日」自动生成候选窗口，并在结果中标注「未校准」，请按发改委正式调价日历定期校准。
+
 ## 记账 bookkeeping
 
 `bookkeeping.*` 提供个人账本与多成员共享账本：
@@ -358,9 +362,9 @@ hermes -p "<profile>" webhook subscribe "<route-name>" \
 - **个人账本**：每个 Profile 私有，首次使用记账工具时自动创建，含账户、收支、转账与月度汇总；
 - **共享账本**：`ledger_create` 创建（创建者即 owner），`member_add`/`member_remove` 管理成员（owner 专属，不能移除 owner 本人）；`account_create(ledgerId)` 在账本下创建**共享账户**（如家庭公共资金池），余额全员共享可见，任意成员可记账；
 - **流水**：`entry_add`/`entry_list`/`entry_get`/`entry_update`/`entry_delete`；金额单位是元（>0，最多两位小数，存储为分）；`transfer` 需要两个不同账户；修改/删除用 `version` 乐观锁，冲突后重新读取再重试。改/删权限：记录人本人，或共享账本 owner；
-- **余额**：永不落库，由全部流水实时派生（含转账双边），跨账本转账自动记入共享账本使双方成员可见；
+- **余额**：永不落库，由全部流水实时派生（含转账双边）。跨账本转账为**单流水**设计：流水记入共享账本后，对端账本成员通过 `shared_entry` 通知可见该笔变动（通知带对端账户/账本信息），但对端账本的流水列表/汇总**不包含**该条目；
 - **通知**：共享账本内记账/修改/删除会通知除记录人外的每个成员；每月 1 号（`BOOKKEEPING_REPORT_CRON`，默认 09:00）scheduler 推送上月个人 + 各共享账本收支汇总，上月无流水的 Profile 静默跳过；
-- **汇总**：`summary` 返回指定月（`yyyy-LL`，按配置时区切自然月）的收入/支出/结余、分类聚合与账户余额清单（单位为元）。
+- **汇总**：`summary` 返回指定月（`yyyy-LL`，按配置时区切自然月）的收入/支出/结余、分类聚合与账户余额清单（单位为元）；其中**账户余额为当前实时值，非所选月份月末快照**。
 
 ## 工具一览
 

@@ -103,10 +103,10 @@ Profile notification 与对应 delivery 在同一个 SQLite 事务中创建。SQ
 
 重试是有限的：
 
-- 明确 HTTP 非 2xx 失败最多尝试 5 次，每次生成新的 request generation；
-- 网络超时、断连等结果不确定失败最多尝试 3 次，复用相同 `X-Request-ID`；
-- 退避间隔为 1 分钟、5 分钟、15 分钟、1 小时，后续间隔封顶 1 小时；
-- 不确定请求接近 Hermes 幂等窗口，或达到对应次数上限后，delivery 转为 `fallback`。
+- 明确 HTTP 非 2xx 失败最多尝试 5 次，每次生成新的 request generation（可到达 15 分钟、1 小时档）；
+- 网络超时、断连等结果不确定（传输）失败最多尝试 3 次即转 `fallback`，只经过 1 分钟、5 分钟两档，且复用相同 `X-Request-ID`；
+- 退避间隔为 1 分钟、5 分钟、15 分钟、1 小时，后续间隔封顶 1 小时（15 分钟、1 小时两档仅对「确认 HTTP 非 2xx」路径可达）；
+- 不确定请求接近 55 分钟 Hermes 幂等窗口，或达到对应次数上限后，delivery 转为 `fallback`（传输失败路径同时受幂等窗口约束，窗口内超期行先被幂等扫描置为 `fallback`）。
 
 这套机制提供持久化、去重键和有界重试，但网络与目标平台不具备 exactly-once 保证。`X-Request-ID` 用于降低不确定结果下的重复风险，不能被描述为绝对不重复。
 
@@ -117,7 +117,7 @@ route 缺失或变化时，旧的未完成 delivery 会转为 `fallback`；同�
 ## 4b. 静默时段、snooze 与通知管理
 
 - **静默时段**：`profile_settings` 表按 Profile 存储 `quiet_start/quiet_end/timezone`（`notify.quiet_hours` 工具读写）。投递循环每轮计算处于静默窗口的 Profile 集合（支持跨午夜窗口，如 22:00–07:00），这些 Profile 本轮完全不尝试主动投递；已排队 delivery 保持 pending，窗口结束后下一 tick 自动补投。`notify.pull` 是用户主动拉取，不受静默时段限制。
-- **snooze（notify.snooze）**：`profile_notification_deliveries.not_before` 列（v5 迁移新增）为推迟投递的生效点；claim 条件同时要求 `next_attempt_at` 与 `not_before` 均到期。snooze 只作用于 pending/failed/fallback 行；对 `request_started_at` 落在 55 分钟幂等窗口内的不确定失败拒绝 snooze，避免以新 Request-ID 重复投递。snooze 重置 attempts/transport_failures 但保持 request_generation（不确定路径复用同一 X-Request-ID）。
+- **snooze（notify.snooze）**：`profile_notification_deliveries.not_before` 列（v5 迁移新增）为推迟投递的生效点；claim 条件同时要求 `next_attempt_at` 与 `not_before` 均到期。snooze 只作用于 pending/failed/fallback 行；对 `request_started_at` 落在 55 分钟幂等窗口内的不确定失败拒绝 snooze（窗口内失败结果不确定，换新 Request-ID 可能重复投递）。能通过窗口校验的行 `request_started_at` 必已过期，因此 snooze 重置 attempts/transport_failures，并把 `request_started_at` 置 NULL、`request_generation + 1`（与 route 恢复重新入队同口径），重启幂等窗口并用新 `X-Request-ID` 投递。
 - **cancel（notify.cancel）**：把 pending/failed/fallback 行置为终态 `cancelled` 并写入 read，防止 route 漂移恢复重新入队，也让 `notify.pull` 不再复述。
 - **list（notify.list）**：只读列出最近 Profile 通知及各 route 投递状态，用于排查与挑选 snooze/cancel 目标。
 

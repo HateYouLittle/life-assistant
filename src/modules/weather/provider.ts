@@ -264,7 +264,7 @@ export async function fetchCurrent(lat: number, lon: number, city?: string): Pro
   };
 }
 
-export async function fetchForecast(lat: number, lon: number, days = 3, city?: string): Promise<ForecastDay[]> {
+export async function fetchForecast(lat: number, lon: number, days = 3, city?: string, timezone = config.timezone): Promise<ForecastDay[]> {
   if (config.qweatherKey && days <= 7) {
     try {
       const loc = city ? await qweatherGeo(city) : null;
@@ -303,9 +303,12 @@ export async function fetchForecast(lat: number, lon: number, days = 3, city?: s
       console.error(`[weather] QWeather forecast failed, fallback to Open-Meteo: ${(e as Error).message}`);
     }
   }
+  // L9：显式传简报同一时区切日（Open-Meteo 接受 IANA 名，如 Asia/Shanghai）。
+  // timezone=auto 会按坐标当地时区切日，与简报 identity 的 config.timezone 本地日
+  // 错开时「今日」语义错位（如旅行时坐标时区 ≠ 简报时区）。
   const r = await httpJson<{ daily?: Record<string, unknown> }>(
     `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}` +
-      `&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max&forecast_days=${days}&timezone=auto`,
+      `&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max&forecast_days=${days}&timezone=${encodeURIComponent(timezone)}`,
   );
   const d = r.daily;
   if (!d || typeof d !== "object") {

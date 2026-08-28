@@ -170,6 +170,84 @@ test("snooze rejects uncertain in-flight failures within the idempotency window"
   assert.equal(deliveryStatus("mgmt:uncertain:1"), "pending");
 });
 
+test("snooze at the 55-minute window boundary resets the idempotency window and bumps request generation", async () => {
+  // 自包含隔离：清掉 profile-a 其余遗留的未完成投递，避免到期扫描捎带投递（与
+  // cancelOtherDeliveries 同口径），保证 summary/请求计数只反映本用例。
+  db.prepare(`
+    UPDATE profile_notification_deliveries
+    SET status = 'cancelled'
+    WHERE profile_id = 'profile-a' AND status IN ('pending', 'failed', 'fallback', 'sending')
+  `).run();
+  await publishProfile({ profileId: "profile-a", source: "schedule", title: "窗口边界", body: "边界内拒绝，边界外重置", dedupeKey: "mgmt:snooze-window:1" });
+  const notificationId = notificationIdFor("mgmt:snooze-window:1");
+  db.prepare(`
+    UPDATE profile_notification_deliveries
+    SET status = 'failed', request_started_at = ?, request_generation = 1, attempts = 2, transport_failures = 2
+    WHERE profile_id = ? AND notification_id = ?
+  `).run("2027-03-02T10:00:00.000Z", "profile-a", notificationId);
+
+  // 窗口内（request_started_at 距今 < 55 分钟）：拒绝。
+  assert.throws(
+    () => snoozeProfileNotificationDelivery("profile-a", notificationId, 10, new Date("2027-03-02T10:54:00.000Z")),
+    /不确定/,
+  );
+
+  // 恰好 55 分钟边界（request_started_at == 现在 - 55min）：允许，且幂等窗口/request_generation 重置。
+  const atBoundary = snoozeProfileNotificationDelivery("profile-a", notificationId, 10, new Date("2027-03-02T10:55:00.000Z"));
+  assert.equal(atBoundary.snoozedUntil, "2027-03-02T11:05:00.000Z");
+  const row = db.prepare(`
+    SELECT status, attempts, transport_failures, request_started_at, request_generation, next_attempt_at
+    FROM profile_notification_deliveries
+    WHERE profile_id = ? AND notification_id = ?
+  `).get("profile-a", notificationId) as {
+    status: string;
+    attempts: number;
+    transport_failures: number;
+    request_started_at: string | null;
+    request_generation: number;
+    next_attempt_at: string;
+  };
+  assert.equal(row.status, "pending");
+  assert.equal(row.attempts, 0);
+  assert.equal(row.transport_failures, 0);
+  assert.equal(row.request_started_at, null, "snooze 后幂等窗口必须重置，不得沿用旧 55 分钟窗口");
+  assert.equal(row.request_generation, 2, "snooze 后必须换代，投递使用新 X-Request-ID");
+  assert.equal(row.next_attempt_at, "2027-03-02T11:05:00.000Z");
+
+  // 到期投递使用新 generation 的 X-Request-ID（a2），证明幂等窗口确实重启。
+  const requests: Array<Headers> = [];
+  const headerCapturingFetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+    requests.push(new Headers(init?.headers));
+    return new Response("ok", { status: 200 });
+  }) as typeof fetch;
+  const summary = await deliverPendingProfileNotifications({
+    at: new Date("2027-03-02T11:05:00.000Z"),
+    profileId: "profile-a",
+    fetchImpl: headerCapturingFetch,
+    clock: () => new Date("2027-03-02T11:05:00.000Z"),
+  });
+  assert.equal(summary.sent, 1);
+  assert.match(requests[0].get("X-Request-ID") ?? "", /:a2$/);
+});
+
+test("notify.pull tool returns count plus the full notifications array with title/body", async () => {
+  await publishProfile({ profileId: "profile-a", source: "schedule", title: "拉取工具返回正文", body: "工具结果必须包含通知正文", dedupeKey: "mgmt:pull-tool:1" });
+  const tool = notifyModule.tools!.find((entry) => entry.name === "pull")!;
+  const result = await tool.handler({}, { id: "profile-a" });
+  assert.equal(result.isError, undefined);
+  const payload = JSON.parse((result.content[0] as { text: string }).text) as {
+    count: number;
+    notifications: Array<{ id: number; title: string; body: string; source: string; scope: string; time: string }>;
+  };
+  assert.equal(payload.count, payload.notifications.length, "count 必须等于 notifications.length");
+  const target = payload.notifications.find((notice) => notice.title === "拉取工具返回正文");
+  assert.ok(target, "pull 结果应包含刚发布的通知");
+  assert.equal(target.body, "工具结果必须包含通知正文");
+  assert.equal(target.scope, "profile");
+  assert.equal(target.source, "schedule");
+  assert.ok(Number.isInteger(target.id) && target.time.length > 0, "通知应带 id 与 time");
+});
+
 test("snooze on a sent notification explains there is nothing to defer", async () => {
   await publishProfile({ profileId: "profile-a", source: "schedule", title: "已投递通知", body: "已送达", dedupeKey: "mgmt:sent:1" });
   const notificationId = notificationIdFor("mgmt:sent:1");
@@ -187,6 +265,13 @@ test("snooze on a sent notification explains there is nothing to defer", async (
 });
 
 test("cancel stops pending delivery and keeps the notification out of notify.pull", async () => {
+  // 自包含：清掉 profile-a 其余遗留的未完成投递（含 sending），消除跨用例顺序依赖——
+  // `attempted === 0` 断言不得依赖前一用例的投递副作用吃掉遗留 pending 行（L31）。
+  db.prepare(`
+    UPDATE profile_notification_deliveries
+    SET status = 'cancelled'
+    WHERE profile_id = 'profile-a' AND status IN ('pending', 'failed', 'fallback', 'sending')
+  `).run();
   await publishProfile({ profileId: "profile-a", source: "schedule", title: "取消投递", body: "用户不需要这条提醒", dedupeKey: "mgmt:cancel:1" });
   const notificationId = notificationIdFor("mgmt:cancel:1");
 

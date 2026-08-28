@@ -202,6 +202,26 @@ function normalizeRecurrence(input: ScheduleInput, calendar: CalendarType, type:
   if (raw.count !== undefined && raw.until !== undefined) {
     throw new Error("count and until are mutually exclusive");
   }
+  // L38：与 MCP 层 schema（schedule/index.ts recurrenceSchema）同一口径的范围校验。
+  // assistant.import 的 recurrence 是 z.unknown() 透传，直调 service 的路径不得绕过——
+  // 读取侧 sanitizeRecurrence 会静默丢弃越界值，写入/读取口径不一致会让合法值被吞。
+  const WEEKDAYS = ["SU", "MO", "TU", "WE", "TH", "FR", "SA"];
+  if (raw.byWeekday !== undefined) {
+    if (!Array.isArray(raw.byWeekday)
+      || raw.byWeekday.some((day) => typeof day !== "string" || !WEEKDAYS.includes(day))) {
+      throw new Error("byWeekday must be an array of SU/MO/TU/WE/TH/FR/SA");
+    }
+  }
+  if (raw.byMonthDay !== undefined) {
+    if (!Number.isInteger(raw.byMonthDay) || (raw.byMonthDay as number) < 1 || (raw.byMonthDay as number) > 31) {
+      throw new Error("byMonthDay must be an integer between 1 and 31");
+    }
+  }
+  if (raw.count !== undefined) {
+    if (!Number.isInteger(raw.count) || (raw.count as number) < 1) {
+      throw new Error("count must be a positive integer");
+    }
+  }
   const policy = input.leapMonthPolicy ?? (input.isLeapMonth ? "leap" : "normal");
   // N3/D1-A：both/prefer-leap 未实现，输入路径明确拒绝（MCP schema 已只开放 normal/leap，
   // 此处兜底直接调用 service 的路径）

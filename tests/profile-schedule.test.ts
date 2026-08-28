@@ -117,9 +117,15 @@ test("push routes accept only strong loopback webhook configurations", () => {
 });
 
 test("Profile context is required and never falls back to default", () => {
+  // L28：删除/恢复 HERMES_PROFILE 必须成对（try/finally），保证任何断言失败都不污染后续用例。
+  const original = process.env.HERMES_PROFILE;
   delete process.env.HERMES_PROFILE;
-  assert.throws(() => requireProfileContext(), /HERMES_PROFILE/);
-  process.env.HERMES_PROFILE = "profile-a";
+  try {
+    assert.throws(() => requireProfileContext(), /HERMES_PROFILE/);
+  } finally {
+    if (original === undefined) delete process.env.HERMES_PROFILE;
+    else process.env.HERMES_PROFILE = original;
+  }
   assert.equal(requireProfileContext().id, "profile-a");
 });
 
@@ -775,7 +781,15 @@ test("a route change never re-enqueues a notification that was already sent", as
 });
 
 test("removed routes do not consume delivery batch capacity", async () => {
-  db.prepare("UPDATE profile_notification_deliveries SET status = 'cancelled'").run();
+  // L30：只取消本用例命名空间（push:removed-route:* / push:valid-after-stale）之外的既有
+  // deliveries，不再无条件清全表；本用例自己的行在下方发布后才产生，语义与旧行为一致。
+  db.prepare(`
+    UPDATE profile_notification_deliveries SET status = 'cancelled'
+    WHERE notification_id NOT IN (
+      SELECT id FROM profile_notifications
+      WHERE dedupe_key LIKE 'push:removed-route:%' OR dedupe_key = 'push:valid-after-stale'
+    )
+  `).run();
   for (let index = 0; index < 101; index += 1) {
     await publishProfile({ profileId: "profile-a", source: "schedule", title: `Removed route ${index}`, body: "stale route", dedupeKey: `push:removed-route:${index}` });
   }
@@ -858,12 +872,13 @@ test("QQ webhook delivery uses HMAC V2 and marks the outbox sent", async () => {
 test("each webhook request uses a fresh HMAC timestamp", async () => {
   await publishProfile({ profileId: "profile-a", source: "schedule", title: "Batch one", body: "body one", dedupeKey: "push:batch:1" });
   await publishProfile({ profileId: "profile-a", source: "schedule", title: "Batch two", body: "body two", dedupeKey: "push:batch:2" });
-  const ids = db.prepare(
-    "SELECT id FROM profile_notifications WHERE profile_id = ? AND dedupe_key IN (?, ?) ORDER BY id",
-  ).all("profile-a", "push:batch:1", "push:batch:2") as Array<{ id: number }>;
-  db.prepare(
-    "UPDATE profile_notification_deliveries SET status = 'cancelled' WHERE notification_id NOT IN (?, ?)",
-  ).run(ids[0].id, ids[1].id);
+  // L30：投递隔离改按本用例 dedupe_key 定向保留（其余历史 deliveries 取消），不再依赖裸 id 宽扫。
+  db.prepare(`
+    UPDATE profile_notification_deliveries SET status = 'cancelled'
+    WHERE notification_id NOT IN (
+      SELECT id FROM profile_notifications WHERE profile_id = ? AND dedupe_key IN (?, ?)
+    )
+  `).run("profile-a", "push:batch:1", "push:batch:2");
   const clockValues = [
     new Date("2100-01-02T00:00:00.000Z"),
     new Date("2100-01-02T00:05:01.000Z"),
@@ -889,9 +904,13 @@ test("failed QQ delivery waits for backoff before retrying", async () => {
   const notification = db.prepare(
     "SELECT id FROM profile_notifications WHERE profile_id = ? AND dedupe_key = ?",
   ).get("profile-a", "push:retry:a") as { id: number };
-  db.prepare(
-    "UPDATE profile_notification_deliveries SET status = 'cancelled' WHERE NOT (profile_id = ? AND notification_id = ?)",
-  ).run("profile-a", notification.id);
+  // L30：按本用例 dedupe_key 定向隔离，不再用 (profile_id, notification_id) 反选宽扫。
+  db.prepare(`
+    UPDATE profile_notification_deliveries SET status = 'cancelled'
+    WHERE notification_id NOT IN (
+      SELECT id FROM profile_notifications WHERE profile_id = ? AND dedupe_key = ?
+    )
+  `).run("profile-a", "push:retry:a");
 
   const firstAt = new Date("2100-02-01T00:00:00.000Z");
   let calls = 0;
@@ -948,9 +967,12 @@ test("confirmed HTTP failures may retry a fresh request ID after a one-hour back
   const notification = db.prepare(
     "SELECT id FROM profile_notifications WHERE profile_id = ? AND dedupe_key = ?",
   ).get("profile-b", "push:http-long-retry:b") as { id: number };
-  db.prepare(
-    "UPDATE profile_notification_deliveries SET status = 'cancelled' WHERE NOT (profile_id = ? AND notification_id = ?)",
-  ).run("profile-b", notification.id);
+  db.prepare(`
+    UPDATE profile_notification_deliveries SET status = 'cancelled'
+    WHERE notification_id NOT IN (
+      SELECT id FROM profile_notifications WHERE profile_id = ? AND dedupe_key = ?
+    )
+  `).run("profile-b", "push:http-long-retry:b");
   const requestIds: string[] = [];
   const failingFetch = (async (_url: string | URL | Request, init?: RequestInit) => {
     requestIds.push(new Headers(init?.headers).get("X-Request-ID") ?? "");
@@ -990,9 +1012,12 @@ test("confirmed HTTP failures stop after the bounded retry schedule and remain p
   const notification = db.prepare(
     "SELECT id FROM profile_notifications WHERE profile_id = ? AND dedupe_key = ?",
   ).get("profile-b", "push:http-bounded:b") as { id: number };
-  db.prepare(
-    "UPDATE profile_notification_deliveries SET status = 'cancelled' WHERE NOT (profile_id = ? AND notification_id = ?)",
-  ).run("profile-b", notification.id);
+  db.prepare(`
+    UPDATE profile_notification_deliveries SET status = 'cancelled'
+    WHERE notification_id NOT IN (
+      SELECT id FROM profile_notifications WHERE profile_id = ? AND dedupe_key = ?
+    )
+  `).run("profile-b", "push:http-bounded:b");
   const failingFetch = (async () => new Response("unavailable", { status: 503 })) as typeof fetch;
   const attempts = [
     new Date("2100-02-07T00:00:00.000Z"),
@@ -1019,9 +1044,12 @@ test("a transport timeout reuses the same webhook request ID", async () => {
   const notification = db.prepare(
     "SELECT id FROM profile_notifications WHERE profile_id = ? AND dedupe_key = ?",
   ).get("profile-b", "push:timeout:b") as { id: number };
-  db.prepare(
-    "UPDATE profile_notification_deliveries SET status = 'cancelled' WHERE NOT (profile_id = ? AND notification_id = ?)",
-  ).run("profile-b", notification.id);
+  db.prepare(`
+    UPDATE profile_notification_deliveries SET status = 'cancelled'
+    WHERE notification_id NOT IN (
+      SELECT id FROM profile_notifications WHERE profile_id = ? AND dedupe_key = ?
+    )
+  `).run("profile-b", "push:timeout:b");
 
   const requestIds: string[] = [];
   const timeoutFetch = (async (_url: string | URL | Request, init?: RequestInit) => {
@@ -1054,9 +1082,12 @@ test("three transport-uncertain failures fall back before the idempotency window
   const notification = db.prepare(
     "SELECT id FROM profile_notifications WHERE profile_id = ? AND dedupe_key = ?",
   ).get("profile-b", "push:fallback:b") as { id: number };
-  db.prepare(
-    "UPDATE profile_notification_deliveries SET status = 'cancelled' WHERE NOT (profile_id = ? AND notification_id = ?)",
-  ).run("profile-b", notification.id);
+  db.prepare(`
+    UPDATE profile_notification_deliveries SET status = 'cancelled'
+    WHERE notification_id NOT IN (
+      SELECT id FROM profile_notifications WHERE profile_id = ? AND dedupe_key = ?
+    )
+  `).run("profile-b", "push:fallback:b");
   const requestIds: string[] = [];
   const timeoutFetch = (async (_url: string | URL | Request, init?: RequestInit) => {
     requestIds.push(new Headers(init?.headers).get("X-Request-ID") ?? "");
@@ -1098,9 +1129,12 @@ test("repeated stale claims cannot extend a request ID beyond the idempotency wi
   const notification = db.prepare(
     "SELECT id FROM profile_notifications WHERE profile_id = ? AND dedupe_key = ?",
   ).get("profile-a", "push:old-request:a") as { id: number };
-  db.prepare(
-    "UPDATE profile_notification_deliveries SET status = 'cancelled' WHERE NOT (profile_id = ? AND notification_id = ?)",
-  ).run("profile-a", notification.id);
+  db.prepare(`
+    UPDATE profile_notification_deliveries SET status = 'cancelled'
+    WHERE notification_id NOT IN (
+      SELECT id FROM profile_notifications WHERE profile_id = ? AND dedupe_key = ?
+    )
+  `).run("profile-a", "push:old-request:a");
   db.prepare(`
     UPDATE profile_notification_deliveries
     SET status = 'sending', request_started_at = ?, claimed_at = ?, claim_token = ?
@@ -1134,12 +1168,12 @@ test("repeated stale claims cannot extend a request ID beyond the idempotency wi
 
 test("an in-flight delivery is atomically claimed from other workers and notify.pull", async () => {
   await publishProfile({ profileId: "profile-a", source: "schedule", title: "Claim me", body: "single sender", dedupeKey: "push:claim:a" });
-  const notification = db.prepare(
-    "SELECT id FROM profile_notifications WHERE profile_id = ? AND dedupe_key = ?",
-  ).get("profile-a", "push:claim:a") as { id: number };
-  db.prepare(
-    "UPDATE profile_notification_deliveries SET status = 'cancelled' WHERE NOT (profile_id = ? AND notification_id = ?)",
-  ).run("profile-a", notification.id);
+  db.prepare(`
+    UPDATE profile_notification_deliveries SET status = 'cancelled'
+    WHERE notification_id NOT IN (
+      SELECT id FROM profile_notifications WHERE profile_id = ? AND dedupe_key = ?
+    )
+  `).run("profile-a", "push:claim:a");
 
   let releaseFetch!: () => void;
   let markStarted!: () => void;
@@ -1201,8 +1235,13 @@ test("notify.pull suppression follows only the current Profile route", async () 
   const notification = db.prepare(
     "SELECT id FROM profile_notifications WHERE profile_id = ? AND dedupe_key = ?",
   ).get("profile-a", "push:route-change:a") as { id: number };
-  db.prepare("UPDATE profile_notification_deliveries SET status = 'cancelled' WHERE notification_id <> ?")
-    .run(notification.id);
+  // L30：按本用例 dedupe_key 定向隔离，替代旧的 notification_id <> ? 反选宽扫。
+  db.prepare(`
+    UPDATE profile_notification_deliveries SET status = 'cancelled'
+    WHERE notification_id NOT IN (
+      SELECT id FROM profile_notifications WHERE profile_id = ? AND dedupe_key = ?
+    )
+  `).run("profile-a", "push:route-change:a");
   const time = new Date().toISOString();
   db.prepare(`
     INSERT INTO profile_notification_deliveries(
@@ -1403,9 +1442,12 @@ test("a poison schedule does not starve healthy schedules or existing QQ outbox"
   const existingNotification = db.prepare(
     "SELECT id FROM profile_notifications WHERE profile_id = ? AND dedupe_key = ?",
   ).get("profile-b", "push:existing:b") as { id: number };
-  db.prepare(
-    "UPDATE profile_notification_deliveries SET status = 'cancelled' WHERE NOT (profile_id = ? AND notification_id = ?)",
-  ).run("profile-b", existingNotification.id);
+  db.prepare(`
+    UPDATE profile_notification_deliveries SET status = 'cancelled'
+    WHERE notification_id NOT IN (
+      SELECT id FROM profile_notifications WHERE profile_id = ? AND dedupe_key = ?
+    )
+  `).run("profile-b", "push:existing:b");
 
   const poison = createSchedule(requireProfileContext("profile-a"), {
     title: "poison reminder",
@@ -1501,6 +1543,58 @@ test("more than 500 poison schedules cannot starve a later healthy schedule", as
       .run("healthy after 500 poison schedules");
     db.prepare("DELETE FROM schedules WHERE title LIKE 'poison batch %' OR title = ?")
       .run("healthy after 500 poison schedules");
+  }
+});
+
+test("L4: a delivery failure joins module tick errors in the aggregated rejection", async () => {
+  // 模块 tick 失败（poison trigger）+ 投递失败（打桩）必须一起出现在 AggregateError 里，
+  // 而不是让投递异常吞掉已收集的模块错误（runSchedulerTick 的 errors 通道）。
+  await publishProfile({ profileId: "profile-a", source: "schedule", title: "L4 outbox", body: "delivery row", dedupeKey: "push:l4-delivery:a" });
+  const poison = createSchedule(requireProfileContext("profile-a"), {
+    title: "L4 poison reminder",
+    calendar: "solar",
+    date: "2018-01-01",
+    time: "00:00",
+    timezone: "Asia/Shanghai",
+    reminders: [{ minutesBefore: 0 }],
+  });
+  db.prepare("UPDATE schedules SET enabled = 0 WHERE NOT (profile_id = ? AND id = ?)")
+    .run("profile-a", poison.id);
+  db.exec(`
+    CREATE TRIGGER fail_l4_notification
+    BEFORE INSERT ON profile_notifications
+    WHEN NEW.dedupe_key LIKE 'schedule:profile-a:${poison.id}:%'
+    BEGIN
+      SELECT RAISE(FAIL, 'module tick boom');
+    END;
+  `);
+  const originalPrepare = db.prepare.bind(db);
+  (db as unknown as { prepare: typeof db.prepare }).prepare = ((sql: string) => {
+    if (String(sql).includes("UPDATE profile_notification_deliveries")) {
+      return {
+        run: () => { throw new Error("delivery boom"); },
+      } as unknown as ReturnType<typeof db.prepare>;
+    }
+    return originalPrepare(sql);
+  }) as typeof db.prepare;
+  try {
+    await assert.rejects(
+      () => runSchedulerTick(new Date("2100-08-01T00:00:00.000Z"), fetch),
+      (error: unknown) => {
+        assert.ok(error instanceof AggregateError, `expected AggregateError, got ${String(error)}`);
+        assert.deepEqual(
+          (error as AggregateError).errors.map((entry) => (entry as Error).message).sort(),
+          ["delivery boom", "module tick boom"],
+        );
+        return true;
+      },
+    );
+  } finally {
+    (db as unknown as { prepare: typeof db.prepare }).prepare = originalPrepare;
+    db.exec("DROP TRIGGER IF EXISTS fail_l4_notification");
+    db.prepare("DELETE FROM schedules WHERE profile_id = ? AND id = ?").run("profile-a", poison.id);
+    db.prepare("DELETE FROM profile_notifications WHERE profile_id = ? AND dedupe_key = ?")
+      .run("profile-a", "push:l4-delivery:a");
   }
 });
 
@@ -1824,10 +1918,12 @@ test("阶段D：快照即投递——webhook body 的 title/body 与落库快照
     assert.equal(snapshot.body, "**今日**：25～33℃，晴");
 
     // 只投递本条：取消 profile-a 其他历史 delivery，避免干扰 summary/请求计数。
-    const notification = db.prepare("SELECT id FROM profile_notifications WHERE profile_id = ? AND dedupe_key = ?")
-      .get("profile-a", dedupeKey) as { id: number };
-    db.prepare("UPDATE profile_notification_deliveries SET status = 'cancelled' WHERE NOT (profile_id = ? AND notification_id = ?)")
-      .run("profile-a", notification.id);
+    db.prepare(`
+      UPDATE profile_notification_deliveries SET status = 'cancelled'
+      WHERE notification_id NOT IN (
+        SELECT id FROM profile_notifications WHERE profile_id = ? AND dedupe_key = ?
+      )
+    `).run("profile-a", dedupeKey);
 
     const at = new Date("2100-01-01T00:00:00.000Z");
     const requests: Array<{ url: string; body: string }> = [];
@@ -2518,5 +2614,65 @@ test("updating a schedule with a NULL legacy version self-heals", () => {
     assert.equal(row.version, 2, "写回应自愈为归一化值+1");
   } finally {
     db.prepare("DELETE FROM schedules WHERE profile_id = ? AND id = ?").run(a.id, item.id);
+  }
+});
+
+test("M7: lease refresh failures are contained and never crash the heartbeat", async (t) => {
+  // 真实 SQLITE_BUSY 难以在单测复现：打桩续租 UPDATE 抛错，用假时钟推进 60s 触发心跳，
+  // 断言 fence 的 catch 分支（console.error + 返回 false）让进程存活，而不是未捕获冒泡终止。
+  // startScheduler 会触发 holiday onStart 抓取：预先写入冷却标记，让刷新在抓取前直接失败。
+  const now = new Date().toISOString();
+  for (const year of [new Date().getFullYear(), new Date().getFullYear() + 1]) {
+    db.prepare(`
+      INSERT INTO cn_holiday_year_meta(year, status, source, payload_hash, fetched_at, last_attempt_at, last_error)
+      VALUES(?, 'failed', 'none', '', ?, ?, 'offline: M7 forced cooldown')
+      ON CONFLICT(year) DO UPDATE SET
+        status = 'failed', source = 'none', payload_hash = '', fetched_at = excluded.fetched_at,
+        last_attempt_at = excluded.last_attempt_at, last_error = excluded.last_error
+    `).run(year, now, now);
+  }
+
+  const errors: string[] = [];
+  const originalError = console.error;
+  console.error = (...args: unknown[]) => { errors.push(args.map(String).join(" ")); };
+  const startScheduler = (schedulerModule as Record<string, unknown>).startScheduler as () => {
+    stop(): void;
+    owner: string;
+    started: boolean;
+  };
+  t.mock.timers.enable({ apis: ["setInterval", "setTimeout"] });
+  let handle: { stop(): void; started: boolean } | undefined;
+  try {
+    // 先以真实 db 获取租约并启动（onStart 的 runFenced/fence 同步返回成功）。
+    handle = startScheduler();
+    assert.equal(handle.started, true);
+
+    // 再打桩续租 UPDATE 模拟 SQLITE_BUSY；心跳回调里的 fence 必须吞掉错误。
+    const originalPrepare = db.prepare.bind(db);
+    (db as unknown as { prepare: typeof db.prepare }).prepare = ((sql: string) => {
+      if (String(sql).includes("UPDATE scheduler_lease")) {
+        return {
+          run: () => { throw new Error("SQLITE_BUSY: database is locked"); },
+        } as unknown as ReturnType<typeof db.prepare>;
+      }
+      return originalPrepare(sql);
+    }) as typeof db.prepare;
+    try {
+      t.mock.timers.tick(60_000); // 触发 60s 心跳 → fence → 续租抛错被吞、进程不退出
+      assert.ok(
+        errors.some((line) => line.includes("lease refresh failed")),
+        `fence 必须记录续租失败而不是未捕获冒泡: ${errors.join(" | ")}`,
+      );
+      assert.ok(
+        !errors.some((line) => line.includes("lease lost")),
+        "瞬态续租失败不应被误判为租约丢失而停表",
+      );
+    } finally {
+      (db as unknown as { prepare: typeof db.prepare }).prepare = originalPrepare;
+    }
+  } finally {
+    handle?.stop();
+    t.mock.timers.reset();
+    console.error = originalError;
   }
 });

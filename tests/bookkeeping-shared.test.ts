@@ -60,11 +60,11 @@ test("shared accounts are owner-managed but member-writable", async () => {
   svc.addLedgerMember(a(), ledger.id, "profile-b");
 
   // member 不能创建共享账户
-  assert.throws(() => svc.createAccount(b(), { name: "私建", ledgerId: ledger.id }), /only the ledger owner/i);
+  await assert.rejects(() => svc.createAccount(b(), { name: "私建", ledgerId: ledger.id }), /only the ledger owner/i);
   // 非成员不可见（not found，不泄露存在性）
-  assert.throws(() => svc.createAccount(c(), { name: "外人", ledgerId: ledger.id }), /shared ledger not found/i);
+  await assert.rejects(() => svc.createAccount(c(), { name: "外人", ledgerId: ledger.id }), /shared ledger not found/i);
 
-  const pool = svc.createAccount(a(), { name: "家庭公共资金池", type: "alipay", initialBalance: 1000, ledgerId: ledger.id });
+  const pool = await svc.createAccount(a(), { name: "家庭公共资金池", type: "alipay", initialBalance: 1000, ledgerId: ledger.id });
   assert.equal(pool.kind, "shared");
   assert.equal(pool.ownerProfileId, undefined);
   assert.equal(pool.ledgerId, ledger.id);
@@ -93,7 +93,7 @@ test("shared accounts are owner-managed but member-writable", async () => {
 test("entry write permissions: member edits own only, owner edits anyone's", async () => {
   const ledger = svc.createSharedLedger(a(), "权限测试账本");
   svc.addLedgerMember(a(), ledger.id, "profile-b");
-  const pool = svc.createAccount(a(), { name: "权限资金池", ledgerId: ledger.id });
+  const pool = await svc.createAccount(a(), { name: "权限资金池", ledgerId: ledger.id });
 
   const byA = await svc.addEntry(a(), { type: "expense", amount: 10, category: "A的", accountId: pool.id });
   const byB = await svc.addEntry(b(), { type: "expense", amount: 20, category: "B的", accountId: pool.id });
@@ -122,8 +122,8 @@ test("entry write permissions: member edits own only, owner edits anyone's", asy
 test("cross-ledger transfer attribution follows the plan rules", async () => {
   const ledger = svc.createSharedLedger(a(), "跨账本转账");
   svc.addLedgerMember(a(), ledger.id, "profile-b");
-  const pool = svc.createAccount(a(), { name: "转账资金池", initialBalance: 500, ledgerId: ledger.id });
-  const personal = svc.createAccount(a(), { name: "转账个人钱包", initialBalance: 300 });
+  const pool = await svc.createAccount(a(), { name: "转账资金池", initialBalance: 500, ledgerId: ledger.id });
+  const personal = await svc.createAccount(a(), { name: "转账个人钱包", initialBalance: 300 });
 
   // 个人 → 共享：恰一端共享 → 记入共享账本（全员可见）
   const t1 = await svc.addEntry(a(), { type: "transfer", amount: 100, accountId: personal.id, toAccountId: pool.id });
@@ -133,12 +133,12 @@ test("cross-ledger transfer attribution follows the plan rules", async () => {
   assert.equal(svc.listAccounts(a()).find((x) => x.id === personal.id)!.balanceCents, 20000);
 
   // 共享 → 个人：仍记入共享账本；转入端必须是 b 自己的个人账户
-  const bWallet = svc.createAccount(b(), { name: "b 的个人钱包" });
+  const bWallet = await svc.createAccount(b(), { name: "b 的个人钱包" });
   const t2 = await svc.addEntry(b(), { type: "transfer", amount: 50, accountId: pool.id, toAccountId: bWallet.id });
   assert.equal(t2.ledgerId, ledger.id);
 
   // 两个个人账户互转 → 记录人个人账本，共享账本看不到
-  const otherPersonal = svc.createAccount(a(), { name: "转账个人银行卡" });
+  const otherPersonal = await svc.createAccount(a(), { name: "转账个人银行卡" });
   const t3 = await svc.addEntry(a(), { type: "transfer", amount: 25, accountId: personal.id, toAccountId: otherPersonal.id });
   assert.equal(t3.ledgerId, svc.ensurePersonalLedger(a()).id);
   assert.equal(svc.listEntries(b(), ledger.id).some((e) => e.id === t3.id), false);
@@ -157,7 +157,7 @@ test("cross-ledger transfer attribution follows the plan rules", async () => {
 test("profiles A and B keep isolated personal books while sharing one ledger", async () => {
   const ledger = svc.createSharedLedger(a(), "隔离验证账本");
   svc.addLedgerMember(a(), ledger.id, "profile-b");
-  const pool = svc.createAccount(a(), { name: "隔离资金池", ledgerId: ledger.id });
+  const pool = await svc.createAccount(a(), { name: "隔离资金池", ledgerId: ledger.id });
 
   const aLedgerId = svc.ensurePersonalLedger(a()).id;
   const bLedgerId = svc.ensurePersonalLedger(b()).id;
@@ -179,4 +179,28 @@ test("profiles A and B keep isolated personal books while sharing one ledger", a
   // summary 默认各看各的个人账本
   assert.equal(svc.summarizeLedger(a()).expenseCents, 500);
   assert.equal(svc.summarizeLedger(b()).expenseCents, 700);
+});
+
+test("L15: monthly report shared section only counts entries after the member joined", async () => {
+  const a = requireProfileContext("profile-a");
+  const b = requireProfileContext("profile-b");
+  // owner a 6 月 20 日创建账本；成员 b 7 月 15 日加入（月中）
+  const ledger = svc.createSharedLedger(a, "加入时间截断账本", new Date("2026-06-20T00:00:00.000Z"));
+  svc.addLedgerMember(a, ledger.id, "profile-b", new Date("2026-07-15T00:00:00.000Z"));
+  const pool = await svc.createAccount(a, { name: "截断资金池", ledgerId: ledger.id });
+  // 7 月 10 日（b 加入前）与 7 月 20 日（b 加入后）各一笔
+  await svc.addEntry(a, { type: "expense", amount: 100, category: "早期", accountId: pool.id, occurredAt: "2026-07-10T02:00:00.000Z" });
+  await svc.addEntry(a, { type: "expense", amount: 200, category: "后期", accountId: pool.id, occurredAt: "2026-07-20T02:00:00.000Z" });
+
+  const reportA = svc.buildMonthlyReport("profile-a", "2026-07");
+  const reportB = svc.buildMonthlyReport("profile-b", "2026-07");
+  // a 加入早于 7 月：两笔共享流水都计入
+  const partA = reportA.shared.find((p) => p.ledgerId === ledger.id)!;
+  assert.equal(partA.expenseCents, 30000);
+  assert.equal(partA.incomeCents, 0);
+  // b 7 月 15 日加入：只统计加入之后的流水（7 月 20 日那笔）
+  const partB = reportB.shared.find((p) => p.ledgerId === ledger.id)!;
+  assert.equal(partB.expenseCents, 20000);
+  // 余额仍是实时值，不受截断影响（两笔支出都扣了）
+  assert.equal(partB.balanceCents, -30000);
 });

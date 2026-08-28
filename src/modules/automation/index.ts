@@ -82,7 +82,7 @@ export const automationModule: AssistantModule = {
     withTool(
       {
         name: "run",
-        description: "立即手动执行一次自动任务并返回结果（用于验证配置）。条件满足时会推送一条提醒（同一分钟内重复执行会去重）；手动执行不影响任务的既定调度节奏。",
+        description: "立即手动执行一次自动任务并返回结果（用于验证配置）。条件满足时会推送一条提醒（同一本地日期内重复执行会去重，与 scheduler 扫描的每日去重语义一致）；手动执行不影响任务的既定调度节奏。",
       },
       { id: z.string() },
       (args, context) => ok(runAutomationNow(context ?? requireProfileContext(), args.id)),

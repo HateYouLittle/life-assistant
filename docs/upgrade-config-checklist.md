@@ -166,9 +166,9 @@ JUHE_KEY=
    systemctl --user restart hermes-gateway.service   # 或各 Profile 的 gateway 服务
    npm run start:scheduler
    ```
-   日志应出现 5 行 `[scheduler] registered ...` 模块 cron 注册（weather.daily_brief / weather.alerts_check /
-   oilprice.watch / holiday.refresh_calendar / automation.scan），随后汇总行为 `started, 6 jobs`（多出的 1 个是
-   内置每分钟 tick）；重复启动第二个 scheduler 应以退出码 1 早退。
+   日志应出现 6 行 `[scheduler] registered ...` 模块 cron 注册（weather.daily_brief / weather.alerts_check /
+   oilprice.watch / holiday.refresh_calendar / automation.scan / bookkeeping.monthly_report），随后汇总行为
+   `started, 7 jobs`（多出的 1 个是内置每分钟 tick）；重复启动第二个 scheduler 应以退出码 1 早退。
 
 3. **节假日抓取**
    ```bash

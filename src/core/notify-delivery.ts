@@ -238,6 +238,8 @@ export async function deliverPendingProfileNotifications(options: {
       });
       if (!response.ok) {
         confirmedHttpFailure = true;
+        // 非 2xx 分支不消费响应体：取消流让 undici 连接可复用。
+        response.body?.cancel();
         throw new Error(`HTTP ${response.status}`);
       }
       db.exec("BEGIN IMMEDIATE");
@@ -277,6 +279,11 @@ export async function deliverPendingProfileNotifications(options: {
         ? null
         : row.request_started_at == null ? requestAt.toISOString() : String(row.request_started_at);
       const retrySeconds = [60, 300, 900, 3600][Math.min(attempts - 1, 3)];
+      // 退避阶梯达档位说明（不改档位数组本身）：
+      // - 传输失败（结果不确定，复用同一 X-Request-ID/request_generation）第 3 次即 fallback，
+      //   实际只经过 60s/300s 两档；
+      // - 900s/3600s 档仅对「确认 HTTP 非 2xx」路径可达（每次换代 request_generation + 1）；
+      // - 传输失败路径同时受 55 分钟幂等窗口约束：request_started_at 超期行先被幂等扫描置 fallback。
       const nextAttemptAt = new Date(requestAt.getTime() + retrySeconds * 1000).toISOString();
       const nextStatus = (!confirmedHttpFailure && transportFailures >= 3)
         || (confirmedHttpFailure && attempts >= MAX_CONFIRMED_HTTP_ATTEMPTS)

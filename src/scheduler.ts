@@ -54,7 +54,14 @@ export async function runSchedulerTick(at = new Date(), fetchImpl: typeof fetch 
   }
   // 投递在所有模块扫描之后统一执行；扫描失败不阻断在途投递排空，
   // 汇总错误在投递后抛出（与既有"先扫后投、错后抛"语义一致）。
-  const summary = await deliverPendingProfileNotifications({ at, fetchImpl });
+  let summary: DeliverySummary;
+  try {
+    summary = await deliverPendingProfileNotifications({ at, fetchImpl });
+  } catch (error) {
+    // L4：投递异常加入 errors 一并聚合上报，不得让投递抛错吞掉已收集的模块 tick 错误。
+    errors.push(error);
+    summary = { attempted: 0, sent: 0, failed: 0 };
+  }
   if (errors.length === 1) throw errors[0];
   if (errors.length > 1) throw new AggregateError(errors, `${errors.length} module ticks failed`);
   return summary;
@@ -88,7 +95,14 @@ export function startScheduler(): SchedulerHandle {
   };
   const fence = (): boolean => {
     if (stopped) return false;
-    if (refreshSchedulerLease(owner)) return true;
+    try {
+      if (refreshSchedulerLease(owner)) return true;
+    } catch (error) {
+      // M7：续租写锁失败（如 SQLITE_BUSY）是瞬态错误，不等于租约丢失——
+      // 吞掉并记日志，绝不从 setInterval 心跳未捕获冒泡终止进程。
+      console.error("[scheduler] lease refresh failed:", error);
+      return false;
+    }
     console.error("[scheduler] lease lost; stopping all scheduled work");
     stop();
     return false;
@@ -104,7 +118,12 @@ export function startScheduler(): SchedulerHandle {
     }
   };
   heartbeat = setInterval(() => {
-    fence();
+    try {
+      fence();
+    } catch (error) {
+      // M7：fence 内部已兜住续租抛错；此处兜底防止未来心跳回调改动引入未捕获异常。
+      console.error("[scheduler] heartbeat failed:", error);
+    }
   }, 60_000);
   heartbeat.unref();
   for (const module of getModules()) {
@@ -135,7 +154,8 @@ export function startScheduler(): SchedulerHandle {
   }
   let tickRunning = false;
   tasks.push(cron.schedule("* * * * *", async () => {
-    // 投递最坏 100×10s，比 tick 周期长；跳过重叠 tick 避免故障期负载放大。
+    // L24：投递有界——最多 5 worker、45s 预算（见 notify-delivery），远短于 tick 周期；
+    // 跳过重叠 tick 避免故障期负载放大。
     if (tickRunning) return;
     tickRunning = true;
     try {

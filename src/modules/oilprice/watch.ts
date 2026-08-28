@@ -14,6 +14,8 @@ import { nearestWindowDeviationDays, nextWindow } from "./schedule.js";
 
 const BUSINESS_TIMEZONE = "Asia/Shanghai";
 const FUEL_KEYS: FuelKey[] = ["p92", "p95", "p0"];
+/** 连续 retry 告警阈值：第 RETRY_WARN_THRESHOLD 次连续 retry 起 console.warn */
+const RETRY_WARN_THRESHOLD = 3;
 
 export interface OilPriceState {
   schemaVersion: 1;
@@ -26,6 +28,8 @@ export interface OilPriceState {
   windowDate?: string;
   observedAt: string;
   lastProcessedWindow?: string;
+  /** 连续 retry 计数：发布/基线成功时清除，超过阈值触发告警 */
+  retryCount?: number;
 }
 
 export interface OilPriceStateRepository {
@@ -86,6 +90,7 @@ export function isValidOilPriceState(state: unknown): state is OilPriceState {
     const value = candidate[field];
     if (value !== undefined && typeof value !== "string") return false;
   }
+  if (candidate.retryCount !== undefined && typeof candidate.retryCount !== "number") return false;
   return true;
 }
 
@@ -120,7 +125,13 @@ function completeAndConsistent(observation: OilPriceObservation, state: OilPrice
   let hasAdjustment = false;
   for (const key of FUEL_KEYS) {
     const fuel = observation.fuels[key];
-    if (fuel.previous !== state.fuels[key]) return false;
+    // previous 对照同取 ±1 分口径（cents 比较），避免三油品与本地 state 的 1 分舍入
+    // 偏差导致整窗结果被静默丢弃（与 completeAdjustmentEvidence 保持一致）。
+    const previous = cents(fuel.previous);
+    const stored = cents(state.fuels[key]);
+    if (previous === undefined || stored === undefined) return false;
+    const deviation = previous - stored;
+    if (deviation > 1n || deviation < -1n) return false;
     if (cents(fuel.change) !== 0n) hasAdjustment = true;
   }
   return hasAdjustment;
@@ -167,6 +178,33 @@ export async function observeOilPrice(
     }
   }
 
+  const outcome = await observeOilPriceCore(observation, options);
+
+  // 连续 retry 告警：计数持久化在 state 上（成功发布/基线会由 baseline 覆盖清除）。
+  if (outcome === "retry") {
+    const repository = options.repository ?? oilPriceStateRepository;
+    const current = repository.get(observation.province);
+    if (current && isValidOilPriceState(current)) {
+      const count = (current.retryCount ?? 0) + 1;
+      repository.set({ ...current, retryCount: count });
+      if (count >= RETRY_WARN_THRESHOLD) {
+        console.warn(
+          `[oilprice] ${count} consecutive retries for ${observation.province}; no official result published yet (window ${current.windowDate ?? "unknown"})`,
+        );
+      }
+    }
+  }
+  return outcome;
+}
+
+async function observeOilPriceCore(
+  observation: OilPriceObservation,
+  options: {
+    observedAt: Date;
+    repository?: OilPriceStateRepository;
+    publish?: GlobalPublishFn;
+  },
+): Promise<OilPriceObservationOutcome> {
   const repository = options.repository ?? oilPriceStateRepository;
   let state = repository.get(observation.province);
   if (state && !isValidOilPriceState(state)) {
@@ -190,22 +228,61 @@ export async function observeOilPrice(
   }
   if (observation.windowDate < state.windowDate) return "ignored";
   if (observation.windowDate === state.windowDate) {
-    if (completeAdjustmentEvidence(observation, state)) {
-      const revised = baseline(observation, options.observedAt, state.lastProcessedWindow);
-      if (!revised) return "retry";
-      repository.set(revised);
+    // 同窗完整证据：直接发布正式结果（identity 含 result:${province}:${windowDate}，天然防重不会双发），
+    // 再回写修订基线；修正数据不影响下一个窗口的发布。
+    if (!completeAdjustmentEvidence(observation, state)) return "ignored";
+    let publishedNotice = false;
+    const effective = DateTime.fromISO(observation.providerEffectiveDate, { zone: BUSINESS_TIMEZONE }).startOf("day");
+    if (effective.isValid) {
+      const effectiveAt = effective.toISO({ suppressMilliseconds: true });
+      if (effectiveAt) {
+        await publishNotification(officialResultNotification({
+          province: observation.province,
+          windowDate: observation.windowDate,
+          effectiveAt,
+          generatedAt: observedAt(options.observedAt),
+          provider: observation.provider,
+          source: observation.source,
+          unit: observation.unit,
+          fuels: observation.fuels,
+        }), options.publish ? { publishGlobal: options.publish } : {});
+        publishedNotice = true;
+      }
     }
-    return "ignored";
+    const revised = baseline(observation, options.observedAt, state.lastProcessedWindow);
+    if (!revised) return "retry";
+    repository.set(revised);
+    return publishedNotice ? "published" : "ignored";
   }
 
   const effective = DateTime.fromISO(observation.providerEffectiveDate, { zone: BUSINESS_TIMEZONE }).startOf("day");
   if (!effective.isValid) return "retry";
   const timestamp = options.observedAt.getTime();
   if (timestamp > effective.plus({ hours: 48 }).toMillis()) {
+    // 超窗（>48h）结果不再静默丢弃：证据完整时延迟发布一次（payload/标题标注"延迟发布"，
+    // identity 含 windowDate 天然防重），否则保持原有静默推进基线。
+    let publishedNotice = false;
+    if (completeAdjustmentEvidence(observation, state)) {
+      const effectiveAt = effective.toISO({ suppressMilliseconds: true });
+      if (effectiveAt) {
+        await publishNotification(officialResultNotification({
+          province: observation.province,
+          windowDate: observation.windowDate,
+          effectiveAt,
+          generatedAt: observedAt(options.observedAt),
+          provider: observation.provider,
+          source: observation.source,
+          unit: observation.unit,
+          fuels: observation.fuels,
+          delayed: true,
+        }), options.publish ? { publishGlobal: options.publish } : {});
+        publishedNotice = true;
+      }
+    }
     const nextState = baseline(observation, options.observedAt, state.lastProcessedWindow);
     if (!nextState) return "retry";
     repository.set(nextState);
-    return "baseline";
+    return publishedNotice ? "published" : "baseline";
   }
   if (timestamp < effective.toMillis() || !completeAndConsistent(observation, state)) return "retry";
 
@@ -243,19 +320,27 @@ export async function runOilPriceWatch(options: OilPriceWatchOptions = {}): Prom
   const errors: unknown[] = [];
   const window = nextWindow(at);
   if (!window) {
-    // 窗口表已用尽：仅关闭 advance 通知，油价观测与正式结果链路继续正常跑
+    // 窗口表与候选生成均已用尽（异常情形）：仅关闭 advance 通知，油价观测与正式结果链路继续正常跑
     console.error(
-      "[oilprice] adjustment window table exhausted; advance notices disabled — update ADJUSTMENT_WINDOWS in src/modules/oilprice/schedule.ts",
+      "[oilprice] adjustment window generation exhausted; advance notices disabled — update ADJUSTMENT_WINDOWS in src/modules/oilprice/schedule.ts",
     );
-  } else if (window.hoursUntil < 40) {
-    try {
-      await publishNotification(advanceNoticeNotification({
-        windowDate: window.date,
-        effectiveAt: window.effectiveAt,
-        generatedAt: observedAt(at),
-      }), publishers);
-    } catch (error) {
-      errors.push(error);
+  } else {
+    if (window.calibrated === false) {
+      console.warn(
+        `[oilprice] using uncalibrated candidate adjustment window ${window.date} (10-workday rule; pending official calendar)`,
+      );
+    }
+    if (window.hoursUntil < 40) {
+      try {
+        await publishNotification(advanceNoticeNotification({
+          windowDate: window.date,
+          effectiveAt: window.effectiveAt,
+          generatedAt: observedAt(at),
+          calibrated: window.calibrated,
+        }), publishers);
+      } catch (error) {
+        errors.push(error);
+      }
     }
   }
 

@@ -13,6 +13,10 @@ import {
 export const CHINA_ZONE = "Asia/Shanghai";
 export const DEFAULT_ATTEMPT_COOLDOWN_MS = 6 * 60 * 60 * 1000;
 
+/** 标题年视图覆盖窗口：上一年 12/20 起（含跨年元旦段），本标题年 12/19 止（不含 12 月下旬外发行）。 */
+export const YEAR_VIEW_COVERAGE_START = "12-20";
+export const YEAR_VIEW_COVERAGE_END = "12-19";
+
 export interface HolidayYearRecord {
   year: number;
   source: string;
@@ -121,7 +125,7 @@ export function isHolidayYearReady(year: number): boolean {
  */
 export function isDateCoveredByHolidayData(date: string): boolean {
   const year = Number(date.slice(0, 4));
-  if (date.slice(5, 10) < "12-20") return isHolidayYearReady(year);
+  if (date.slice(5, 10) < YEAR_VIEW_COVERAGE_START) return isHolidayYearReady(year);
   // 12/20-12/31 属于 year+1 标题年：仅 holiday-cn 的标题年文件完整覆盖该窗口；
   // chinese-days 是单自然年数据，year+1 文件不含上一年 12 月行，不能视为覆盖。
   const nextStatus = yearStatus(year + 1);
@@ -137,8 +141,8 @@ export function isDateCoveredByHolidayData(date: string): boolean {
 export function readHolidayYear(year: number): HolidayYearRecord | undefined {
   const meta = yearStatus(year);
   if (!meta?.ready) return undefined;
-  const minDate = `${year - 1}-12-20`;
-  const maxDate = `${year}-12-19`;
+  const minDate = `${year - 1}-${YEAR_VIEW_COVERAGE_START}`;
+  const maxDate = `${year}-${YEAR_VIEW_COVERAGE_END}`;
   const rows = getDatabase().prepare(
     "SELECT date, year, day_type, name FROM cn_holiday_days WHERE date >= ? AND date <= ? ORDER BY date",
   ).all(minDate, maxDate) as Array<{ date: string; year: number; day_type: HolidayDayType; name: string }>;
@@ -354,8 +358,8 @@ export function holidayYearView(year: number): HolidayYearView | undefined {
   // （与 HOLIDAY_WINDOWS 的元旦窗口 from=[12,20] 对齐）。maxDate 收窄到 12/19：
   // 自然年 year 的 12/20-12/31 行属于 year+1 标题年的元旦跨年段，不得外泄进本视图；
   // 中国法定假期没有落在 12/20-12/31 且属于本标题年的安排。
-  const minDate = `${year - 1}-12-20`;
-  const maxDate = `${year}-12-19`;
+  const minDate = `${year - 1}-${YEAR_VIEW_COVERAGE_START}`;
+  const maxDate = `${year}-${YEAR_VIEW_COVERAGE_END}`;
   const holidayRows = getDatabase().prepare(
     "SELECT date, name FROM cn_holiday_days WHERE date >= ? AND date <= ? AND day_type = 'holiday' ORDER BY date",
   ).all(minDate, maxDate) as Array<{ date: string; name: string }>;
@@ -424,7 +428,7 @@ export function nextHoliday(from = new Date()): NextHolidayResult {
       // 保持「缺数据不猜测」。
       const nextViewReady = year + 1 <= local.year + 2
         && holidayYearView(year + 1) !== undefined;
-      if (today >= `${year}-12-20` && nextViewReady) continue;
+      if (today >= `${year}-${YEAR_VIEW_COVERAGE_START}` && nextViewReady) continue;
       return {
         status: "unknown",
         today,
@@ -432,7 +436,7 @@ export function nextHoliday(from = new Date()): NextHolidayResult {
         message: `${year} 年节假日安排尚未获取，scheduler 会在发布窗口自动更新，请稍后重试。`,
       };
     }
-    coveredUntil = `${year}-12-19`;
+    coveredUntil = `${year}-${YEAR_VIEW_COVERAGE_END}`;
     for (const period of view.periods) {
       if (period.endDate < today) continue;
       if (period.startDate <= today) {

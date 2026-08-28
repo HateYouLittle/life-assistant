@@ -73,6 +73,97 @@ test("blank DATA_DIR falls back to the ./data directory", async () => {
   }
 });
 
+test("M8: an invalid IANA timezone fails configuration loading", async () => {
+  for (const value of ["Not/AZone", "Mars/Olympus", "Asia/Shanghai/Extra"]) {
+    await assert.rejects(
+      () => loadConfigWith("LIFE_ASSISTANT_TIMEZONE", value),
+      /LIFE_ASSISTANT_TIMEZONE.*is not a valid IANA timezone/,
+    );
+  }
+});
+
+test("M8: a relative DATA_DIR fails configuration loading", async () => {
+  await assert.rejects(
+    () => loadConfigWith("DATA_DIR", "relative/data"),
+    /DATA_DIR.*must be an absolute path/,
+  );
+  await assert.rejects(
+    () => loadConfigWith("DATA_DIR", "./data"),
+    /DATA_DIR.*must be an absolute path/,
+  );
+});
+
+test("L6: a valid paired LOCATION_LAT/LON is accepted as parsed numbers", async () => {
+  const previousLat = process.env.LOCATION_LAT;
+  const previousLon = process.env.LOCATION_LON;
+  process.env.LOCATION_LAT = "39.9";
+  process.env.LOCATION_LON = "116.4";
+  try {
+    const { config } = await import(`../src/config.js?config-test=${importSequence++}`);
+    assert.equal(config.location.lat, 39.9);
+    assert.equal(config.location.lon, 116.4);
+    assert.equal(config.location.city, "");
+  } finally {
+    if (previousLat === undefined) delete process.env.LOCATION_LAT;
+    else process.env.LOCATION_LAT = previousLat;
+    if (previousLon === undefined) delete process.env.LOCATION_LON;
+    else process.env.LOCATION_LON = previousLon;
+  }
+});
+
+test("L6: non-numeric, out-of-range or unpaired coordinates warn and fall back to unset", async () => {
+  const previousLat = process.env.LOCATION_LAT;
+  const previousLon = process.env.LOCATION_LON;
+  const originalWarn = console.warn;
+  const warnings: string[] = [];
+  console.warn = ((message: string) => {
+    warnings.push(message);
+  }) as typeof console.warn;
+  const loadLocation = async (lat: string | undefined, lon: string | undefined) => {
+    if (lat === undefined) delete process.env.LOCATION_LAT;
+    else process.env.LOCATION_LAT = lat;
+    if (lon === undefined) delete process.env.LOCATION_LON;
+    else process.env.LOCATION_LON = lon;
+    const { config } = await import(`../src/config.js?config-test=${importSequence++}`);
+    return config.location;
+  };
+  try {
+    // 非数字串 → NaN → 非法 → 未配置，并告警
+    let location = await loadLocation("not-a-number", "116.4");
+    assert.equal(location.lat, undefined);
+    assert.equal(location.lon, undefined);
+    assert.ok(warnings.some((line) => line.includes("LOCATION_LAT")), `expected LOCATION_LAT warning: ${warnings.join(" | ")}`);
+    assert.ok(warnings.some((line) => line.includes("pair")), `expected pair warning: ${warnings.join(" | ")}`);
+
+    // 越界纬度 → 未配置
+    location = await loadLocation("91.5", "116.4");
+    assert.equal(location.lat, undefined);
+    assert.equal(location.lon, undefined);
+
+    // 非法经度 → 未配置
+    location = await loadLocation("39.9", "abc");
+    assert.equal(location.lat, undefined);
+    assert.equal(location.lon, undefined);
+
+    // 只给纬度、不给经度 → 未配置 + 成对告警
+    location = await loadLocation("39.9", undefined);
+    assert.equal(location.lat, undefined);
+    assert.equal(location.lon, undefined);
+    assert.ok(warnings.some((line) => line.includes("pair")));
+
+    // 留空串等价未设置
+    location = await loadLocation("", "");
+    assert.equal(location.lat, undefined);
+    assert.equal(location.lon, undefined);
+  } finally {
+    if (previousLat === undefined) delete process.env.LOCATION_LAT;
+    else process.env.LOCATION_LAT = previousLat;
+    if (previousLon === undefined) delete process.env.LOCATION_LON;
+    else process.env.LOCATION_LON = previousLon;
+    console.warn = originalWarn;
+  }
+});
+
 test("non-empty but invalid PROFILE_PUSH_ROUTES_JSON warns once without secrets", async () => {
   const previous = process.env.PROFILE_PUSH_ROUTES_JSON;
   const originalWarn = console.warn;

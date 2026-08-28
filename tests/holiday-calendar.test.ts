@@ -20,6 +20,7 @@ const {
   nextHoliday,
   readHolidayYear,
   refreshHolidayCalendar,
+  YEAR_VIEW_COVERAGE_END,
   yearStatus,
 } = await import("../src/modules/holiday/calendar.js");
 const { parseDataset } = await import("../src/modules/holiday/provider.js");
@@ -184,8 +185,8 @@ test("nextHoliday returns unknown when the next year is not covered", () => {
   db.prepare("DELETE FROM cn_holiday_days WHERE year = ?").run(2026);
   const result = nextHoliday(new Date("2025-12-31T12:00:00+08:00"));
   assert.equal(result.status, "unknown");
-  // H6：ready 年份的覆盖边界与 holidayYearView 一致，到 12-19 为止。
-  assert.equal(result.coveredUntil, "2025-12-19");
+  // H6：ready 年份的覆盖边界与 holidayYearView 一致，到 12-19 为止（L29：引用源码导出常量，避免哨兵漂移）。
+  assert.equal(result.coveredUntil, `2025-${YEAR_VIEW_COVERAGE_END}`);
   assert.match(result.message ?? "", /2026 年节假日安排尚未获取/);
 });
 

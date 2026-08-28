@@ -28,7 +28,8 @@ export interface TianApiOilPrice extends OilPriceBase {
   fuels: Record<FuelKey, AdjustmentFuelPrice>;
   providerEffectiveDate: string;
   windowDate: string;
-  nextWindowDate: string;
+  /** 可选：next_adjustment 缺失/畸形时解析失败仅告警，置 undefined 不废掉整条结果 */
+  nextWindowDate?: string;
 }
 
 export interface JuheOilPrice extends OilPriceBase {
@@ -173,7 +174,14 @@ export async function fetchOilPrice(city: string, options: FetchOilPriceOptions 
       if (!response.result || typeof response.result !== "object") throw new Error("TianAPI market result is missing");
       const result = response.result as Record<string, unknown>;
       const providerEffective = providerDate(result.last_adjusted, "last_adjusted");
-      const nextEffective = providerDate(result.next_adjustment, "next_adjustment");
+      // next_adjustment 为可选容错字段：解析失败仅告警并把 nextWindowDate 置 undefined，
+      // 不废掉整条结果与 adjustmentEvidence（二次审查 P2）。
+      let nextEffective: DateTime<true> | undefined;
+      try {
+        nextEffective = providerDate(result.next_adjustment, "next_adjustment");
+      } catch (error) {
+        console.warn(`[oilprice] TianAPI next_adjustment unreadable; treating next window as unknown: ${errorMessage(error)}`);
+      }
       const providerProvince = typeof result.prov === "string" ? provinceOf(result.prov) : undefined;
       if (providerProvince !== province) {
         throw new Error(`TianAPI province mismatch: requested ${province}, received ${String(result.prov ?? "missing")}`);
@@ -186,7 +194,7 @@ export async function fetchOilPrice(city: string, options: FetchOilPriceOptions 
         source: "TianAPI 成品油市场数据",
         providerEffectiveDate: providerEffective.toISODate(),
         windowDate: providerEffective.minus({ days: 1 }).toISODate(),
-        nextWindowDate: nextEffective.minus({ days: 1 }).toISODate(),
+        nextWindowDate: nextEffective ? nextEffective.minus({ days: 1 }).toISODate() : undefined,
         fuels: {
           p92: adjustmentFuel(result.p92, "p92"),
           p95: adjustmentFuel(result.p95, "p95"),
@@ -219,14 +227,23 @@ export async function fetchOilPrice(city: string, options: FetchOilPriceOptions 
     const hit = response.result.find((item) => {
       if (!item || typeof item !== "object") return false;
       const candidate = (item as Record<string, unknown>).city;
-      return typeof candidate === "string" && (candidate === province || candidate === city.trim());
+      if (typeof candidate !== "string") return false;
+      // 城市名直配优先；否则按归一后的省名匹配，保证与 TianAPI 的 provinceOf 归一口径一致
+      if (candidate === city.trim()) return true;
+      const normalized = provinceOf(candidate);
+      return normalized !== undefined && normalized === province;
     }) as Record<string, unknown> | undefined;
     if (!hit || typeof hit.city !== "string") {
       throw new Error(`oil-price provider does not cover ${province ?? city}${provinceHint}`);
     }
+    const juheProvince = provinceOf(hit.city);
+    if (juheProvince === undefined) {
+      // 归一失败：告警并回退原始城市名，避免数据源切换后 state 以 province 为 key 分裂
+      console.warn(`[oilprice] JUHE city "${hit.city}" could not be normalized to a province; keeping the raw city name`);
+    }
     return {
       adjustmentEvidence: false,
-      province: hit.city,
+      province: juheProvince ?? hit.city,
       unit: UNIT,
       provider: "JUHE",
       source: "聚合数据当前油价",

@@ -24,6 +24,37 @@ function numericOrRaw(value: string | undefined): number | string | undefined {
 
 const cityParam = z.object({ city: z.string().min(1).max(64).optional() });
 
+/**
+ * 每个真实 action 的结果字段白名单（条件 DSL 的 condition.field 校验用，L36）。
+ * 键 = dot-path 叶子字段；weather.forecast 的 days 是数组，用 {i} 通配任意下标
+ * （days.{i}.precipProb 匹配 days.0.precipProb / days.1.precipProb…）。
+ * 新增 action 时必须同步登记其 run() 实际返回的字段名，条件 DSL 与通知引用它们。
+ */
+export const actionConditionFields: Record<string, string[]> = {
+  "weather.current": [
+    "city", "temperature", "apparent", "humidity", "windSpeed", "windSpeedUnit", "weatherText",
+  ],
+  "weather.forecast": [
+    "city",
+    "today.date", "today.tMax", "today.tMin", "today.weatherText",
+    "today.precipProb", "today.precipAmountMm",
+    "days.{i}.date", "days.{i}.tMax", "days.{i}.tMin", "days.{i}.weatherText",
+    "days.{i}.precipProb", "days.{i}.precipAmountMm",
+  ],
+  "airquality.current": ["city", "aqi", "scale", "category", "pm25", "pm10"],
+  "oilprice.current": ["province", "p92", "p95", "p0"],
+};
+
+/** condition.field 是否在 action 的结果字段白名单内（数组下标用 {i} 通配）。 */
+export function isConditionFieldAllowed(action: string, field: string): boolean {
+  const patterns = actionConditionFields[action];
+  if (!patterns) return false;
+  if (patterns.includes(field)) return true;
+  const arrayMatch = /^([A-Za-z]+)\.(\d+)\.(.+)$/.exec(field);
+  if (!arrayMatch) return false;
+  return patterns.includes(`${arrayMatch[1]}.{i}.${arrayMatch[3]}`);
+}
+
 export const automationActions: Record<string, AutomationActionDef> = {
   "weather.current": {
     name: "weather.current",

@@ -61,6 +61,16 @@ test("next adjustment tool data does not promise a fixed announcement time", () 
   assert.doesNotMatch(JSON.stringify(summary), /17:00|前一日|预计公告/);
 });
 
+test("next adjustment tool returns uncalibrated candidate windows outside the static table", () => {
+  // 2027 年静态表未覆盖：工具正常返回候选窗口并标注未校准，不再 fail（H3）
+  const summary = nextAdjustmentSummary(new Date("2027-01-05T01:00:00.000Z"));
+
+  assert.equal(summary?.date, "2027-01-07");
+  assert.equal(summary?.effectiveAt, "2027-01-08T00:00:00+08:00");
+  assert.equal(summary?.calibrated, false);
+  assert.match(summary?.note ?? "", /每 10 个工作日.*未.*校准|未经法定节假日校准/);
+});
+
 test("oil-price watch remains daily at 09:00 in the Shanghai business timezone", () => {
   const module = getModules().find((candidate) => candidate.name === "oilprice");
   const job = module?.jobs?.find((candidate) => candidate.name === "watch");

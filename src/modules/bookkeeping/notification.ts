@@ -27,6 +27,16 @@ export interface SharedEntryPayload {
   actorProfileId: string;
   occurredAt: string;
   generatedAt: string;
+  /** 涉及的账户：expense/income 为 accountId，transfer 含两端（L14）。 */
+  accountId?: string;
+  toAccountId?: string;
+  /** 账户所属共享账本（个人账户缺省）；跨账本转账时标识对端账户/账本（M1）。 */
+  accountLedgerId?: string;
+  toAccountLedgerId?: string;
+  /** update 留痕：accountId/toAccountId 变更前的旧值与原归属账本（M2）。 */
+  previousAccountId?: string;
+  previousToAccountId?: string;
+  previousLedgerId?: string;
 }
 
 export type SharedEntryEnvelope = EnvelopeFor<"bookkeeping.shared_entry", SharedEntryPayload>;
@@ -36,9 +46,22 @@ export interface SharedEntryNotificationInput {
   profileId: string;
   ledgerId: string;
   ledgerName: string;
-  entry: Pick<LedgerEntry, "id" | "type" | "amountCents" | "category" | "note" | "occurredAt" | "updatedAt">;
+  entry: Pick<LedgerEntry, "id" | "type" | "amountCents" | "category" | "note" | "occurredAt" | "updatedAt" | "ledgerId">;
   action: SharedEntryAction;
   actorProfileId: string;
+  /** 端点账户及其所属共享账本（service 侧解析，M1/L14）。 */
+  accounts?: {
+    accountId?: string;
+    toAccountId?: string;
+    accountLedgerId?: string;
+    toAccountLedgerId?: string;
+  };
+  /** update 留痕：变更前的账户与归属账本（M2）。 */
+  previous?: {
+    accountId?: string;
+    toAccountId?: string;
+    ledgerId?: string;
+  };
 }
 
 const ENTRY_TYPE_LABELS = { expense: "支出", income: "收入", transfer: "转账" } as const;
@@ -50,8 +73,14 @@ export function formatYuan(cents: number): string {
 
 export function buildSharedEntryNotification(input: SharedEntryNotificationInput): SharedEntryEnvelope {
   const { profileId, ledgerId, ledgerName, entry, action, actorProfileId } = input;
+  const accounts = input.accounts;
+  const previous = input.previous;
   const categorySuffix = entry.category ? `（${entry.category}）` : "";
   const headline = `${ledgerName} · ${actorProfileId} ${ACTION_VERBS[action]}${ENTRY_TYPE_LABELS[entry.type]} ¥${formatYuan(entry.amountCents)}${categorySuffix}`;
+  // 留痕仅在值确实变化时输出：old ≠ new 才带 previous 字段（M2）。
+  const accountChanged = previous?.accountId !== undefined && previous.accountId !== accounts?.accountId;
+  const toAccountChanged = previous?.toAccountId !== undefined && previous.toAccountId !== accounts?.toAccountId;
+  const ledgerMoved = previous?.ledgerId !== undefined && previous.ledgerId !== entry.ledgerId;
   return {
     kind: "bookkeeping.shared_entry",
     identity: `${ledgerId}:${entry.id}:${action}:${entry.updatedAt}`,
@@ -71,8 +100,20 @@ export function buildSharedEntryNotification(input: SharedEntryNotificationInput
       actorProfileId,
       occurredAt: entry.occurredAt,
       generatedAt: entry.updatedAt,
+      ...(accounts?.accountId !== undefined ? { accountId: accounts.accountId } : {}),
+      ...(accounts?.toAccountId !== undefined ? { toAccountId: accounts.toAccountId } : {}),
+      ...(accounts?.accountLedgerId !== undefined ? { accountLedgerId: accounts.accountLedgerId } : {}),
+      ...(accounts?.toAccountLedgerId !== undefined ? { toAccountLedgerId: accounts.toAccountLedgerId } : {}),
+      ...(accountChanged ? { previousAccountId: previous.accountId } : {}),
+      ...(toAccountChanged ? { previousToAccountId: previous.toAccountId } : {}),
+      ...(ledgerMoved ? { previousLedgerId: previous.ledgerId } : {}),
     },
   };
+}
+
+/** 渲染账户行：共享账户附带所属账本 id，标识跨账本流转（M1）。 */
+function accountLabel(accountId: string, ledgerId?: string): string {
+  return ledgerId ? `${accountId}（账本 ${ledgerId}）` : accountId;
 }
 
 function sharedEntryBlocks(rawPayload: unknown): RenderBlock[] {
@@ -85,6 +126,15 @@ function sharedEntryBlocks(rawPayload: unknown): RenderBlock[] {
     { type: "label", label: "类型", value: ENTRY_TYPE_LABELS[payload.entryType] },
     { type: "label", label: "金额", value: `¥${formatYuan(payload.amountCents)}` },
   ];
+  if (payload.entryType === "transfer") {
+    if (payload.accountId) blocks.push({ type: "label", label: "转出账户", value: accountLabel(payload.accountId, payload.accountLedgerId) });
+    if (payload.toAccountId) blocks.push({ type: "label", label: "转入账户", value: accountLabel(payload.toAccountId, payload.toAccountLedgerId) });
+  } else if (payload.accountId) {
+    blocks.push({ type: "label", label: "账户", value: accountLabel(payload.accountId, payload.accountLedgerId) });
+  }
+  if (payload.previousAccountId) blocks.push({ type: "label", label: "原账户", value: payload.previousAccountId });
+  if (payload.previousToAccountId) blocks.push({ type: "label", label: "原转入账户", value: payload.previousToAccountId });
+  if (payload.previousLedgerId) blocks.push({ type: "label", label: "原账本", value: payload.previousLedgerId });
   if (payload.category) blocks.push({ type: "label", label: "分类", value: payload.category });
   blocks.push({ type: "label", label: "记录人", value: payload.actorProfileId });
   blocks.push({ type: "label", label: "时间", value: localTime });

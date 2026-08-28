@@ -35,7 +35,7 @@ test("shared entry add notifies every member except the actor", async () => {
   const b = requireProfileContext("profile-b");
   const ledger = svc.createSharedLedger(a, "通知家庭账本");
   svc.addLedgerMember(a, ledger.id, "profile-b");
-  const pool = svc.createAccount(a, { name: "通知资金池", ledgerId: ledger.id });
+  const pool = await svc.createAccount(a, { name: "通知资金池", ledgerId: ledger.id });
 
   const at = new Date("2026-08-10T08:00:00.000Z");
   const entry = await svc.addEntry(a, { type: "expense", amount: 35, category: "餐饮", accountId: pool.id }, at);
@@ -87,9 +87,10 @@ test("monthly report aggregates last month and is idempotent per profile+month",
   const c = requireProfileContext("profile-c");
 
   // a：上月个人收支；与 b 共享一个有动态的账本；c 只有安静账本（上月无任何流水）
-  const shared = svc.createSharedLedger(a, "月报共享账本");
-  svc.addLedgerMember(a, shared.id, "profile-b");
-  const pool = svc.createAccount(a, { name: "月报资金池", initialBalance: 400, ledgerId: shared.id });
+  // 显式给出账本创建/成员加入时间（早于 7 月），否则 L15 的 joined_at 截断会排除 7 月流水
+  const shared = svc.createSharedLedger(a, "月报共享账本", new Date("2026-01-15T00:00:00.000Z"));
+  svc.addLedgerMember(a, shared.id, "profile-b", new Date("2026-06-01T00:00:00.000Z"));
+  const pool = await svc.createAccount(a, { name: "月报资金池", initialBalance: 400, ledgerId: shared.id });
   svc.createSharedLedger(c, "安静账本");
 
   const aPersonal = svc.ensurePersonalLedger(a).id;
@@ -142,10 +143,12 @@ test("shared entry notification renders through the registered block renderer", 
   const row = noticesFor("profile-b").find((n) => String(n.dedupe_key) === `bookkeeping:${ledger.id}:${entry.id}:add:${entry.updatedAt}`)!;
   assert.ok(row, "成员通知应已落库");
   assert.equal(row.title, "通知家庭账本 · profile-a 记了一笔支出 ¥12.50（日用）");
+  // 通知 body 含账户信息（共享账户附带所属账本 id，M1/L14）
   assert.equal(row.body, [
     "账本：通知家庭账本",
     "类型：支出",
     "金额：¥12.50",
+    `账户：${pool.id}（账本 ${ledger.id}）`,
     "分类：日用",
     "记录人：profile-a",
     "时间：2026-08-11 16:30",
@@ -159,8 +162,8 @@ test("cross-ledger shared transfer notifies members of both ledgers", async () =
   svc.addLedgerMember(a, ledgerA.id, "profile-b");
   const ledgerB = svc.createSharedLedger(a, "双账本B");
   svc.addLedgerMember(a, ledgerB.id, "profile-c");
-  const poolA = svc.createAccount(a, { name: "A池", ledgerId: ledgerA.id });
-  const poolB = svc.createAccount(a, { name: "B池", ledgerId: ledgerB.id });
+  const poolA = await svc.createAccount(a, { name: "A池", ledgerId: ledgerA.id });
+  const poolB = await svc.createAccount(a, { name: "B池", ledgerId: ledgerB.id });
 
   // 流水归属源账本 A，但转账两端账本的成员（b、c）都要收到通知
   const t = await svc.addEntry(a, { type: "transfer", amount: 10, accountId: poolA.id, toAccountId: poolB.id });
@@ -193,4 +196,97 @@ test("moving an entry to another ledger notifies the source ledger members too",
   // 原账本成员 b（否则流水「凭空消失」）与目标账本成员 c 都收到 update 通知
   assert.ok(keysOf("profile-b").some((k) => k.startsWith(`bookkeeping:${ledgerA.id}:${entry.id}:update:`)));
   assert.ok(keysOf("profile-c").some((k) => k.startsWith(`bookkeeping:${ledgerB.id}:${entry.id}:update:`)));
+});
+
+test("M1: cross-ledger transfer notification payload carries both endpoint accounts and their ledgers", async () => {
+  const a = requireProfileContext("profile-a");
+  const ledgerA = svc.createSharedLedger(a, "M1账本A");
+  svc.addLedgerMember(a, ledgerA.id, "profile-b");
+  const ledgerB = svc.createSharedLedger(a, "M1账本B");
+  svc.addLedgerMember(a, ledgerB.id, "profile-c");
+  const poolA = await svc.createAccount(a, { name: "M1-A池", ledgerId: ledgerA.id });
+  const poolB = await svc.createAccount(a, { name: "M1-B池", ledgerId: ledgerB.id });
+
+  const t = await svc.addEntry(a, { type: "transfer", amount: 10, accountId: poolA.id, toAccountId: poolB.id });
+  assert.equal(t.ledgerId, ledgerA.id);
+
+  // b（账本 A 成员）的通知：payload 含两端账户及其所属共享账本（对端账本信息可见）
+  const bRow = noticesFor("profile-b").find((n) => String(n.dedupe_key).includes(`${t.id}:add:`))!;
+  assert.ok(bRow, "b 应收到转账通知");
+  const bEnv = JSON.parse(String(bRow.envelope));
+  assert.equal(bEnv.payload.accountId, poolA.id);
+  assert.equal(bEnv.payload.toAccountId, poolB.id);
+  assert.equal(bEnv.payload.accountLedgerId, ledgerA.id);
+  assert.equal(bEnv.payload.toAccountLedgerId, ledgerB.id);
+
+  // c（账本 B 成员）的通知同样携带两端账本信息
+  const cRow = noticesFor("profile-c").find((n) => String(n.dedupe_key).includes(`${t.id}:add:`))!;
+  assert.ok(cRow, "c 应收到转账通知");
+  const cEnv = JSON.parse(String(cRow.envelope));
+  assert.equal(cEnv.payload.accountId, poolA.id);
+  assert.equal(cEnv.payload.accountLedgerId, ledgerA.id);
+  assert.equal(cEnv.payload.toAccountLedgerId, ledgerB.id);
+});
+
+test("M2: moving a shared entry to another ledger requires owner; owner's move carries audit trail", async () => {
+  const a = requireProfileContext("profile-a");
+  const b = requireProfileContext("profile-b");
+  const ledger = svc.createSharedLedger(a, "移出留痕账本");
+  svc.addLedgerMember(a, ledger.id, "profile-b");
+  const pool = await svc.createAccount(a, { name: "移出资金池", ledgerId: ledger.id });
+  const aPersonal = await svc.createAccount(a, { name: "a 个人户" });
+  const bPersonal = await svc.createAccount(b, { name: "b 个人户" });
+
+  const entry = await svc.addEntry(b, { type: "expense", amount: 8, category: "家用", accountId: pool.id });
+  assert.equal(entry.ledgerId, ledger.id);
+
+  // 成员（记录人本人但非 owner）想把共享流水改挂个人账户 → 拒绝
+  await assert.rejects(
+    () => svc.updateEntry(b, ledger.id, entry.id, { version: entry.version, accountId: bPersonal.id }),
+    /only the ledger owner can move a shared-ledger entry/i,
+  );
+  // 拒绝后共享账本仍保留该流水
+  assert.equal(svc.getEntry(b, ledger.id, entry.id).ledgerId, ledger.id);
+
+  // 同账本内普通修改不受影响（成员改自己的流水金额仍允许）
+  const sameLedgerEdit = await svc.updateEntry(b, ledger.id, entry.id, { version: entry.version, amount: 9 });
+  assert.equal(sameLedgerEdit.ledgerId, ledger.id);
+
+  // owner 可以把共享流水移出（改挂到 owner 自己的个人账户）
+  const moved = await svc.updateEntry(a, ledger.id, entry.id, { version: sameLedgerEdit.version, accountId: aPersonal.id });
+  assert.equal(moved.ledgerId, svc.ensurePersonalLedger(a).id);
+
+  // 原账本成员 b 收到 update 通知，payload 含账户/账本留痕（old/new accountId 与 old ledgerId）
+  const row = noticesFor("profile-b").find((n) => String(n.dedupe_key).startsWith(`bookkeeping:${ledger.id}:${entry.id}:update:`))!;
+  assert.ok(row, "b 应收到原账本的 update 通知");
+  const env = JSON.parse(String(row.envelope));
+  assert.equal(env.payload.accountId, aPersonal.id);
+  assert.equal(env.payload.previousAccountId, pool.id);
+  assert.equal(env.payload.previousLedgerId, ledger.id);
+  assert.equal(env.payload.ledgerId, ledger.id);
+});
+
+test("M10: creating a shared account with initialBalance notifies members about the opening entry", async () => {
+  const a = requireProfileContext("profile-a");
+  const b = requireProfileContext("profile-b");
+  const ledger = svc.createSharedLedger(a, "期初通知账本");
+  svc.addLedgerMember(a, ledger.id, "profile-b");
+
+  const pool = await svc.createAccount(a, { name: "期初资金池", initialBalance: 300, ledgerId: ledger.id });
+
+  // b 恰好收到一条该账本的 add 通知；创建者 a 自己不收
+  const bRows = noticesFor("profile-b").filter((n) => String(n.dedupe_key).includes(ledger.id) && n.source === "bookkeeping");
+  assert.equal(bRows.length, 1);
+  const aRows = noticesFor("profile-a").filter((n) => String(n.dedupe_key).includes(ledger.id) && n.source === "bookkeeping");
+  assert.equal(aRows.length, 0);
+
+  const row = bRows[0];
+  assert.match(String(row.dedupe_key), /:add:/);
+  assert.equal(row.title, "期初通知账本 · profile-a 记了一笔收入 ¥300.00（期初余额）");
+  const env = JSON.parse(String(row.envelope));
+  assert.equal(env.payload.entryType, "income");
+  assert.equal(env.payload.category, "期初余额");
+  assert.equal(env.payload.amountCents, 30000);
+  assert.equal(env.payload.accountId, pool.id);
+  assert.equal(env.payload.accountLedgerId, ledger.id);
 });

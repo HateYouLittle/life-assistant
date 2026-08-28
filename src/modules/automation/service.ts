@@ -6,7 +6,7 @@ import { getDatabase } from "../../core/database.js";
 import { publishNotification } from "../../core/notification-publisher.js";
 import type { ProfilePublishFn } from "../../core/notifier.js";
 import { asProfileContext, isWellFormedId, requireProfileContext, type ProfileContext } from "../../core/profile.js";
-import { automationActions } from "./actions.js";
+import { automationActions, actionConditionFields, isConditionFieldAllowed } from "./actions.js";
 import { automationResultNotification, resultFields } from "./notification.js";
 import type { AutomationCondition, AutomationItem, AutomationListOptions } from "./types.js";
 
@@ -56,6 +56,30 @@ function validateAction(action: string, params: Record<string, unknown> | undefi
   return { action, params: def.paramsSchema.parse(params ?? {}) };
 }
 
+/**
+ * L36：条件校验 = schema 解析 + 结果字段白名单 + 字符串值只允许 ==/!=。
+ * - field 必须是该 action 结果字段白名单内的 dot-path（数组下标用数字段）；
+ * - value 为字符串时，字典序比较（"9" > "10" 为 true）语义不可控，创建/更新时拒绝
+ *   >、>=、<、<=，只保留 == / !=（数值比较请用数字值）。
+ */
+export function validateCondition(
+  action: string,
+  condition: AutomationCondition | undefined,
+): AutomationCondition | undefined {
+  if (condition === undefined) return undefined;
+  const parsed = automationConditionSchema.parse(condition);
+  if (!isConditionFieldAllowed(action, parsed.field)) {
+    throw new Error(
+      `condition field "${parsed.field}" 不在 action ${action} 的结果字段白名单内` +
+        `（可用字段：${(actionConditionFields[action] ?? []).join(" / ")}）`,
+    );
+  }
+  if (typeof parsed.value === "string" && parsed.op !== "==" && parsed.op !== "!=") {
+    throw new Error(`字符串比较仅支持 == / !=（field "${parsed.field}" op "${parsed.op}"）；请改用数字值做大小比较`);
+  }
+  return parsed;
+}
+
 function rowToItem(row: Record<string, unknown>): AutomationItem {
   return {
     id: String(row.id),
@@ -81,7 +105,7 @@ export function createAutomation(value: ProfileContext | string, input: Automati
     z.string().min(1).max(64).parse(input.action),
     input.params,
   );
-  const condition = input.condition === undefined ? undefined : automationConditionSchema.parse(input.condition);
+  const condition = validateCondition(action, input.condition);
   const schedule = normalizeSchedule(automationScheduleSchema.parse(input.schedule));
   const enabled = input.enabled ?? true;
 
@@ -157,7 +181,7 @@ export function updateAutomation(value: ProfileContext | string, id: string, cha
     ? current.condition
     : changes.condition === null
       ? undefined
-      : automationConditionSchema.parse(changes.condition);
+      : validateCondition(nextAction.action, changes.condition);
   const schedule = changes.schedule === undefined
     ? current.schedule
     : normalizeSchedule(automationScheduleSchema.parse(changes.schedule));
@@ -220,7 +244,13 @@ function getPath(source: unknown, path: string): unknown {
       const index = Number(segment);
       return Number.isInteger(index) && index >= 0 ? acc[index] : undefined;
     }
-    if (typeof acc === "object") return (acc as Record<string, unknown>)[segment];
+    if (typeof acc === "object") {
+      // L36：只取自有属性，且显式拒绝原型链探针段：__proto__/constructor/prototype
+      // 命中即视为字段缺失（条件不满足），杜绝用条件 DSL 探测对象原型链。
+      if (segment === "__proto__" || segment === "constructor" || segment === "prototype") return undefined;
+      const record = acc as Record<string, unknown>;
+      return Object.prototype.hasOwnProperty.call(record, segment) ? record[segment] : undefined;
+    }
     return undefined;
   }, source);
 }
@@ -319,6 +349,41 @@ function recordRun(profileId: string, id: string, at: Date, patch: { lastResult?
   );
 }
 
+/**
+ * 失败路径落库（L34/L35）：
+ * - L35：last_result 显式置 NULL——否则 COALESCE 保留旧的「成功结果」，list 展示出现
+ *   「旧成功结果 + 新错误」并存，lastResult/lastError 语义互斥；
+ * - L34：last_run_at 仅在 interval 语义下推进（避免每个扫描周期重试放大故障）；
+ *   daily 失败不推进——isAutomationDue 的 daily 分支按 lastRunAt 同本地日去重，
+ *   一旦推进会让「一次失败即丢一整天」，与 interval 行为不对称。
+ */
+function recordRunFailure(
+  profileId: string,
+  id: string,
+  at: Date,
+  scheduleType: "daily" | "interval",
+  message: string,
+): void {
+  const advanceLastRun = scheduleType === "interval";
+  const sql = advanceLastRun
+    ? "UPDATE automations SET last_run_at = ?, last_result = NULL, last_error = ?, updated_at = ? WHERE profile_id = ? AND id = ?"
+    : "UPDATE automations SET last_result = NULL, last_error = ?, updated_at = ? WHERE profile_id = ? AND id = ?";
+  const params: unknown[] = advanceLastRun
+    ? [at.toISOString(), message, at.toISOString(), profileId, id]
+    : [message, at.toISOString(), profileId, id];
+  getDatabase().prepare(sql).run(...params as any[]);
+}
+
+/** 损坏行无法完整 hydration 时，尽力判读 schedule 类型以决定失败路径是否推进 last_run_at。 */
+function readScheduleType(row: Record<string, unknown>): "daily" | "interval" {
+  try {
+    const parsed = JSON.parse(String(row.schedule_json ?? "{}")) as { type?: unknown };
+    return parsed.type === "daily" ? "daily" : "interval";
+  } catch {
+    return "interval";
+  }
+}
+
 /** scheduler 扫描：执行所有到期且启用的 automation；单条失败不阻断其余。 */
 export async function runAutomationScan(options: AutomationScanOptions = {}): Promise<AutomationRunOutcome[]> {
   const at = options.at ?? new Date();
@@ -344,8 +409,9 @@ export async function runAutomationScan(options: AutomationScanOptions = {}): Pr
       const message = error instanceof Error ? error.message : String(error);
       const identity = rowToItemId(row);
       console.error(`[automation] ${String(row.profile_id)}/${identity} failed: ${message}`);
-      // 到期即记 last_run_at，避免失败任务每个扫描周期重试放大故障。
-      recordRun(String(row.profile_id), identity, at, { lastError: message });
+      // L34/L35：失败路径 daily 不推进 last_run_at（当日保留可重试），
+      // interval 推进（避免每个扫描周期重试放大故障）；last_result 置 NULL 保互斥。
+      recordRunFailure(String(row.profile_id), identity, at, readScheduleType(row), message);
       outcomes.push({ id: identity, profileId: String(row.profile_id), ran: false, published: false, error: message });
     }
   }
@@ -372,12 +438,15 @@ export async function runAutomationNow(
   const result = await def.run(item.params);
   const conditionMet = item.condition ? evaluateCondition(item.condition, result) : true;
   const timezone = itemTimezone(item);
-  const minuteBucket = DateTime.fromJSDate(at).setZone(timezone).toFormat("yyyy-LL-dd'T'HH:mm");
+  // L37：复用手动执行目标的当日 identity（与 scan 的 `${id}:${localDate}` 同源），
+  // 「同一本地日期最多提醒一次」语义一致；旧 :run: 分钟桶会让同一分钟 scan 与
+  // run 命中同一任务时双键双发，且跨分钟重复手动执行也不去重。
+  const localDate = DateTime.fromJSDate(at).setZone(timezone).toISODate() ?? at.toISOString().slice(0, 10);
   if (conditionMet) {
     const notification = automationResultNotification({
       item,
       fields: resultFields(result),
-      identity: `${item.id}:run:${minuteBucket}`,
+      identity: `${item.id}:${localDate}`,
       generatedAt: at.toISOString(),
       timezone,
     });

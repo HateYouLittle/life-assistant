@@ -5,6 +5,7 @@ import { asProfileContext, isWellFormedId, type ProfileContext } from "../../cor
 import { config } from "../../config.js";
 import { publishNotification } from "../../core/notification-publisher.js";
 import { buildMonthlyReportNotification, buildSharedEntryNotification, type SharedEntryAction } from "./notification.js";
+import { MAX_AMOUNT_YUAN } from "./types.js";
 import type {
   AccountBalanceView,
   AccountCreateInput,
@@ -39,13 +40,16 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
-/** 元 → 分：拒绝非有限数、非正数与两位以上小数（浮点噪声容忍 1e-6）。 */
+/** 元 → 分：拒绝非有限数、非正数、超过 9e12 元（分值超出安全整数范围）与两位以上小数（浮点噪声容忍 1e-6）。 */
 function toCents(amount: number): number {
   if (typeof amount !== "number" || !Number.isFinite(amount)) {
     throw new Error("amount must be a finite number (unit: yuan)");
   }
   const cents = Math.round(amount * 100);
   if (cents <= 0) throw new Error("amount must be greater than 0");
+  if (cents > MAX_AMOUNT_YUAN * 100) {
+    throw new Error(`amount must be at most ${MAX_AMOUNT_YUAN} yuan`);
+  }
   if (Math.abs(amount * 100 - cents) >= 1e-6) throw new Error("amount supports at most 2 decimal places");
   return cents;
 }
@@ -56,10 +60,6 @@ function normalizeTimestamp(value: string | undefined, fallback: string): string
   const parsed = DateTime.fromISO(value, { setZone: true });
   if (!parsed.isValid) throw new Error(`invalid ISO timestamp: ${value}`);
   return parsed.toUTC().toISO()!;
-}
-
-function monthKeyOf(occurredAt: string, timezone: string = config.timezone): string {
-  return DateTime.fromISO(occurredAt, { setZone: true }).setZone(timezone).toFormat("yyyy-LL");
 }
 
 function currentMonthKey(timezone: string = config.timezone): string {
@@ -338,7 +338,7 @@ function requireAccountForAdmin(profile: ProfileContext, accountId: string): Led
   return account;
 }
 
-export function createAccount(value: ProfileContext | string, input: AccountCreateInput, at: Date = new Date()): AccountView {
+export async function createAccount(value: ProfileContext | string, input: AccountCreateInput, at: Date = new Date()): Promise<AccountView> {
   const profile = asProfileContext(value);
   const name = input.name.trim();
   if (!name) throw new Error("account name is required");
@@ -360,7 +360,11 @@ export function createAccount(value: ProfileContext | string, input: AccountCrea
   const id = crypto.randomUUID();
   // 期初流水与账户行同一事务落库；个人账本懒创建自带事务，须放在 BEGIN 之前解析。
   const opening = input.initialBalance !== undefined
-    ? { ledgerId: kind === "shared" ? ledgerId! : ensurePersonalLedger(profile).id, amountCents: toCents(input.initialBalance) }
+    ? {
+        ledgerId: kind === "shared" ? ledgerId! : ensurePersonalLedger(profile).id,
+        amountCents: toCents(input.initialBalance),
+        entryId: crypto.randomUUID(),
+      }
     : null;
   db.exec("BEGIN IMMEDIATE");
   try {
@@ -372,7 +376,7 @@ export function createAccount(value: ProfileContext | string, input: AccountCrea
       // 期初余额 = 一条「期初余额」收入流水，余额口径与普通流水完全一致。
       insertEntryRow({
         ledgerId: opening.ledgerId,
-        id: crypto.randomUUID(),
+        id: opening.entryId,
         profileId: profile.id,
         type: "income",
         amountCents: opening.amountCents,
@@ -390,6 +394,12 @@ export function createAccount(value: ProfileContext | string, input: AccountCrea
   } catch (error) {
     db.exec("ROLLBACK");
     throw error;
+  }
+  // 共享账户的期初流水对其他成员可见但此前不产生任何动态：补发与普通记账
+  // 同路径的 add 通知（除创建者外的成员各一条），避免余额凭空增加（M10）。
+  if (opening && kind === "shared") {
+    const openingEntry = getEntryRow(opening.ledgerId, opening.entryId)!;
+    await notifySharedEntryChange("add", openingEntry, profile.id);
   }
   return withBalance(getAccountRow(id)!);
 }
@@ -419,8 +429,13 @@ export function updateAccount(
 ): AccountView {
   const profile = asProfileContext(value);
   const account = requireAccountForAdmin(profile, accountId);
+  // 显式拒绝空/全空白名称，避免静默回退旧名让用户误以为改名成功（L17）。
+  if (changes.name !== undefined) {
+    const trimmedName = changes.name.trim();
+    if (!trimmedName) throw new Error("account name is required and must not be blank");
+  }
   const merged = {
-    name: changes.name?.trim() || account.name,
+    name: changes.name !== undefined ? changes.name.trim() : account.name,
     type: changes.type ?? account.type,
     archived: changes.archived ?? account.archived,
   };
@@ -489,14 +504,15 @@ function getEntryRow(ledgerId: string, entryId: string): LedgerEntry | undefined
   return row ? rowToEntry(row) : undefined;
 }
 
-function validateCategory(type: EntryType, category: string | undefined): void {
+/** 校验分类约定；allowMissing 时（更新路径）允许分类被清空（expense/income 传空串清除）。 */
+function validateCategory(type: EntryType, category: string | undefined, options: { allowMissing?: boolean } = {}): void {
   if (type === "transfer") {
     if (category !== undefined && category.trim() !== "") {
       throw new Error("transfer entries must not have a category");
     }
     return;
   }
-  if (category === undefined || category.trim() === "") {
+  if (!options.allowMissing && (category === undefined || category.trim() === "")) {
     throw new Error(`category is required for ${type} entries`);
   }
 }
@@ -559,7 +575,8 @@ export async function addEntry(value: ProfileContext | string, input: EntryAddIn
     accountId: input.accountId ?? null,
     toAccountId: input.toAccountId ?? null,
     occurredAt,
-    note: input.note ?? null,
+    // 空串/全空白备注归一为 NULL，避免与「无备注」产生两种等价表示（L12）。
+    note: input.note && input.note.trim() ? input.note : null,
     version: 1,
     createdAt: at.toISOString(),
     updatedAt: at.toISOString(),
@@ -609,8 +626,8 @@ function requireEntryForWrite(profile: ProfileContext, entry: LedgerEntry, ledge
   throw new Error("only the recorder or the ledger owner can modify this entry");
 }
 
-function versionConflictError(entryId: string, expected: number): Error {
-  return new Error(`entry version conflict: expected version ${expected}, refetch the entry and retry`);
+function versionConflictError(entryId: string, expected: number, current: number): Error {
+  return new Error(`entry version conflict: current version is ${current}, expected version ${expected}; refetch the entry and retry`);
 }
 
 /**
@@ -620,11 +637,20 @@ function versionConflictError(entryId: string, expected: number): Error {
  * 时两端成员都通知，避免「余额变了/流水消失却无人知晓」。通知失败记录日志继续，
  * 不回滚已落库的记账（对齐 schedule/tick 的容错风格）。
  */
+/**
+ * 共享账本写路径的成员动态通知：对除记录人外的每个成员各发一条 profile scope
+ * 信封（未配推送路由的成员走 notify.pull 拉取）。通知账本集合按流水账户端点
+ * 推导（extraLedgerIds 供流水改挂账本时补传原账本）：转账两端分属不同共享账本
+ * 时两端成员都通知，避免「余额变了/流水消失却无人知晓」。通知失败记录日志继续，
+ * 不回滚已落库的记账（对齐 schedule/tick 的容错风格）。
+ * previous 供 update 携带变更前的账户/账本信息，作为成员通知的留痕（M2/L14）。
+ */
 async function notifySharedEntryChange(
   action: SharedEntryAction,
   entry: LedgerEntry,
   actorProfileId: string,
   extraLedgerIds: string[] = [],
+  previous?: Pick<LedgerEntry, "ledgerId" | "accountId" | "toAccountId">,
 ): Promise<void> {
   const ledgerIds = new Set<string>([entry.ledgerId, ...extraLedgerIds]);
   for (const accountId of [entry.accountId, entry.toAccountId]) {
@@ -632,6 +658,7 @@ async function notifySharedEntryChange(
     const account = getAccountRow(accountId);
     if (account?.kind === "shared") ledgerIds.add(account.ledgerId!);
   }
+  const accounts = entryAccounts(entry);
   for (const ledgerId of ledgerIds) {
     const ledgerRow = getLedgerRow(ledgerId);
     if (!ledgerRow || (ledgerRow.type as LedgerType) !== "shared") continue;
@@ -649,12 +676,31 @@ async function notifySharedEntryChange(
           entry,
           action,
           actorProfileId,
+          accounts,
+          previous,
         }));
       } catch (error) {
         console.error(`[bookkeeping] shared entry notification failed for ${member.profile_id}:`, (error as Error).message);
       }
     }
   }
+}
+
+/** 流水端点账户及其所属共享账本（个人账户无账本）：通知 payload 的账户/账本信息（M1/L14）。 */
+function entryAccounts(entry: LedgerEntry): {
+  accountId?: string;
+  toAccountId?: string;
+  accountLedgerId?: string;
+  toAccountLedgerId?: string;
+} {
+  const source = entry.accountId !== undefined ? getAccountRow(entry.accountId) : undefined;
+  const target = entry.toAccountId !== undefined ? getAccountRow(entry.toAccountId) : undefined;
+  return {
+    accountId: entry.accountId,
+    toAccountId: entry.toAccountId,
+    accountLedgerId: source?.kind === "shared" ? source.ledgerId : undefined,
+    toAccountLedgerId: target?.kind === "shared" ? target.ledgerId : undefined,
+  };
 }
 
 export async function updateEntry(
@@ -676,17 +722,26 @@ export async function updateEntry(
   const merged = {
     type: entry.type,
     amountCents: changes.amount !== undefined ? toCents(changes.amount) : entry.amountCents,
+    // 空串/全空白分类 → undefined（清空，落 NULL）；「用于清空」的分支在工具层放开空串后可达（L12）。
     category: changes.category !== undefined ? (changes.category.trim() || undefined) : entry.category,
     accountId: changes.accountId !== undefined ? changes.accountId : entry.accountId,
     toAccountId: entry.type === "transfer"
       ? (changes.toAccountId !== undefined ? changes.toAccountId : entry.toAccountId)
       : undefined,
     occurredAt: changes.occurredAt !== undefined ? normalizeTimestamp(changes.occurredAt, entry.occurredAt) : entry.occurredAt,
-    note: changes.note !== undefined ? changes.note : entry.note,
+    // 空串/全空白备注归一为 undefined → 落 NULL（L12）。
+    note: changes.note !== undefined ? (changes.note.trim() ? changes.note : undefined) : entry.note,
   };
-  validateCategory(merged.type, merged.category);
+  // 更新路径允许清空分类（创建仍要求 expense/income 分类必填）。
+  validateCategory(merged.type, merged.category, { allowMissing: true });
   // 类型不可变（v1），transfer 恒双账户、expense/income 恒无 to 账户，归属重算只随账户变化。
   const destinationLedgerId = resolveEntryLedger(profile, merged);
+
+  // 共享账本流水跨账本移出（改挂到其他账本）需 owner 权限：成员即使记录人本人，
+  // 把共享流水改挂个人账户也会让共享余额整体静默变化（M2）。同账本内改账户不受影响。
+  if (ledger.type === "shared" && destinationLedgerId !== ledgerId && ledger.ownerProfileId !== profile.id) {
+    throw new Error("only the ledger owner can move a shared-ledger entry to another ledger");
+  }
 
   const ts = at.toISOString();
   const result = getDatabase().prepare(`
@@ -708,11 +763,15 @@ export async function updateEntry(
     changes.version,
   );
   if (result.changes === 0) {
-    throw versionConflictError(entryId, changes.version);
+    // 区分「条目已不存在（并发删除/被移出）」与「版本不匹配」两条路径（L16）。
+    const stillThere = getEntryRow(ledgerId, entryId);
+    if (!stillThere) throw new Error("entry not found: it was deleted or moved to another ledger concurrently");
+    throw versionConflictError(entryId, changes.version, stillThere.version);
   }
   const updated = getEntryRow(destinationLedgerId, entryId)!;
-  // 流水改挂到其他账本时原账本成员也通知，否则流水在他们那里「凭空消失」。
-  await notifySharedEntryChange("update", updated, profile.id, ledgerId !== destinationLedgerId ? [ledgerId] : []);
+  // 流水改挂到其他账本时原账本成员也通知，否则流水在他们那里「凭空消失」；
+  // 同时携带变更前的账户/账本信息以供留痕（M2/L14）。
+  await notifySharedEntryChange("update", updated, profile.id, ledgerId !== destinationLedgerId ? [ledgerId] : [], entry);
   return updated;
 }
 
@@ -731,7 +790,10 @@ export async function deleteEntry(
     .prepare("DELETE FROM ledger_entries WHERE ledger_id = ? AND id = ? AND version = ?")
     .run(ledgerId, entryId, version);
   if (result.changes === 0) {
-    throw versionConflictError(entryId, version);
+    // 区分「条目已不存在（并发删除）」与「版本不匹配」两条路径（L16）。
+    const stillThere = getEntryRow(ledgerId, entryId);
+    if (!stillThere) throw new Error("entry not found: it was deleted concurrently");
+    throw versionConflictError(entryId, version, stillThere.version);
   }
   await notifySharedEntryChange("delete", entry, profile.id);
   return entry;
@@ -796,9 +858,16 @@ export function summarizeLedger(
 export function buildMonthlyReport(profileId: string, month: string): MonthlyReportData {
   const { start, end } = monthRange(month);
   const db = getDatabase();
-  const entriesIn = (ledgerId: string): LedgerEntry[] =>
-    (db.prepare("SELECT * FROM ledger_entries WHERE ledger_id = ? AND occurred_at >= ? AND occurred_at < ?")
-      .all(ledgerId, start, end) as Row[]).map(rowToEntry);
+  // floorAt 提供共享账本段按成员加入时间截断的下界（L15）：新成员不收到其加入之前的共享流水。
+  const entriesIn = (ledgerId: string, floorAt?: string): LedgerEntry[] => {
+    const rows = floorAt
+      ? db.prepare(
+          "SELECT * FROM ledger_entries WHERE ledger_id = ? AND occurred_at >= ? AND occurred_at < ? AND occurred_at >= ?",
+        ).all(ledgerId, start, end, floorAt)
+      : db.prepare("SELECT * FROM ledger_entries WHERE ledger_id = ? AND occurred_at >= ? AND occurred_at < ?")
+          .all(ledgerId, start, end);
+    return (rows as Row[]).map(rowToEntry);
+  };
 
   const personalRow = db
     .prepare("SELECT * FROM ledgers WHERE type = 'personal' AND owner_profile_id = ?")
@@ -808,14 +877,18 @@ export function buildMonthlyReport(profileId: string, month: string): MonthlyRep
   const personalExpense = personalEntries.filter((e) => e.type === "expense").reduce((s, e) => s + e.amountCents, 0);
 
   const sharedLedgers = (db.prepare(`
-    SELECT l.* FROM ledgers l
+    SELECT l.*, m.joined_at AS caller_joined_at FROM ledgers l
     JOIN ledger_members m ON m.ledger_id = l.id AND m.profile_id = ?
     WHERE l.type = 'shared'
     ORDER BY l.created_at, l.id
-  `).all(profileId) as Row[]).map(rowToLedger);
+  `).all(profileId) as Row[]).map((row): { ledger: Ledger; joinedAt: string } => ({
+    ledger: rowToLedger(row),
+    joinedAt: row.caller_joined_at as string,
+  }));
   let sharedHasEntries = false;
-  const shared: MonthlyReportSharedPart[] = sharedLedgers.map((ledger) => {
-    const entries = entriesIn(ledger.id);
+  const shared: MonthlyReportSharedPart[] = sharedLedgers.map(({ ledger, joinedAt }) => {
+    // 只统计该成员加入（joined_at）之后发生的流水；余额仍为当前实时值。
+    const entries = entriesIn(ledger.id, joinedAt);
     if (entries.length > 0) sharedHasEntries = true;
     return {
       ledgerId: ledger.id,

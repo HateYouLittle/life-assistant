@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  registerNotificationBlocks,
   renderNotification,
   type NotificationEnvelope,
   type NotificationRenderTarget,
@@ -621,5 +622,64 @@ test("平台分支 fallback：最小残缺 payload 遍历全部 4 个 target 恒
     assert.equal(typeof rendered.body, "string");
     assert.ok(rendered.title.length > 0, `${target} title 不得为空`);
     assert.ok(rendered.body.length > 0, `${target} body 不得为空`);
+  }
+});
+
+// ============================================================================
+// L1/L33：未知 kind 的 fallbackBlocks 投影 + 抛错渲染器的绝对兜底
+// ============================================================================
+
+function fallbackEnvelope(kind: string, details: string | undefined): NotificationEnvelope {
+  return {
+    kind,
+    identity: `${kind}:identity`,
+    source: "test",
+    scope: { type: "global" },
+    headline: `headline-${kind}`,
+    generatedAt: "2027-01-01T00:00:00.000Z",
+    ...(details === undefined ? {} : { details }),
+    payload: {},
+  };
+}
+
+test("L33: unregistered kinds render the fallbackBlocks projection on plain and qq-markdown", () => {
+  const envelope = fallbackEnvelope("no.such.kind", "原样保留的官方原文");
+  // fallbackBlocks = [line(headline), raw(details)]：plain 为 headline 行 + raw details。
+  assert.deepEqual(
+    renderNotification(envelope, "plain"),
+    { title: "headline-no.such.kind", body: "headline-no.such.kind\n原样保留的官方原文" },
+  );
+  // qq-markdown 省略与 headline 相同的首行，只保留 raw details。
+  assert.deepEqual(
+    renderNotification(envelope, "qq-markdown"),
+    { title: "# headline-no.such.kind", body: "原样保留的官方原文" },
+  );
+});
+
+test("L33: a registered kind whose renderer throws falls back to the plain projection without throwing", () => {
+  const envelope = fallbackEnvelope("test.boom", "兜底正文");
+  registerNotificationBlocks("test.boom", () => {
+    throw new Error("boom");
+  });
+  const plainFallback = renderNotification(envelope, "plain");
+  assert.deepEqual(plainFallback, { title: "headline-test.boom", body: "兜底正文" });
+  assert.deepEqual(renderNotification(envelope, "qq-markdown"), plainFallback);
+});
+
+test("L1: a throwing renderer never escapes renderNotification on plain or any markdown target", () => {
+  const envelope = fallbackEnvelope("test.renderer.throw", "兜底正文");
+  registerNotificationBlocks("test.renderer.throw", () => {
+    throw new Error("renderer exploded");
+  });
+  const expected = { title: envelope.headline, body: envelope.details ?? "" };
+  const targets: NotificationRenderTarget[] = [
+    "plain",
+    "qq-markdown",
+    "feishu-markdown",
+    "wechat-markdown",
+  ];
+  for (const target of targets) {
+    assert.doesNotThrow(() => renderNotification(envelope, target), `${target} 不得 throw`);
+    assert.deepEqual(renderNotification(envelope, target), expected);
   }
 });

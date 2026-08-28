@@ -28,12 +28,13 @@ export function currentLocation(): Location | null {
   const saved = store.get<Location>(KEY);
   if (saved) {
     // 旧 schema 允许脏数据（空 city、越界/Infinity 坐标）：读取侧校验，
-    // 非法则视为未确认，走重新确认流程，避免天气/油价链路持续失败
+    // 非法则清除存储键并继续走 env 预置兜底（L25：脏数据不得直接 return null，
+    // 否则 env 配置的位置也会被跳过），避免天气/油价链路持续失败。
     const parsed = locationSetSchema.safeParse(saved);
     if (parsed.success) {
       return { ...parsed.data, source: saved.source, confirmedAt: saved.confirmedAt };
     }
-    return null;
+    store.del(KEY);
   }
   // env 预置城市需 trim 后非空且 <=64（N14），与 location.set 的 schema 保持一致
   const envCity = config.location.city.trim();

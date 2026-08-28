@@ -6,6 +6,7 @@ import test from "node:test";
 
 import { config } from "../src/config.js";
 import { resetDatabaseForTests } from "../src/core/database.js";
+import { store } from "../src/core/store.js";
 import { currentLocation, locationSetSchema } from "../src/modules/location/index.js";
 
 test("location.set accepts a detected province while preserving legacy inputs", () => {
@@ -74,4 +75,42 @@ test("currentLocation env branch ignores blank or overlong city", (t) => {
   assert.ok(loc, "valid env city should produce an env-sourced location");
   assert.equal(loc?.city, "北京");
   assert.equal(loc?.source, "env");
+});
+
+test("L25: dirty saved location is cleared and falls through to env presets instead of returning null", (t) => {
+  const original = {
+    dataDir: config.dataDir,
+    city: config.location.city,
+    lat: config.location.lat,
+    lon: config.location.lon,
+  };
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "life-assistant-location-dirty-"));
+  config.dataDir = dataDir;
+  t.after(() => {
+    config.dataDir = original.dataDir;
+    config.location.city = original.city;
+    config.location.lat = original.lat;
+    config.location.lon = original.lon;
+    resetDatabaseForTests();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  // 旧 schema 写的脏数据（空 city + NaN 坐标）。
+  store.set("location:current", {
+    city: "",
+    province: "江西",
+    lat: Number.NaN,
+    lon: 116.4,
+    source: "manual",
+    confirmedAt: "2026-01-01T00:00:00.000Z",
+  });
+  config.location.city = "北京";
+  config.location.lat = 39.9;
+  config.location.lon = 116.4;
+
+  const loc = currentLocation();
+  assert.ok(loc, "脏数据不应让 env 预置位置被跳过");
+  assert.equal(loc?.city, "北京");
+  assert.equal(loc?.source, "env");
+  assert.equal(store.get("location:current"), undefined, "脏数据键应被清除（后续 location.set 重新确认）");
 });

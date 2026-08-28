@@ -65,16 +65,26 @@ test("advance notices materialize once per window across Profile fan-out and rem
     "SELECT profile_id, dedupe_key FROM profile_notifications WHERE source = 'oilprice' ORDER BY profile_id",
   ).all() as Array<{ profile_id: string; dedupe_key: string }>;
   const notices = noticeRows.map(({ profile_id, dedupe_key }) => ({ profile_id, dedupe_key }));
+  // 第二轮观测是同窗完整证据：按新行为发布正式结果（identity 含 windowDate 防重），
+  // advance 仍由 dedupe 保证每窗口只落库一次
   assert.deepEqual(notices, [
     { profile_id: "oil-profile-a", dedupe_key: "oilprice:advance:2026-08-14" },
+    { profile_id: "oil-profile-a", dedupe_key: "oilprice:result:江西:2026-07-31" },
     { profile_id: "oil-profile-b", dedupe_key: "oilprice:advance:2026-08-14" },
+    { profile_id: "oil-profile-b", dedupe_key: "oilprice:result:江西:2026-07-31" },
   ]);
   assert.equal(Number((db.prepare(
     "SELECT count(*) AS count FROM profile_notification_deliveries WHERE status = 'pending'",
-  ).get() as { count: number }).count), 2);
+  ).get() as { count: number }).count), 4);
 
-  assert.deepEqual(pullPending("oil-profile-a").map((notice) => notice.dedupeKey), ["oilprice:advance:2026-08-14"]);
-  assert.deepEqual(pullPending("oil-profile-b").map((notice) => notice.dedupeKey), ["oilprice:advance:2026-08-14"]);
+  assert.deepEqual(pullPending("oil-profile-a").map((notice) => notice.dedupeKey), [
+    "oilprice:advance:2026-08-14",
+    "oilprice:result:江西:2026-07-31",
+  ]);
+  assert.deepEqual(pullPending("oil-profile-b").map((notice) => notice.dedupeKey), [
+    "oilprice:advance:2026-08-14",
+    "oilprice:result:江西:2026-07-31",
+  ]);
   assert.deepEqual(pullPending("oil-profile-a"), []);
 });
 
@@ -99,6 +109,10 @@ test("publisher dedupe prevents a duplicate result when state advancement fails 
     observedAt: new Date("2026-08-15T01:00:00.000Z"),
     repository: flakyRepository,
   }), /fixture state write failure/);
+  // 时序钉住：发布先于状态写——通知已落库（profile fan-out 2 行）而 lastProcessedWindow 仍未写
+  assert.equal(Number((db.prepare(
+    "SELECT count(*) AS count FROM profile_notifications WHERE dedupe_key = ?",
+  ).get(`oilprice:result:${province}:2026-08-14`) as { count: number }).count), 2);
   assert.equal(oilPriceStateRepository.get(province)?.lastProcessedWindow, undefined);
 
   assert.equal(await observeOilPrice(observation(province, true), {

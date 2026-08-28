@@ -296,3 +296,82 @@ test("an unknown province hints at location.detect when JUHE has no coverage", a
     /does not cover 未知地名.*location\.detect/s,
   );
 });
+
+test("TianAPI adopts the result when next_adjustment is missing or malformed", async () => {
+  // next_adjustment 为可选容错字段：解析失败仅告警、nextWindowDate 置 undefined，
+  // 不废掉整条结果与 adjustmentEvidence（二次审查 P2）
+  for (const nextAdjustmentValue of [undefined, "not-a-date", "2026051"]) {
+    const fixture = structuredClone(marketFixture);
+    if (nextAdjustmentValue === undefined) delete fixture.result.next_adjustment;
+    else fixture.result.next_adjustment = nextAdjustmentValue;
+
+    const warnings: string[] = [];
+    const originalWarn = console.warn;
+    console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(" ")); };
+    let result;
+    try {
+      result = await fetchOilPrice("萍乡", {
+        tianapiKey: "fixture-key",
+        juheKey: "",
+        httpJson: async () => fixture,
+      });
+    } finally {
+      console.warn = originalWarn;
+    }
+
+    assert.equal(result.provider, "TianAPI");
+    assert.equal(result.adjustmentEvidence, true);
+    assert.equal(result.windowDate, "2026-07-31");
+    assert.equal(result.nextWindowDate, undefined);
+    assert.ok(warnings.some((line) => line.includes("next_adjustment unreadable")));
+  }
+});
+
+test("JUHE city names normalize to the province like TianAPI", async () => {
+  // JUHE 命中分支同样走 provinceOf 归一，避免数据源切换后 state 以 province 为 key 分裂
+  for (const city of ["江西", "江西省", "萍乡", "萍乡市"]) {
+    const fixture = structuredClone(juheFixture);
+    fixture.result = [{ city, "92h": "7.93", "95h": "8.51", "98h": "10.01", "0h": "7.69" }];
+    const result = await fetchOilPrice("萍乡市安源区", {
+      tianapiKey: "",
+      juheKey: "fallback-key",
+      httpJson: async () => fixture,
+    });
+    assert.equal(result.provider, "JUHE");
+    assert.equal(result.province, "江西", `JUHE city ${city} should normalize to 江西`);
+  }
+});
+
+test("JUHE city names participate in the matching predicate after normalization", async () => {
+  // 命中谓词同步考虑归一后比较：请求"萍乡市安源区"（归一 江西）可命中 city="萍乡市" 的行
+  const fixture = structuredClone(juheFixture);
+  fixture.result = [{ city: "南昌", "92h": "7.93", "95h": "8.51", "98h": "10.01", "0h": "7.69" }];
+  const result = await fetchOilPrice("萍乡市安源区", {
+    tianapiKey: "",
+    juheKey: "fallback-key",
+    httpJson: async () => fixture,
+  });
+  assert.equal(result.provider, "JUHE");
+  assert.equal(result.province, "江西");
+});
+
+test("JUHE unnormalizable city warns and keeps the raw city name", async () => {
+  const fixture = structuredClone(juheFixture);
+  fixture.result = [{ city: "某区", "92h": "7.93", "95h": "8.51", "98h": "10.01", "0h": "7.69" }];
+  const warnings: string[] = [];
+  const originalWarn = console.warn;
+  console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(" ")); };
+  let result;
+  try {
+    result = await fetchOilPrice("某区", {
+      tianapiKey: "",
+      juheKey: "fallback-key",
+      httpJson: async () => fixture,
+    });
+  } finally {
+    console.warn = originalWarn;
+  }
+  assert.equal(result.provider, "JUHE");
+  assert.equal(result.province, "某区");
+  assert.ok(warnings.some((line) => line.includes("could not be normalized")));
+});

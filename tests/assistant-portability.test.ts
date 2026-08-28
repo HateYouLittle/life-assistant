@@ -326,3 +326,55 @@ test("P1: v1/v2 both accepted; out-of-range versions rejected with a clear messa
     /不支持的快照版本 3（当前支持版本 1-2）/,
   );
 });
+
+test("M6: import pre-validates quietHours before any write (no partial import on bad timezone)", () => {
+  const countBefore = db.prepare("SELECT COUNT(*) AS count FROM schedules WHERE profile_id = ?")
+    .get(profile.id) as { count: number };
+  const automationCountBefore = db.prepare("SELECT COUNT(*) AS count FROM automations WHERE profile_id = ?")
+    .get(profile.id) as { count: number };
+  const payload = {
+    format: "life-assistant.export",
+    version: 2,
+    data: {
+      schedules: [{
+        id: "m6-should-not-persist",
+        title: "不应落库的日程",
+        calendar: "solar",
+        date: "2099-06-01",
+        time: "09:00",
+        timezone: "Asia/Shanghai",
+        reminders: [{ id: "r1", minutesBefore: 0 }],
+      }],
+      quietHours: { start: "22:00", end: "07:00", timezone: "Not/AZone" },
+    },
+  };
+  // 非法时区在导入任何条目之前整体失败，而不是「部分导入 + 整体报错」。
+  assert.throws(() => importAssistantExport(profile, payload), /无效时区：Not\/AZone/);
+  const countAfter = db.prepare("SELECT COUNT(*) AS count FROM schedules WHERE profile_id = ?")
+    .get(profile.id) as { count: number };
+  const automationCountAfter = db.prepare("SELECT COUNT(*) AS count FROM automations WHERE profile_id = ?")
+    .get(profile.id) as { count: number };
+  assert.equal(countAfter.count, countBefore.count, "非法 quietHours 时不允许任何日程落库");
+  assert.equal(automationCountAfter.count, automationCountBefore.count, "非法 quietHours 时不允许任何 automation 落库");
+  assert.throws(() => getSchedule(profile, "m6-should-not-persist"), /not found/);
+});
+
+test("L10: export skips a corrupted automation row and flags invalidAutomations instead of failing", () => {
+  // 直接落一行 schedule_json 截断的损坏行：修复前 JSON.parse 会让整个导出抛出。
+  db.prepare(`
+    INSERT INTO automations(profile_id, id, name, action, params_json, condition_json, schedule_json, enabled, created_at, updated_at)
+    VALUES(?, 'corrupt-export-row', '损坏行', 'weather.current', '{}', NULL, '{"type":"daily","time":', 1,
+      '2027-02-01T00:00:00.000Z', '2027-02-01T00:00:00.000Z')
+  `).run(profile.id);
+  try {
+    const snapshot = buildAssistantExport(profile);
+    assert.ok(!snapshot.data.automations.some((entry) => entry.id === "corrupt-export-row"),
+      "损坏行应被跳过而不是拖垮导出");
+    assert.equal(snapshot.data.invalidAutomations, 1, "损坏行应计入 invalidAutomations 供导入方提示");
+    // 其余合法 automation 不受影响。
+    assert.ok(snapshot.data.automations.length >= 1);
+  } finally {
+    db.prepare("DELETE FROM automations WHERE profile_id = ? AND id = ?").run(profile.id, "corrupt-export-row");
+  }
+  assert.equal(buildAssistantExport(profile).data.invalidAutomations, undefined, "无损坏行时不应带 invalidAutomations 标记");
+});

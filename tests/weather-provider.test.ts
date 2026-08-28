@@ -537,3 +537,36 @@ test("Open-Meteo indices degrade to empty when uv_index_max is null", async (t) 
   assert.equal(result.degraded, true);
   assert.equal(result.source, "Open-Meteo");
 });
+
+test("L9: Open-Meteo forecast passes the brief-provided timezone explicitly instead of timezone=auto", async (t) => {
+  const originalKey = config.qweatherKey;
+  const originalFetch = globalThis.fetch;
+  config.qweatherKey = "";
+  let url = "";
+  globalThis.fetch = (async (input) => {
+    url = String(input);
+    return Response.json({
+      daily: {
+        time: ["2026-08-03"],
+        temperature_2m_max: [30],
+        temperature_2m_min: [23],
+        weather_code: [80],
+        precipitation_probability_max: [65],
+      },
+    });
+  }) as typeof fetch;
+  t.after(() => {
+    config.qweatherKey = originalKey;
+    globalThis.fetch = originalFetch;
+  });
+
+  // 简报时区（Asia/Shanghai）作为显式查询参数：Open-Meteo 按简报同一时区切日，
+  // 与 daily brief identity 的「今日」语义对齐；timezone=auto 会按坐标当地时区切日。
+  await fetchForecast(39.9, 116.4, 2, "北京", "Asia/Shanghai");
+  assert.ok(url.includes("timezone=Asia%2FShanghai"), `Open-Meteo 请求必须带简报时区，实际 URL: ${url}`);
+  assert.ok(!url.includes("timezone=auto"), "不得退回 timezone=auto（与简报本地日错位）");
+
+  // 未显式传时区时默认用 config.timezone（同样不是 auto）。
+  await fetchForecast(39.9, 116.4, 1);
+  assert.ok(!url.includes("timezone=auto"), "默认路径也必须显式时区");
+});

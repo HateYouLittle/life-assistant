@@ -121,11 +121,20 @@ function renderPlainBlocks(blocks: RenderBlock[]): string {
   return blocks.map(blockToPlain).join("\n");
 }
 
+/** 兜底投影：渲染器抛错时保证 renderNotification 恒不 throw。 */
+function fallbackRenderedNotification(notification: NotificationEnvelope): RenderedNotification {
+  return { title: notification.headline, body: notification.details ?? "" };
+}
+
 function renderPlainNotification(notification: NotificationEnvelope): RenderedNotification {
-  return {
-    title: notification.headline,
-    body: renderPlainBlocks(renderBlocks(notification)),
-  };
+  try {
+    return {
+      title: notification.headline,
+      body: renderPlainBlocks(renderBlocks(notification)),
+    };
+  } catch {
+    return fallbackRenderedNotification(notification);
+  }
 }
 
 // ---------------------------------------------------------------------------

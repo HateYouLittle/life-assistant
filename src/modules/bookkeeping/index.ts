@@ -75,7 +75,7 @@ const bookkeepingModule: AssistantModule = {
       {
         name: "account_create",
         description:
-          "创建账户。不带 ledgerId：创建当前 Profile 的个人账户（仅本人可见）。带 ledgerId：在该共享账本下创建共享账户（仅账本 owner 可创建，余额由全部成员共享可见）。initialBalance（元，>0，最多两位小数）为初始余额，会自动补一条「期初余额」收入流水。type 可选：cash/bank/alipay/wechat/other。",
+          "创建账户。不带 ledgerId：创建当前 Profile 的个人账户（仅本人可见）。带 ledgerId：在该共享账本下创建共享账户（仅账本 owner 可创建，余额由全部成员共享可见）。initialBalance（元，>0，最多两位小数）为初始余额，会自动补一条「期初余额」收入流水，其他共享账本成员会收到该期初流水的通知。type 可选：cash/bank/alipay/wechat/other。",
       },
       {
         name: z.string().min(1).max(100).describe("账户名称，如 微信钱包、家庭公共资金池"),
@@ -175,14 +175,14 @@ const bookkeepingModule: AssistantModule = {
       {
         name: "entry_update",
         description:
-          "修改流水（记录人本人，或共享账本 owner 可修改任何人的）。version 是乐观锁：必须传该流水当前的 version；冲突时报错，请重新 entry_get 获取最新值再重试。类型（expense/income/transfer）不可变；amount 单位是元；transfer 的 toAccountId 可改，expense/income 不接受 toAccountId。修改共享账本流水会通知其他成员。",
+          "修改流水（记录人本人，或共享账本 owner 可修改任何人的；共享账本流水跨账本移出需 owner 权限）。version 是乐观锁：必须传该流水当前的 version；冲突时报错，请重新 entry_get 获取最新值再重试。类型（expense/income/transfer）不可变；amount 单位是元；transfer 的 toAccountId 可改，expense/income 不接受 toAccountId；category 传空字符串可清除分类，note 传空字符串清除备注。修改共享账本流水会通知其他成员（通知带账户/账本变更留痕）。",
       },
       {
         ledgerId: z.string().describe("账本 ID"),
         entryId: z.string().describe("流水 ID"),
         version: z.number().int().min(1).describe("乐观锁：流水当前 version"),
         amount: amountYuanSchema.optional().describe("新金额（元）"),
-        category: z.string().min(1).max(50).optional().describe("新分类"),
+        category: z.string().max(50).optional().describe("新分类；传空字符串可清除分类"),
         accountId: z.string().optional().describe("改用其他账户"),
         toAccountId: z.string().optional().describe("仅 transfer：新转入账户"),
         occurredAt: z.string().optional().describe("新发生时间（ISO）"),
