@@ -80,8 +80,13 @@ Hermes 将 MCP 工具注册为 `mcp_life_assistant_<tool>`，点号转换为下�
 
 个人收支与多成员共享账本使用 `bookkeeping.*`（共 14 个工具）：
 
-- **个人账本**：首次调用任何记账工具时自动创建，无需初始化，`bookkeeping.ledger_list` 可见。
-- **记账**：`bookkeeping.entry_add` 记支出（expense）/收入（income）/转账（transfer）。金额单位是**元**（>0，最多两位小数）；expense/income 的 `category` 必填，transfer 必须省略 category 且提供两个不同账户（`accountId` 转出、`toAccountId` 转入）。`occurredAt` 可传 ISO 时间补记。需要账户 ID 时先用 `bookkeeping.account_list` 查询（返回本人个人账户 + 所在共享账本的共享账户及实时余额，含已归档）。
+- **账本-账户层级**：账本（Ledger）分两类，账户（Account）挂在账本之下、数量不限。
+  - **个人账本**：每个 Profile 最多 1 个，首次调用记账工具自动创建（懒创建，无需初始化），owner=本人；下面挂个人账户（kind=personal，如微信/支付宝/现金，可建多个）。
+  - **共享账本**：`bookkeeping.ledger_create` 可建多个，创建者=owner，可加成员；每个账本下挂共享账户（kind=shared，如家庭开支/旅游基金，可建多个）。
+  - `bookkeeping.account_list` 返回**本人个人账户 + 所在共享账本的共享账户**合并列表（可能来自不同账本），带实时余额（含已归档）。
+  - 流水归属由账户决定：用共享账户（或转账涉及共享账户）→ 记入该共享账本并通知其他成员；用个人账户 → 记入个人账本。
+  - **不传 accountId 记账** → 记入个人账本但 `accountId=null`，不属任何具体账户：查账户余额看不到该笔，`summary` 计入个人账本总收支。建议用户记账时带上账户，否则成为「无账户归属」的悬空流水。
+- **记账**：`bookkeeping.entry_add` 记支出（expense）/收入（income）/转账（transfer）。金额单位是**元**（>0，最多两位小数）；expense/income 的 `category` 必填，transfer 必须省略 category 且提供两个不同账户（`accountId` 转出、`toAccountId` 转入）。`occurredAt` 可传 ISO 时间补记。
 - **金额单位注意**：`bookkeeping.entry_list`/`bookkeeping.entry_get` 返回 `amountCents`、账本/账户列表返回 `*BalanceCents`，均以**分**计；`bookkeeping.summary` 返回元。向用户转述时先换算，不要混淆单位。
 - **修改/删除**：`bookkeeping.entry_update`/`bookkeeping.entry_delete` 需要 `version` 乐观锁——先 `bookkeeping.entry_get` 取当前 version 再提交；冲突报错后重新读取再重试，不要盲目重试。条目类型（expense/income/transfer）不可变；category/note 传空字符串可清除。
 - **共享账本**：`bookkeeping.ledger_create` 创建（创建者即 owner）；`bookkeeping.member_add`/`bookkeeping.member_remove` 邀请或移除成员（owner 专属，不能移除 owner 本人；profileId 只要求格式合法，对方无需提前存在）。`bookkeeping.account_create(ledgerId)` 在账本下创建余额全员共享的公共账户（owner 专属），带 `initialBalance` 时自动补一条「期初余额」流水。共享账本内记账/修改/删除会自动通知除记录人外的其他成员；改删流水限记录人本人或 owner，共享流水跨账本移出限 owner。
