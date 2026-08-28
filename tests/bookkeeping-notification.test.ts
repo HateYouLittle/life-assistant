@@ -152,3 +152,45 @@ test("shared entry notification renders through the registered block renderer", 
     "备注：纸巾",
   ].join("\n"));
 });
+
+test("cross-ledger shared transfer notifies members of both ledgers", async () => {
+  const a = requireProfileContext("profile-a");
+  const ledgerA = svc.createSharedLedger(a, "双账本A");
+  svc.addLedgerMember(a, ledgerA.id, "profile-b");
+  const ledgerB = svc.createSharedLedger(a, "双账本B");
+  svc.addLedgerMember(a, ledgerB.id, "profile-c");
+  const poolA = svc.createAccount(a, { name: "A池", ledgerId: ledgerA.id });
+  const poolB = svc.createAccount(a, { name: "B池", ledgerId: ledgerB.id });
+
+  // 流水归属源账本 A，但转账两端账本的成员（b、c）都要收到通知
+  const t = await svc.addEntry(a, { type: "transfer", amount: 10, accountId: poolA.id, toAccountId: poolB.id });
+  assert.equal(t.ledgerId, ledgerA.id);
+  const keysOf = (profileId: string): string[] => noticesFor(profileId).map((n) => String(n.dedupe_key));
+  assert.ok(keysOf("profile-b").includes(`bookkeeping:${ledgerA.id}:${t.id}:add:${t.updatedAt}`));
+  assert.ok(keysOf("profile-c").includes(`bookkeeping:${ledgerB.id}:${t.id}:add:${t.updatedAt}`));
+
+  // 删除该转账：两端账本成员同样各收一条 delete 通知
+  await svc.deleteEntry(a, ledgerA.id, t.id, t.version);
+  assert.ok(keysOf("profile-b").some((k) => k.startsWith(`bookkeeping:${ledgerA.id}:${t.id}:delete:`)));
+  assert.ok(keysOf("profile-c").some((k) => k.startsWith(`bookkeeping:${ledgerB.id}:${t.id}:delete:`)));
+});
+
+test("moving an entry to another ledger notifies the source ledger members too", async () => {
+  const a = requireProfileContext("profile-a");
+  const b = requireProfileContext("profile-b");
+  const ledgerA = svc.listLedgers(a).find((v) => v.name === "双账本A")!;
+  const ledgerB = svc.listLedgers(a).find((v) => v.name === "双账本B")!;
+  const poolA = svc.listAccounts(a, ledgerA.id).find((x) => x.name === "A池")!;
+  const poolB = svc.listAccounts(a, ledgerB.id).find((x) => x.name === "B池")!;
+
+  // b 在账本 A 记账，a（owner，两个账本都有权限）把它改挂到账本 B 的共享账户
+  const entry = await svc.addEntry(b, { type: "expense", amount: 5, category: "搬家", accountId: poolA.id });
+  assert.equal(entry.ledgerId, ledgerA.id);
+  const moved = await svc.updateEntry(a, ledgerA.id, entry.id, { version: entry.version, accountId: poolB.id });
+  assert.equal(moved.ledgerId, ledgerB.id);
+
+  const keysOf = (profileId: string): string[] => noticesFor(profileId).map((n) => String(n.dedupe_key));
+  // 原账本成员 b（否则流水「凭空消失」）与目标账本成员 c 都收到 update 通知
+  assert.ok(keysOf("profile-b").some((k) => k.startsWith(`bookkeeping:${ledgerA.id}:${entry.id}:update:`)));
+  assert.ok(keysOf("profile-c").some((k) => k.startsWith(`bookkeeping:${ledgerB.id}:${entry.id}:update:`)));
+});

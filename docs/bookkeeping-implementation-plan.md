@@ -144,7 +144,7 @@ description 用中文写清 LLM 契约(适用场景、参数含义、金额单�
 参照 `src/modules/schedule/notification.ts` 的结构:payload 类型 + `EnvelopeFor` + builder + `registerNotificationBlocks`(RenderBlock 用 `line`/`label` 块,中文文案)。
 
 1. **`bookkeeping.shared_entry`**(共享账本成员动态)
-   - 触发:entry_add / entry_update / entry_delete 落在共享账本时,service 对**除记录人外**的每个成员各发一条 profile scope 信封(`source: "bookkeeping"`)。
+   - 触发:entry_add / entry_update / entry_delete 涉及共享账本时,service 对**除记录人外**的每个成员各发一条 profile scope 信封(`source: "bookkeeping"`)。通知账本集合按流水账户端点推导:转账两端分属不同共享账本时两端成员都通知;entry_update 把流水改挂到其他账本时,原账本成员也通知(否则流水「凭空消失」无人知晓)。
    - `identity` 必须含变化标记,防止 dedupeKey(`source:identity`)吞掉后续修改:`${ledgerId}:${entryId}:${action}:${entry.updatedAt}`,action ∈ add/update/delete。
    - payload:`{ ledgerId, ledgerName, entryId, action, entryType, amountCents, category?, note?, actorProfileId, occurredAt, generatedAt }`。
    - headline 例:`家庭账本 · 小王记了一笔支出 ¥35.00(餐饮)`。

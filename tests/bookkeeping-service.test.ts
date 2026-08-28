@@ -204,3 +204,35 @@ test("occurredAt must be a valid ISO timestamp", async () => {
     /invalid ISO timestamp/,
   );
 });
+
+test("transfer shape and toAccountId symmetry fail with clear errors", async () => {
+  const a = requireProfileContext("profile-a");
+  await assert.rejects(
+    () => svc.addEntry(a, { type: "transfer", amount: 1 }),
+    /transfer requires accountId and toAccountId/,
+  );
+  await assert.rejects(
+    () => svc.addEntry(a, { type: "transfer", amount: 1, accountId: "acc-ghost" }),
+    /transfer requires accountId and toAccountId/,
+  );
+  for (const type of ["expense", "income"] as const) {
+    await assert.rejects(
+      () => svc.addEntry(a, { type, amount: 1, category: "测试", toAccountId: "acc-ghost" }),
+      /toAccountId only applies to transfer entries/,
+    );
+  }
+});
+
+test("category is trimmed before storage and matches exact filter", async () => {
+  const a = requireProfileContext("profile-a");
+  const entry = await svc.addEntry(a, { type: "expense", amount: 1, category: "  餐饮  " });
+  assert.equal(entry.category, "餐饮");
+  assert.equal(svc.listEntries(a, undefined, { category: "餐饮" }).some((e) => e.id === entry.id), true);
+});
+
+test("listEntries tolerates non-finite limit/offset instead of SQL error", async () => {
+  const a = requireProfileContext("profile-a");
+  const rows = svc.listEntries(a, undefined, { limit: Number.NaN, offset: Number.NaN });
+  assert.equal(Array.isArray(rows), true);
+  assert.ok(rows.length <= 50);
+});

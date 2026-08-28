@@ -216,6 +216,7 @@ export function migrateDatabaseSchema(db: DatabaseSync): void {
     CREATE UNIQUE INDEX IF NOT EXISTS idx_profile_notifications_composite ON profile_notifications(profile_id, id);
     CREATE INDEX IF NOT EXISTS idx_profile_deliveries_due ON profile_notification_deliveries(status, next_attempt_at);
     CREATE INDEX IF NOT EXISTS idx_ledger_entries_time ON ledger_entries(ledger_id, occurred_at);
+    CREATE INDEX IF NOT EXISTS idx_ledgers_personal_owner ON ledgers(type, owner_profile_id);
     CREATE INDEX IF NOT EXISTS idx_ledger_accounts_owner ON ledger_accounts(owner_profile_id);
     CREATE INDEX IF NOT EXISTS idx_ledger_accounts_ledger ON ledger_accounts(ledger_id);
     `);

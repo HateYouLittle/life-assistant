@@ -358,28 +358,38 @@ export function createAccount(value: ProfileContext | string, input: AccountCrea
   const db = getDatabase();
   const ts = at.toISOString();
   const id = crypto.randomUUID();
-  db.prepare(`
-    INSERT INTO ledger_accounts(id, kind, owner_profile_id, ledger_id, name, type, archived, version, created_at, updated_at)
-    VALUES(?, ?, ?, ?, ?, ?, 0, 1, ?, ?)
-  `).run(id, kind, ownerProfileId, ledgerId, name, input.type ?? "other", ts, ts);
-  if (input.initialBalance !== undefined) {
-    const amountCents = toCents(input.initialBalance);
-    // 期初余额 = 一条「期初余额」收入流水，余额口径与普通流水完全一致。
-    insertEntryRow({
-      ledgerId: kind === "shared" ? ledgerId! : ensurePersonalLedger(profile).id,
-      id: crypto.randomUUID(),
-      profileId: profile.id,
-      type: "income",
-      amountCents,
-      category: "期初余额",
-      accountId: id,
-      toAccountId: null,
-      occurredAt: ts,
-      note: null,
-      version: 1,
-      createdAt: ts,
-      updatedAt: ts,
-    });
+  // 期初流水与账户行同一事务落库；个人账本懒创建自带事务，须放在 BEGIN 之前解析。
+  const opening = input.initialBalance !== undefined
+    ? { ledgerId: kind === "shared" ? ledgerId! : ensurePersonalLedger(profile).id, amountCents: toCents(input.initialBalance) }
+    : null;
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    db.prepare(`
+      INSERT INTO ledger_accounts(id, kind, owner_profile_id, ledger_id, name, type, archived, version, created_at, updated_at)
+      VALUES(?, ?, ?, ?, ?, ?, 0, 1, ?, ?)
+    `).run(id, kind, ownerProfileId, ledgerId, name, input.type ?? "other", ts, ts);
+    if (opening) {
+      // 期初余额 = 一条「期初余额」收入流水，余额口径与普通流水完全一致。
+      insertEntryRow({
+        ledgerId: opening.ledgerId,
+        id: crypto.randomUUID(),
+        profileId: profile.id,
+        type: "income",
+        amountCents: opening.amountCents,
+        category: "期初余额",
+        accountId: id,
+        toAccountId: null,
+        occurredAt: ts,
+        note: null,
+        version: 1,
+        createdAt: ts,
+        updatedAt: ts,
+      });
+    }
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
   }
   return withBalance(getAccountRow(id)!);
 }
@@ -526,6 +536,14 @@ function resolveEntryLedger(
 
 export async function addEntry(value: ProfileContext | string, input: EntryAddInput, at: Date = new Date()): Promise<LedgerEntry> {
   const profile = asProfileContext(value);
+  // 账户端点先于任何 SQL 校验：transfer 必须双端齐全，非 transfer 禁带 toAccountId。
+  if (input.type === "transfer") {
+    if (input.accountId === undefined || input.toAccountId === undefined) {
+      throw new Error("transfer requires accountId and toAccountId");
+    }
+  } else if (input.toAccountId !== undefined) {
+    throw new Error("toAccountId only applies to transfer entries");
+  }
   validateCategory(input.type, input.category);
   const amountCents = toCents(input.amount);
   const occurredAt = normalizeTimestamp(input.occurredAt, at.toISOString());
@@ -537,7 +555,7 @@ export async function addEntry(value: ProfileContext | string, input: EntryAddIn
     profileId: profile.id,
     type: input.type,
     amountCents,
-    category: input.category ?? null,
+    category: input.category?.trim() || null,
     accountId: input.accountId ?? null,
     toAccountId: input.toAccountId ?? null,
     occurredAt,
@@ -547,7 +565,7 @@ export async function addEntry(value: ProfileContext | string, input: EntryAddIn
     updatedAt: at.toISOString(),
   });
   const entry = getEntryRow(ledgerId, id)!;
-  await notifySharedEntryChange("add", rowToLedger(getLedgerRow(ledgerId)!), entry, profile.id);
+  await notifySharedEntryChange("add", entry, profile.id);
   return entry;
 }
 
@@ -565,8 +583,11 @@ export function listEntries(
   if (options.category) { clauses.push("category = ?"); values.push(options.category); }
   if (options.from !== undefined) { clauses.push("occurred_at >= ?"); values.push(normalizeTimestamp(options.from, options.from)); }
   if (options.to !== undefined) { clauses.push("occurred_at <= ?"); values.push(normalizeTimestamp(options.to, options.to)); }
-  const limit = Math.min(Math.max(options.limit ?? 50, 1), 500);
-  const offset = Math.max(options.offset ?? 0, 0);
+  // Number.isFinite 兜底：NaN 会穿透 Math.min/Math.max 链，拼进 SQL 直接变成语法错误。
+  const rawLimit = options.limit ?? 50;
+  const limit = Math.min(Math.max(Number.isFinite(rawLimit) ? Math.trunc(rawLimit) : 50, 1), 500);
+  const rawOffset = options.offset ?? 0;
+  const offset = Math.max(Number.isFinite(rawOffset) ? Math.trunc(rawOffset) : 0, 0);
   const rows = getDatabase().prepare(
     `SELECT * FROM ledger_entries WHERE ${clauses.join(" AND ")} ORDER BY occurred_at DESC, created_at DESC LIMIT ${limit} OFFSET ${offset}`,
   ).all(...values) as Row[];
@@ -594,32 +615,44 @@ function versionConflictError(entryId: string, expected: number): Error {
 
 /**
  * 共享账本写路径的成员动态通知：对除记录人外的每个成员各发一条 profile scope
- * 信封（未配推送路由的成员走 notify.pull 拉取）。通知失败记录日志继续，
+ * 信封（未配推送路由的成员走 notify.pull 拉取）。通知账本集合按流水账户端点
+ * 推导（extraLedgerIds 供流水改挂账本时补传原账本）：转账两端分属不同共享账本
+ * 时两端成员都通知，避免「余额变了/流水消失却无人知晓」。通知失败记录日志继续，
  * 不回滚已落库的记账（对齐 schedule/tick 的容错风格）。
  */
 async function notifySharedEntryChange(
   action: SharedEntryAction,
-  ledger: Ledger,
   entry: LedgerEntry,
   actorProfileId: string,
+  extraLedgerIds: string[] = [],
 ): Promise<void> {
-  if (ledger.type !== "shared") return;
-  const members = getDatabase()
-    .prepare("SELECT profile_id FROM ledger_members WHERE ledger_id = ?")
-    .all(ledger.id) as Array<{ profile_id: string }>;
-  for (const member of members) {
-    if (member.profile_id === actorProfileId) continue;
-    try {
-      await publishNotification(buildSharedEntryNotification({
-        profileId: member.profile_id,
-        ledgerId: ledger.id,
-        ledgerName: ledger.name,
-        entry,
-        action,
-        actorProfileId,
-      }));
-    } catch (error) {
-      console.error(`[bookkeeping] shared entry notification failed for ${member.profile_id}:`, (error as Error).message);
+  const ledgerIds = new Set<string>([entry.ledgerId, ...extraLedgerIds]);
+  for (const accountId of [entry.accountId, entry.toAccountId]) {
+    if (accountId === undefined) continue;
+    const account = getAccountRow(accountId);
+    if (account?.kind === "shared") ledgerIds.add(account.ledgerId!);
+  }
+  for (const ledgerId of ledgerIds) {
+    const ledgerRow = getLedgerRow(ledgerId);
+    if (!ledgerRow || (ledgerRow.type as LedgerType) !== "shared") continue;
+    const ledger = rowToLedger(ledgerRow);
+    const members = getDatabase()
+      .prepare("SELECT profile_id FROM ledger_members WHERE ledger_id = ?")
+      .all(ledgerId) as Array<{ profile_id: string }>;
+    for (const member of members) {
+      if (member.profile_id === actorProfileId) continue;
+      try {
+        await publishNotification(buildSharedEntryNotification({
+          profileId: member.profile_id,
+          ledgerId: ledger.id,
+          ledgerName: ledger.name,
+          entry,
+          action,
+          actorProfileId,
+        }));
+      } catch (error) {
+        console.error(`[bookkeeping] shared entry notification failed for ${member.profile_id}:`, (error as Error).message);
+      }
     }
   }
 }
@@ -643,7 +676,7 @@ export async function updateEntry(
   const merged = {
     type: entry.type,
     amountCents: changes.amount !== undefined ? toCents(changes.amount) : entry.amountCents,
-    category: changes.category !== undefined ? changes.category : entry.category,
+    category: changes.category !== undefined ? (changes.category.trim() || undefined) : entry.category,
     accountId: changes.accountId !== undefined ? changes.accountId : entry.accountId,
     toAccountId: entry.type === "transfer"
       ? (changes.toAccountId !== undefined ? changes.toAccountId : entry.toAccountId)
@@ -678,7 +711,8 @@ export async function updateEntry(
     throw versionConflictError(entryId, changes.version);
   }
   const updated = getEntryRow(destinationLedgerId, entryId)!;
-  await notifySharedEntryChange("update", rowToLedger(getLedgerRow(destinationLedgerId)!), updated, profile.id);
+  // 流水改挂到其他账本时原账本成员也通知，否则流水在他们那里「凭空消失」。
+  await notifySharedEntryChange("update", updated, profile.id, ledgerId !== destinationLedgerId ? [ledgerId] : []);
   return updated;
 }
 
@@ -699,7 +733,7 @@ export async function deleteEntry(
   if (result.changes === 0) {
     throw versionConflictError(entryId, version);
   }
-  await notifySharedEntryChange("delete", ledger, entry, profile.id);
+  await notifySharedEntryChange("delete", entry, profile.id);
   return entry;
 }
 

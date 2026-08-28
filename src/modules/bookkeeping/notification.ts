@@ -122,13 +122,14 @@ export function buildMonthlyReportNotification(report: MonthlyReportData): Month
   const { personal, shared } = report;
   const netWord = personal.netCents >= 0 ? "结余" : "超支";
   const headline = `${report.month} 月度账单 · 收入 ¥${formatYuan(personal.incomeCents)} · 支出 ¥${formatYuan(personal.expenseCents)} · ${netWord} ¥${formatYuan(Math.abs(personal.netCents))}`;
+  const generatedAt = new Date().toISOString();
   return {
     kind: "bookkeeping.monthly_report",
     identity: `${report.profileId}:${report.month}`,
     source: "bookkeeping",
     scope: { type: "profile", profileId: report.profileId },
     headline,
-    generatedAt: new Date().toISOString(),
+    generatedAt,
     payload: {
       profileId: report.profileId,
       month: report.month,
@@ -139,7 +140,7 @@ export function buildMonthlyReportNotification(report: MonthlyReportData): Month
         topCategories: personal.topCategories,
       },
       shared: shared.map((part) => ({ ...part })),
-      generatedAt: new Date().toISOString(),
+      generatedAt,
     },
   };
 }
