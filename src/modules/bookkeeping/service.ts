@@ -686,10 +686,13 @@ async function notifySharedEntryChange(
   }
 }
 
-/** 流水端点账户及其所属共享账本（个人账户无账本）：通知 payload 的账户/账本信息（M1/L14）。 */
+/** 流水端点账户及其所属共享账本（个人账户无账本）：通知 payload 的账户/账本信息（M1/L14）。
+ * 附带账户名，通知渲染用友好名替代 UUID（2026-08-28）。 */
 function entryAccounts(entry: LedgerEntry): {
   accountId?: string;
   toAccountId?: string;
+  accountName?: string;
+  toAccountName?: string;
   accountLedgerId?: string;
   toAccountLedgerId?: string;
 } {
@@ -698,6 +701,8 @@ function entryAccounts(entry: LedgerEntry): {
   return {
     accountId: entry.accountId,
     toAccountId: entry.toAccountId,
+    accountName: source?.name,
+    toAccountName: target?.name,
     accountLedgerId: source?.kind === "shared" ? source.ledgerId : undefined,
     toAccountLedgerId: target?.kind === "shared" ? target.ledgerId : undefined,
   };

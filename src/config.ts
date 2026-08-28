@@ -82,6 +82,26 @@ if (profilePushRoutesRaw && Object.keys(profilePushRoutes).length === 0) {
   console.warn("PROFILE_PUSH_ROUTES_JSON is set but produced no valid routes");
 }
 
+/** 解析 Profile 显示名映射（通知「记录人」等场景用友好名替代 profile id）。
+ * PROFILE_DISPLAY_NAMES 是可选 JSON，形如 {"default":"我","bestie":"对象"}。
+ * 非法 JSON / 非字符串值一律丢弃该字段，profile id 仍会回落显示。 */
+export function parseProfileDisplayNames(raw: string | undefined): Record<string, string> {
+  const names = Object.create(null) as Record<string, string>;
+  if (!raw) return names;
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    for (const [profileId, value] of Object.entries(parsed)) {
+      if (typeof value === "string" && value.trim() !== "") {
+        names[profileId] = value.trim();
+      }
+    }
+    return names;
+  } catch {
+    return names;
+  }
+}
+const profileDisplayNames = parseProfileDisplayNames(process.env.PROFILE_DISPLAY_NAMES);
+
 // M8：时区必须加载期校验——非法 IANA 时区会让所有 DateTime 计算静默失真，直接拒绝启动。
 const rawTimezone = nonBlankOrDefault(process.env.LIFE_ASSISTANT_TIMEZONE, Intl.DateTimeFormat().resolvedOptions().timeZone);
 if (!DateTime.now().setZone(rawTimezone).isValid) {
@@ -124,6 +144,7 @@ if ((location.lat === undefined) !== (location.lon === undefined)) {
 export const config = {
   dataDir,
   profilePushRoutes,
+  profileDisplayNames,
   timezone: rawTimezone,
 
   location,
