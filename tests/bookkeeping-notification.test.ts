@@ -143,12 +143,12 @@ test("shared entry notification renders through the registered block renderer", 
   const row = noticesFor("profile-b").find((n) => String(n.dedupe_key) === `bookkeeping:${ledger.id}:${entry.id}:add:${entry.updatedAt}`)!;
   assert.ok(row, "成员通知应已落库");
   assert.equal(row.title, "通知家庭账本 · profile-a 记了一笔支出 ¥12.50（日用）");
-  // 通知 body 含账户信息（共享账户显示友好名而非 UUID，附带所属账本 id；2026-08-28）
+  // 通知 body 含账户信息（共享账户显示友好名而非 UUID，附带所属账本名；2026-08-28）
   assert.equal(row.body, [
     "账本：通知家庭账本",
     "类型：支出",
     "金额：¥12.50",
-    `账户：${pool.name}（账本 ${ledger.id}）`,
+    `账户：${pool.name}（账本 ${ledger.name}）`,
     "分类：日用",
     "记录人：profile-a",
     "时间：2026-08-11 16:30",
