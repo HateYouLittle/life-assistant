@@ -1,13 +1,14 @@
 ---
 name: life-assistant
-description: "Use for weather, air quality, life indices, oil prices, mainland China statutory holidays and workdays, Profile-private schedules, dynamic automations, notification management (quiet hours, snooze, cancel), backup/migration, pending notification recovery, or switching the Hermes notification platform."
-summary: "天气、空气质量、生活指数、油价、节假日/工作日、Profile 私有日程与自动任务、静默时段等通知管理、备份迁移；主动通知统一经 Hermes Webhook。"
+description: "Use for weather, air quality, life indices, oil prices, mainland China statutory holidays and workdays, Profile-private schedules, dynamic automations, personal and shared bookkeeping (ledgers, accounts, entries, transfers, monthly reports), notification management (quiet hours, snooze, cancel), backup/migration, pending notification recovery, or switching the Hermes notification platform."
+summary: "天气、空气质量、生活指数、油价、节假日/工作日、Profile 私有日程与自动任务、个人/共享记账（账本/账户/收支/转账/月度账单）、静默时段等通知管理、备份迁移；主动通知统一经 Hermes Webhook。"
 read_when:
   - 用户询问天气、气温、穿衣、降水、气象预警、空气质量、AQI、雾霾或紫外线
   - 用户询问油价、加油、调价、涨价或降价
   - 用户询问放假、节假日、调休、补班、工作日或放假倒计时
   - 用户提到待办、提醒、日程、生日、纪念日或农历日期
   - 用户想要条件触发的动态提醒（如「明天下雨早上提醒我」「空气差了叫我」）
+  - 用户想要记账、查询收支/余额、管理共享账本或询问月度账单
   - 用户要求免打扰、静默时段、稍后提醒、取消提醒或排查没收到的通知
   - 用户要求备份、导出或迁移生活助理数据
   - 用户要求切换 QQ、微信、飞书等主动通知平台
@@ -39,7 +40,7 @@ Hermes 将 MCP 工具注册为 `mcp_life_assistant_<tool>`，点号转换为下�
 - 当前天气用 `weather.current`，未来天气用 `weather.forecast(days)`，当前预警用 `weather.alerts`，穿衣/洗车/紫外线等生活指数用 `weather.indices`。
 - 空气质量用 `airquality.current`；注意返回的 `scale`（CN 国标 / US 美标），两种量表数值不可直接比较；未配置和风 Key 时为美标兜底，回答时应带量表说明。
 - 回答应包含地点、单位和有用的穿衣、降水或出行建议，不只复述字段。
-- 当前油价用 `oilprice.current`；调价时间和是否提前加油用 `oilprice.next_adjustment`。
+- 当前油价用 `oilprice.current`；调价时间和是否提前加油用 `oilprice.next_adjustment`。调价窗口表按年度校准：超出已校准年份时窗口按「每 10 个工作日」规则推演并在结果中标注「候选未校准」，回答时提醒用户以发改委正式公告为准。
 - 油价 Provider 优先 TianAPI，失败且配置 JUHE 时回退 JUHE。两者均未配置或不可用时，按工具返回的说明告知用户，不要假定只需要某一个 Key。
 - 内置每日生活简报仅由当前天气和当日预报确定性生成，不包含油价，不调用 LLM；不要另建 LLM cron 重复实现它。
 
@@ -52,7 +53,7 @@ Hermes 将 MCP 工具注册为 `mcp_life_assistant_<tool>`，点号转换为下�
 - 距离下次放假还有多久 → `holiday.next`；返回 ongoing 时说明正在假期中并给出剩余天数，返回 unknown 时说明安排尚未获取、会稍后自动更新。
 - 某年完整安排 → `holiday.list(year)`；判断某天是否上班 → `holiday.is_workday(date?)`。
 - 法定工作日 = 周一至周五 − 法定节假日 + 调休上班的周末；法定节假日休假日不含普通周末。回答时把调休上班日一并说明。
-- 数据缺失且工具报错时，如实告知「官方安排尚未获取，scheduler 会在发布窗口自动更新」；必要时用 `holiday.refresh` 补抓，不要用周一至周五的普通周历去猜节假日。
+- 数据缺失且工具报错时，如实告知「官方安排尚未获取，scheduler 会在发布窗口自动更新」；必要时用 `holiday.refresh` 补抓（数据已就绪时仅确认不重抓，传 `force: true` 可强制重抓已就绪年份，内容未变化则幂等入库），不要用周一至周五的普通周历去猜节假日。
 
 ## 日程
 
@@ -74,6 +75,20 @@ Hermes 将 MCP 工具注册为 `mcp_life_assistant_<tool>`，点号转换为下�
 - 创建后用 `automation.run` 立即执行一次验证配置，把结果如实反馈给用户；`automation.list` 查看运行状态与最近错误。
 - 修改用 `automation.update`（condition 传 null 清除），删除用 `automation.delete`。任务和通知只属于当前 Profile。
 - 白名单之外的数据源需求当前无法配置为 automation，如实说明即可，不要伪造任务。
+
+## 记账 bookkeeping
+
+个人收支与多成员共享账本使用 `bookkeeping.*`（共 14 个工具）：
+
+- **个人账本**：首次调用任何记账工具时自动创建，无需初始化，`bookkeeping.ledger_list` 可见。
+- **记账**：`bookkeeping.entry_add` 记支出（expense）/收入（income）/转账（transfer）。金额单位是**元**（>0，最多两位小数）；expense/income 的 `category` 必填，transfer 必须省略 category 且提供两个不同账户（`accountId` 转出、`toAccountId` 转入）。`occurredAt` 可传 ISO 时间补记。需要账户 ID 时先用 `bookkeeping.account_list` 查询（返回本人个人账户 + 所在共享账本的共享账户及实时余额，含已归档）。
+- **金额单位注意**：`bookkeeping.entry_list`/`bookkeeping.entry_get` 返回 `amountCents`、账本/账户列表返回 `*BalanceCents`，均以**分**计；`bookkeeping.summary` 返回元。向用户转述时先换算，不要混淆单位。
+- **修改/删除**：`bookkeeping.entry_update`/`bookkeeping.entry_delete` 需要 `version` 乐观锁——先 `bookkeeping.entry_get` 取当前 version 再提交；冲突报错后重新读取再重试，不要盲目重试。条目类型（expense/income/transfer）不可变；category/note 传空字符串可清除。
+- **共享账本**：`bookkeeping.ledger_create` 创建（创建者即 owner）；`bookkeeping.member_add`/`bookkeeping.member_remove` 邀请或移除成员（owner 专属，不能移除 owner 本人；profileId 只要求格式合法，对方无需提前存在）。`bookkeeping.account_create(ledgerId)` 在账本下创建余额全员共享的公共账户（owner 专属），带 `initialBalance` 时自动补一条「期初余额」流水。共享账本内记账/修改/删除会自动通知除记录人外的其他成员；改删流水限记录人本人或 owner，共享流水跨账本移出限 owner。
+- **查询与汇总**：`bookkeeping.summary` 返回指定月份（yyyy-LL，按配置时区切自然月）的收入/支出/结余与分类聚合；其中**账户余额为当前实时值，不是所选月份的月末快照**，回答用户时如实说明。
+- **跨账本转账**：转账是单流水设计——流水记入其中一侧账本，对端账本成员通过通知可见该笔变动（通知带对端账户/账本信息），但对端账本的流水列表与汇总不包含该条；用户问「对方账本里怎么没有这笔」时按此解释。
+- **月度账单**：每月 1 号 scheduler 自动推送上月个人 + 各共享账本收支汇总（上月无流水的 Profile 静默跳过）。不要另建 LLM cron 重复实现它。
+- 账户不再使用但仍有历史流水时，用 `bookkeeping.account_update(archived: true)` 归档而不是删除（有流水的账户 `bookkeeping.account_delete` 会被拒绝）。
 
 ## 定时任务边界
 
