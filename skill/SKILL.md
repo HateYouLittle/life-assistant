@@ -94,6 +94,7 @@ Hermes 将 MCP 工具注册为 `mcp_life_assistant_<tool>`，点号转换为下�
 - **跨账本转账**：转账是单流水设计——流水记入其中一侧账本，对端账本成员通过通知可见该笔变动（通知带对端账户/账本信息），但对端账本的流水列表与汇总不包含该条；用户问「对方账本里怎么没有这笔」时按此解释。
 - **月度账单**：每月 1 号 scheduler 自动推送上月个人 + 各共享账本收支汇总（上月无流水的 Profile 静默跳过）。不要另建 LLM cron 重复实现它。
 - 账户不再使用但仍有历史流水时，用 `bookkeeping.account_update(archived: true)` 归档而不是删除（有流水的账户 `bookkeeping.account_delete` 会被拒绝）。
+- **通知显示（2026-08-29）**：共享账本变动通知里，账户显示**账户名**（如「生活费-公共账户」）、账户行内的账本显示**账本名**（如「生活费」），均回落 UUID/ID；「记录人」显示 `PROFILE_DISPLAY_NAMES` 映射的友好名（可选 `.env` 配置，JSON 形如 `{"default":"臭臭小王","bestie":"拉拉大王"}`），未配置时回落 profile id。改 `.env` 后需重启 scheduler + 网关 + dashboard 才生效（MCP 进程启动时读 env）。
 
 ## 定时任务边界
 
