@@ -1,6 +1,6 @@
 # Life Assistant 全量审查报告（2026-08-29，历史快照）
 
-> 本文记录上一轮审查结果，不代表当前源码状态。当前修复基线为 `79a1c93`；请以 `/tmp/life-assistant-review.md` 及源码为准。
+> 本文记录上一轮审查结果，不代表当前源码状态。当前修复基线为 `79a1c93`，后续修复提交见 git log；请以源码与 `docs/upgrade-config-checklist.md` 为准。
 
 > 审查对象：`main` @ `ec41c01`（第二轮报告 docs/review-report-2026-08-28-round2.md 及其修复提交之后）。
 > 覆盖范围：全部 52 个 src 文件（约 13.5k 行）逐行通读；文档全量（README / CONTRIBUTING / docs/architecture / skill/SKILL / .env.example / docs ×6）；`.gitignore`、`package.json`、tsconfig 核对。测试套件本轮以运行验证与针对性核查为主（rrule 星期常量、dist 忽略状态等），未逐行审。

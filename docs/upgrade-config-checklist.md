@@ -109,7 +109,7 @@ console.log('deliveries:', db.prepare('SELECT status, COUNT(*) c FROM profile_no
 EOF
 ```
 
-- `schema version` 应为 `8`（v7 起：`schedules` 增加可空的 `reminder_interval_minutes`/`reminder_max_attempts` 列，用于待办强提醒重发，两列置 `NULL` = 未开启强提醒，`schedule.update` 的 `clearStrongReminder: true` 会将其清空；v8 起：新增 `ledgers`/`ledger_members`/`ledger_accounts`/`ledger_entries` 四表与索引，承载记账模块，均为全新建表、不触碰既有数据）。
+- `schema version` 应为 `8`（v7 起：`schedules` 增加可空的 `reminder_interval_minutes`/`reminder_max_attempts` 列，用于待办强提醒重发，两列置 `NULL` = 未开启强提醒，`schedule.update` 的 `clearStrongReminder: true` 会将其清空；v8 起：新增 `ledgers`/`ledger_members`/`ledger_accounts`/`ledger_entries` 四表与索引，承载记账模块，均为全新建表、不触碰既有数据；v8 另给 `profile_notification_deliveries` 增加可空 `ledger_id` 列，用于共享记账通知的成员资格校验，`ensureColumn` 增量迁移，旧行置 `NULL` 不影响投递）。
 - 若旧库中有历史 `profile_notifications`/deliveries，升级会自动迁移，不应报外键错误。
 - 若数据库版本 > 8，说明是未来版本库被旧程序打开，应立即停止并用对应新版本程序处理。
 
