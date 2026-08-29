@@ -2658,6 +2658,10 @@ test("S5: hydration repairs a row with an invalid next_run_at in the database", 
       '{"frequency":"daily","interval":1,"calendar":"solar"}',
       '[{"minutesBefore":0,"id":"reminder-1","target":"occurrence"}]', 1, 'not-a-date', 1, ?, ?)
   `).run(a.id, stamp, stamp);
+  // 自愈会静默停用用户日程，必须经 logHydrationError 留痕，否则坏行消失无线索。
+  const originalConsoleError = console.error;
+  const errors: string[] = [];
+  console.error = (...args: unknown[]) => { errors.push(args.map(String).join(" ")); };
   try {
     const item = getSchedule(a, "bad-next-run-repair");
     assert.equal(item.nextRunAt, undefined);
@@ -2665,7 +2669,12 @@ test("S5: hydration repairs a row with an invalid next_run_at in the database", 
       "SELECT next_run_at, enabled FROM schedules WHERE profile_id = ? AND id = ?",
     ).get(a.id, "bad-next-run-repair") as Record<string, unknown>;
     assert.deepEqual({ ...row }, { next_run_at: null, enabled: 0 });
+    assert.ok(
+      errors.some((line) => line.includes("hydration") && line.includes("bad-next-run-repair")),
+      `S5 自愈必须记录日志，实际记录：${JSON.stringify(errors)}`,
+    );
   } finally {
+    console.error = originalConsoleError;
     db.prepare("DELETE FROM schedules WHERE profile_id = ? AND id = ?").run(a.id, "bad-next-run-repair");
   }
 });

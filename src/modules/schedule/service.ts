@@ -858,8 +858,10 @@ function rowToItem(
     let triggerAt: ValidDateTime;
     try {
       triggerAt = fromUtc(item.nextRunAt);
-    } catch {
+    } catch (error) {
       // S5：非法 next_run_at 不仅内存清空，还要自愈 schedules 行，避免坏行每 tick 被重复选中。
+      // 自愈会静默停用用户日程（enabled=0），必须经 logHydrationError 留痕（自带去重窗口）。
+      logHydrationError(item.profileId, item.id, error);
       item.nextRunAt = undefined;
       getDatabase().prepare(`
         UPDATE schedules SET next_run_at = NULL, enabled = 0, updated_at = ?

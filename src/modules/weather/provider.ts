@@ -264,6 +264,17 @@ export async function fetchCurrent(lat: number, lon: number, city?: string): Pro
   };
 }
 
+/**
+ * QWeather daily precip → 降水量 mm：缺失/空串/0 按「无降水」降级为 undefined
+ * （不 emit 0mm）；畸形非数值抛错走 Open-Meteo 兜底，与温度字段的 N12 口径一致。
+ */
+function parsePrecipAmountMm(value: string | undefined): number | undefined {
+  if (value == null || value.trim() === "") return undefined;
+  const n = Number(value);
+  if (!Number.isFinite(n)) throw new Error("QWeather forecast returned invalid numeric fields");
+  return n === 0 ? undefined : n;
+}
+
 export async function fetchForecast(lat: number, lon: number, days = 3, city?: string, timezone = config.timezone): Promise<ForecastDay[]> {
   if (config.qweatherKey && days <= 7) {
     try {
@@ -295,7 +306,7 @@ export async function fetchForecast(lat: number, lon: number, days = 3, city?: s
             // 和风 v7 daily 的 precip 是当日累计降水量（mm），实测（2026-08，专属 API host）
             // 响应中没有 precipProb 字段：阵雨日 precip=9.5 是毫米量，按概率解释会
             // 显示"概率 9%"并漏掉带伞建议。降水量缺失时置 undefined，不带噪音。
-            precipAmountMm: Number(d.precip) || undefined,
+            precipAmountMm: parsePrecipAmountMm(d.precip),
           };
         });
       }

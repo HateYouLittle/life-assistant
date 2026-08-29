@@ -759,7 +759,7 @@ export async function updateEntry(
     UPDATE ledger_entries SET
       amount_cents = ?, category = ?, account_id = ?, to_account_id = ?,
       occurred_at = ?, note = ?, ledger_id = ?, version = version + 1, updated_at = ?
-    WHERE ledger_id = ? AND id = ? AND version = ?
+    WHERE ledger_id = ? AND id = ? AND version IS ?
   `).run(
     merged.amountCents,
     merged.category ?? null,
@@ -798,7 +798,7 @@ export async function deleteEntry(
   if (!entry) throw new Error("entry not found");
   requireEntryForWrite(profile, entry, ledger);
   const result = getDatabase()
-    .prepare("DELETE FROM ledger_entries WHERE ledger_id = ? AND id = ? AND version = ?")
+    .prepare("DELETE FROM ledger_entries WHERE ledger_id = ? AND id = ? AND version IS ?")
     .run(ledgerId, entryId, version);
   if (result.changes === 0) {
     // 区分「条目已不存在（并发删除）」与「版本不匹配」两条路径（L16）。

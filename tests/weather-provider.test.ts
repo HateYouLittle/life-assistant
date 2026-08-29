@@ -97,6 +97,53 @@ test("QWeather forecast drops zero precip amount instead of emitting 0mm", async
   }]);
 });
 
+test("QWeather forecast with malformed precip falls back to Open-Meteo instead of treating it as no rain", async (t) => {
+  const originalKey = config.qweatherKey;
+  const originalFetch = globalThis.fetch;
+  config.qweatherKey = "test-key";
+  let calls = 0;
+  globalThis.fetch = (async (input) => {
+    calls += 1;
+    const url = String(input);
+    if (url.includes("/v7/weather/3d")) {
+      return Response.json({
+        daily: [{
+          fxDate: "2026-08-03",
+          tempMax: "31",
+          tempMin: "24",
+          textDay: "中雨",
+          iconDay: "306",
+          precip: "abc",
+        }],
+      });
+    }
+    assert.match(url, /api\.open-meteo\.com/);
+    return Response.json({
+      daily: {
+        time: ["2026-08-03"],
+        temperature_2m_max: [30],
+        temperature_2m_min: [23],
+        weather_code: [80],
+        precipitation_probability_max: [65],
+      },
+    });
+  }) as typeof fetch;
+  t.after(() => {
+    config.qweatherKey = originalKey;
+    globalThis.fetch = originalFetch;
+  });
+
+  // 畸形 precip 与非法温度同口径（N12）：抛错走 Open-Meteo 兜底，而不是静默当「无降水」。
+  assert.deepEqual(await fetchForecast(39.9, 116.4, 1), [{
+    date: "2026-08-03",
+    tMax: 30,
+    tMin: 23,
+    weatherText: "阵雨",
+    precipProb: 65,
+  }]);
+  assert.equal(calls, 2);
+});
+
 test("QWeather forecast business error code falls back to Open-Meteo", async (t) => {
   const originalKey = config.qweatherKey;
   const originalFetch = globalThis.fetch;
