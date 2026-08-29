@@ -2768,3 +2768,25 @@ test("M7: lease refresh failures are contained and never crash the heartbeat", a
     console.error = originalError;
   }
 });
+
+test("schedule.list validates from/to as ISO dates instead of silently comparing garbage", async () => {
+  // L4：from/to 曾是 z.string() 透传，与 next_run_at 做字典序比较——垃圾输入静默空结果。
+  // 现在 schema 层校验，非法参数经工具面返回 isError 而不是空列表。
+  const { getModules } = await import("../src/core/registry.js");
+  await import("../src/modules/schedule/index.js");
+  const scheduleModule = getModules().find((module) => module.name === "schedule");
+  assert.ok(scheduleModule, "schedule 模块应已注册");
+  const listTool = scheduleModule.tools.find((tool) => tool.name === "list");
+  assert.ok(listTool, "schedule.list 工具应存在");
+  const a = requireProfileContext("profile-a");
+
+  const badFrom = await listTool.handler({ from: "garbage" }, a);
+  assert.equal(badFrom.isError, true, "垃圾 from 必须参数报错，而不是静默空结果");
+  assert.match(String(badFrom.content?.[0]?.text ?? ""), /from 必须是/);
+
+  const badTo = await listTool.handler({ to: "not-a-date" }, a);
+  assert.equal(badTo.isError, true);
+
+  const good = await listTool.handler({ from: "2026-08-29", to: "2099-12-31T23:59:59.999Z" }, a);
+  assert.notEqual(good.isError, true, "合法 ISO 日期/UTC 时间应通过校验");
+});

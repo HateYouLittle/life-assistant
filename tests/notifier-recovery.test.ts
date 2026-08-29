@@ -361,3 +361,53 @@ test("N8: 3xx is treated as a confirmed HTTP failure via redirect manual", async
   assert.deepEqual(summary, { attempted: 0, sent: 0, failed: 0 });
   assert.equal(deliveryRow("recovery:n8:1").status, "fallback");
 });
+
+test("failure writeback increments live row values instead of the stale batch snapshot", async () => {
+  // L2：批量 SELECT 与 claim 之间行可能被 route 恢复重新入队（attempts=0、generation+1）。
+  // 用快照绝对值回写会把 request_generation 拨回旧值（X-Request-ID 撞号）、attempts 回退；
+  // 回写必须对 claim 后的行现值做算术递增。fetch 桩在 claim 之后、回写之前修改行，
+  // 精确复现该竞态的可见终态。
+  clearDeliveries();
+  await publishProfile({ profileId: "profile-a", source: "schedule", title: "接管竞态", body: "回写不得回拨 generation", dedupeKey: "recovery:race:1" });
+  const { notification_id: notificationId } = db.prepare(`
+    SELECT d.notification_id FROM profile_notification_deliveries d
+    JOIN profile_notifications n ON n.id = d.notification_id AND n.profile_id = d.profile_id
+    WHERE n.dedupe_key = ? AND n.profile_id = ?
+  `).get("recovery:race:1", "profile-a") as { notification_id: number };
+
+  // 批量 SELECT 将看到的快照：attempts=2 / generation=1 / transport_failures=2，已到期可 claim。
+  db.prepare(`
+    UPDATE profile_notification_deliveries
+    SET status = 'pending', attempts = 2, request_generation = 1, transport_failures = 2,
+        request_started_at = '2100-03-01T00:04:00.000Z', next_attempt_at = '2100-03-01T00:00:00.000Z'
+    WHERE profile_id = ? AND notification_id = ?
+  `).run("profile-a", notificationId);
+
+  const summary = await deliverPendingProfileNotifications({
+    at: new Date("2100-03-01T00:05:00.000Z"),
+    profileId: "profile-a",
+    fetchImpl: (async () => {
+      // 竞态注入：route 恢复重新入队的终态（不动 status/claim_token，回写仍命中本 claim）。
+      db.prepare(`
+        UPDATE profile_notification_deliveries
+        SET attempts = 0, request_generation = 5, request_started_at = NULL, transport_failures = 0
+        WHERE profile_id = ? AND notification_id = ?
+      `).run("profile-a", notificationId);
+      return new Response("boom", { status: 500 });
+    }) as typeof fetch,
+    clock: () => new Date("2100-03-01T00:05:00.000Z"),
+  });
+  assert.equal(summary.failed, 1);
+
+  const row = db.prepare(`
+    SELECT status, attempts, request_generation, transport_failures, request_started_at
+    FROM profile_notification_deliveries WHERE profile_id = ? AND notification_id = ?
+  `).get("profile-a", notificationId) as Record<string, unknown>;
+  // 回写基于行现值：attempts=0+1=1（快照口径会写 3）；generation=5+1=6（快照口径会回拨到
+  // 1+1=2，与 route 恢复时已用过的 X-Request-ID 撞号）。确认 HTTP 失败仍重置幂等窗口。
+  assert.equal(row.status, "failed");
+  assert.equal(row.attempts, 1);
+  assert.equal(row.request_generation, 6, "回写不得把 request_generation 拨回快照旧值");
+  assert.equal(row.transport_failures, 0);
+  assert.equal(row.request_started_at, null);
+});

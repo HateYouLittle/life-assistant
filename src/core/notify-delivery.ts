@@ -272,12 +272,12 @@ export async function deliverPendingProfileNotifications(options: {
       }
       if (completed.changes === 1) result.sent += 1;
     } catch (error) {
+      // 回写基于 claim 后的行现值做算术递增，而不是批量 SELECT 的快照：批量 SELECT 与
+      // claim 之间行可能被 route 恢复重新入队（attempts=0、request_generation+1），
+      // 用快照绝对值回写会把 generation 拨回旧值（X-Request-ID 撞号）、attempts 回退。
+      // 退避档位/fallback 判定仍由快照 attempts 计算（仅决策）；存储值由 SQL 在行上原子推进。
       const attempts = Number(row.attempts) + 1;
       const transportFailures = confirmedHttpFailure ? 0 : Number(row.transport_failures) + 1;
-      const requestGeneration = Number(row.request_generation) + (confirmedHttpFailure ? 1 : 0);
-      const requestStartedAt = confirmedHttpFailure
-        ? null
-        : row.request_started_at == null ? requestAt.toISOString() : String(row.request_started_at);
       const retrySeconds = [60, 300, 900, 3600][Math.min(attempts - 1, 3)];
       // 退避阶梯达档位说明（不改档位数组本身）：
       // - 传输失败（结果不确定，复用同一 X-Request-ID/request_generation）第 3 次即 fallback，
@@ -291,16 +291,20 @@ export async function deliverPendingProfileNotifications(options: {
         : "failed";
       const completed = db.prepare(`
         UPDATE profile_notification_deliveries
-        SET status = ?, attempts = ?, request_generation = ?, request_started_at = ?, transport_failures = ?,
+        SET status = ?,
+            attempts = attempts + 1,
+            transport_failures = CASE WHEN ? THEN 0 ELSE transport_failures + 1 END,
+            request_generation = request_generation + CASE WHEN ? THEN 1 ELSE 0 END,
+            request_started_at = CASE WHEN ? THEN NULL ELSE COALESCE(request_started_at, ?) END,
             next_attempt_at = ?, last_error = ?, claim_token = NULL, claimed_at = NULL, updated_at = ?
         WHERE profile_id = ? AND notification_id = ? AND route = ?
           AND status = 'sending' AND claim_token = ?
       `).run(
         nextStatus,
-        attempts,
-        requestGeneration,
-        requestStartedAt,
-        transportFailures,
+        confirmedHttpFailure ? 1 : 0,
+        confirmedHttpFailure ? 1 : 0,
+        confirmedHttpFailure ? 1 : 0,
+        requestAt.toISOString(),
         nextAttemptAt,
         error instanceof Error ? error.message : String(error),
         requestAt.toISOString(),

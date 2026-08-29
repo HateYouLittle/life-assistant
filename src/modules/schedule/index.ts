@@ -93,13 +93,20 @@ const scheduleModule: AssistantModule = {
     withTool(
       {
         name: "list",
-        description: "列出当前 Hermes Profile 的私有日程，可按类型、状态、时间范围和 upcoming 数量筛选。",
+        description:
+          "列出当前 Hermes Profile 的私有日程，可按类型、状态、时间范围和 upcoming 数量筛选。from/to 过滤的是「下次触发时间」（next_run_at）而非发生日期；已完成的一次性日程（next_run_at 为空）恒包含在任何时间范围内。",
       },
       {
         type: z.enum(["todo", "birthday", "anniversary"]).optional(),
         status: z.enum(["active", "completed", "archived"]).optional(),
-        from: z.string().optional(),
-        to: z.string().optional(),
+        from: z.string().regex(
+          /^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2}(\.\d{1,3})?)?Z)?$/,
+          "from 必须是 YYYY-MM-DD 或带 Z 的 UTC ISO 时间（按 next_run_at 字典序比较）",
+        ).optional(),
+        to: z.string().regex(
+          /^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2}(\.\d{1,3})?)?Z)?$/,
+          "to 必须是 YYYY-MM-DD 或带 Z 的 UTC ISO 时间（按 next_run_at 字典序比较）",
+        ).optional(),
         upcoming: z.number().int().min(1).max(500).optional(),
       },
       (args, context) => ok(listSchedules(context ?? requireProfileContext(), args)),
