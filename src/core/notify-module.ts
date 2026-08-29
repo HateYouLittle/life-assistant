@@ -20,7 +20,7 @@ export const notifyModule: AssistantModule = {
     withTool(
       {
         name: "pull",
-        description: "拉取当前 Hermes Profile 的未读通知：公共天气/油价通知和本 Profile 的私有日程通知。",
+        description: "拉取当前 Hermes Profile 的未读通知：公共天气/油价通知和本 Profile 的私有日程通知。已 snooze（稍后提醒）的通知在到期前不会被返回，到期后照常恢复。",
       },
       {},
       (_args, context) => {

@@ -150,6 +150,27 @@ test("snooze defers the next delivery attempt until not_before passes", async ()
   assert.equal(after.sent, 1);
 });
 
+test("notify.pull must not deliver or cancel a snoozed notification before not_before passes", async () => {
+  clearQuietHours("profile-a");
+  const at = new Date("2027-07-01T10:00:00.000Z");
+  await publishProfile({ profileId: "profile-a", source: "schedule", title: "稍后提醒不提前送达", body: "半小时后再说", dedupeKey: "mgmt:snooze-pull:1" });
+  const notificationId = notificationIdFor("mgmt:snooze-pull:1");
+  snoozeProfileNotificationDelivery("profile-a", notificationId, 30, at);
+
+  const early = pullPending("profile-a", new Date("2027-07-01T10:10:00.000Z"));
+  assert.equal(
+    early.find((notice) => notice.dedupeKey === "mgmt:snooze-pull:1"),
+    undefined,
+    "snooze 未到期不得被 pull 提前返回",
+  );
+  assert.equal(deliveryStatus("mgmt:snooze-pull:1"), "pending", "pull 不得取消未到期的 snooze 投递");
+
+  const due = pullPending("profile-a", new Date("2027-07-01T10:31:00.000Z"));
+  const notice = due.find((entry) => entry.dedupeKey === "mgmt:snooze-pull:1");
+  assert.ok(notice, "not_before 过期后 pull 应正常恢复该通知");
+  assert.equal(deliveryStatus("mgmt:snooze-pull:1"), "cancelled", "pull 返回后 delivery 置 cancelled，避免双发");
+});
+
 test("snooze rejects uncertain in-flight failures within the idempotency window", async () => {
   await publishProfile({ profileId: "profile-a", source: "schedule", title: "不确定失败", body: "结果不确定时不能推迟", dedupeKey: "mgmt:uncertain:1" });
   const notificationId = notificationIdFor("mgmt:uncertain:1");

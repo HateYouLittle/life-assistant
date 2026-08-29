@@ -225,8 +225,16 @@ export function pullPending(value: ProfileContext | string, at: Date = new Date(
               OR (? IS NULL AND d.status = 'sending' AND d.claimed_at > ?)
             )
         )
+        AND NOT EXISTS (
+          -- snooze（not_before 在未来）的行不得被 pull 提前送达：pull 返回即取消
+          -- delivery，会把「稍后提醒」永久取消。等 not_before 过期后由本查询正常恢复。
+          SELECT 1 FROM profile_notification_deliveries d
+          WHERE d.notification_id = n.id AND d.profile_id = n.profile_id
+            AND d.status IN ('pending', 'failed', 'fallback')
+            AND d.not_before IS NOT NULL AND d.not_before > ?
+        )
       ORDER BY n.id ASC LIMIT 100
-    `).all(profile.id, profile.id, activeRoute ?? null, activeRoute ?? null, staleClaimAt, activeRoute ?? null, staleClaimAt) as Record<string, unknown>[];
+    `).all(profile.id, profile.id, activeRoute ?? null, activeRoute ?? null, staleClaimAt, activeRoute ?? null, staleClaimAt, time) as Record<string, unknown>[];
     const notices = [
       ...globalRows.map((row) => noticeFromRow(row, "global")),
       ...profileRows.map((row) => {
