@@ -84,7 +84,7 @@ interface JobDef {
 定时需求分为三个层级：
 
 1. `schedule` reminder：静态或重复个人提醒，存储于 SQLite，严格属于创建它的 Profile。recurrence 除 RRule 频率外还支持 `workday`（中国大陆法定工作日）与 `holiday`（仅法定节假日休假日），两者基于共享节假日数据计算，见「中国大陆节假日历法」。
-2. automation：用户可配置的动态任务，存储于 `automations` 表（Profile 私有）。白名单 action（`src/modules/automation/actions.ts`，全部复用模块 Provider）+ 条件 DSL（`{field, op, value}`，dot-path 取值，数值/字符串比较，字段缺失视为不满足）+ 调度（daily 带时区 / interval ≥5 分钟）。scheduler 按 `AUTOMATION_SCAN_CRON`（默认每 10 分钟）扫描到期任务并确定性执行，不调用 LLM。通知走 Profile 私有发布通道，dedupe key 含任务本地日期，同一任务每个本地日期最多主动提醒一次；到期即记 `last_run_at`（含失败），避免失败任务每个扫描周期重试；`automation.run` 手动执行不推进 `last_run_at`。
+2. automation：用户可配置的动态任务，存储于 `automations` 表（Profile 私有）。白名单 action（`src/modules/automation/actions.ts`，全部复用模块 Provider）+ 条件 DSL（`{field, op, value}`，dot-path 取值，数值/字符串比较，字段缺失视为不满足）+ 调度（daily 带时区 / interval ≥5 分钟）。scheduler 按 `AUTOMATION_SCAN_CRON`（默认每 10 分钟）扫描到期任务并确定性执行，不调用 LLM。通知走 Profile 私有发布通道，dedupe key 含任务本地日期，同一任务每个本地日期最多主动提醒一次；失败仅对 interval 任务推进 `last_run_at`（等下一间隔，避免失败任务每个扫描周期重试），daily 任务失败不推进——当日后续扫描周期仍会重试（重试频率受 `AUTOMATION_SCAN_CRON` 约束，默认每 10 分钟一次）；`automation.run` 手动执行不推进 `last_run_at`。
 3. code-defined module job：白名单之外的实时数据固定任务，由 scheduler 执行并通过标准通知接口发布。
 
 循环日程在提醒窗口内创建或更新时，只要目标时刻（occurrence 或 deadline）仍在未来，错过窗口的触发时刻会立即在下一次扫描补发（与一次性日程的补发语义一致）。

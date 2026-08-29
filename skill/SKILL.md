@@ -89,12 +89,12 @@ Hermes 将 MCP 工具注册为 `mcp_life_assistant_<tool>`，点号转换为下�
 - **记账**：`bookkeeping.entry_add` 记支出（expense）/收入（income）/转账（transfer）。金额单位是**元**（>0，最多两位小数）；expense/income 的 `category` 必填，transfer 必须省略 category 且提供两个不同账户（`accountId` 转出、`toAccountId` 转入）。`occurredAt` 可传 ISO 时间补记。
 - **金额单位注意**：`bookkeeping.entry_list`/`bookkeeping.entry_get` 返回 `amountCents`、账本/账户列表返回 `*BalanceCents`，均以**分**计；`bookkeeping.summary` 返回元。向用户转述时先换算，不要混淆单位。
 - **修改/删除**：`bookkeeping.entry_update`/`bookkeeping.entry_delete` 需要 `version` 乐观锁——先 `bookkeeping.entry_get` 取当前 version 再提交；冲突报错后重新读取再重试，不要盲目重试。条目类型（expense/income/transfer）不可变；category/note 传空字符串可清除。
-- **共享账本**：`bookkeeping.ledger_create` 创建（创建者即 owner）；`bookkeeping.member_add`/`bookkeeping.member_remove` 邀请或移除成员（owner 专属，不能移除 owner 本人；profileId 只要求格式合法，对方无需提前存在）。`bookkeeping.account_create(ledgerId)` 在账本下创建余额全员共享的公共账户（owner 专属），带 `initialBalance` 时自动补一条「期初余额」流水。共享账本内记账/修改/删除会自动通知除记录人外的其他成员；改删流水限记录人本人或 owner，共享流水跨账本移出限 owner。
+- **共享账本**：`bookkeeping.ledger_create` 创建（创建者即 owner）；`bookkeeping.member_add`/`bookkeeping.member_remove` 邀请或移除成员（owner 专属，不能移除 owner 本人；profileId 只要求格式合法，对方无需提前存在）。`bookkeeping.account_create(ledgerId)` 在账本下创建余额全员共享的公共账户（owner 专属），带 `initialBalance` 时自动补一条「期初余额」流水（该流水按收入计入创建当月的 `summary` 与月报 income，回答当月收支时应知悉此口径）。共享账本内记账/修改/删除会自动通知除记录人外的其他成员；改删流水限记录人本人或 owner，共享流水跨账本移出限 owner。
 - **查询与汇总**：`bookkeeping.summary` 返回指定月份（yyyy-LL，按配置时区切自然月）的收入/支出/结余与分类聚合；其中**账户余额为当前实时值，不是所选月份的月末快照**，回答用户时如实说明。
 - **跨账本转账**：转账是单流水设计——流水记入其中一侧账本，对端账本成员通过通知可见该笔变动（通知带对端账户/账本信息），但对端账本的流水列表与汇总不包含该条；用户问「对方账本里怎么没有这笔」时按此解释。
-- **月度账单**：每月 1 号 scheduler 自动推送上月个人 + 各共享账本收支汇总（上月无流水的 Profile 静默跳过）。不要另建 LLM cron 重复实现它。
+- **月度账单**：每月 1 号 scheduler 自动推送上月个人 + 各共享账本收支汇总（上月无流水的 Profile 静默跳过）。月报是 1 号推送时刻的快照，之后补记的上月流水不会出现在任何月报；用户补记上月流水并追问月报时如实说明。不要另建 LLM cron 重复实现它。
 - 账户不再使用但仍有历史流水时，用 `bookkeeping.account_update(archived: true)` 归档而不是删除（有流水的账户 `bookkeeping.account_delete` 会被拒绝）。
-- **通知显示（2026-08-29）**：共享账本变动通知里，账户显示**账户名**（如「生活费-公共账户」）、账户行内的账本显示**账本名**（如「生活费」），均回落 UUID/ID；「记录人」显示 `PROFILE_DISPLAY_NAMES` 映射的友好名（可选 `.env` 配置，JSON 形如 `{"default":"臭臭小王","bestie":"拉拉大王"}`），未配置时回落 profile id。改 `.env` 后需重启 scheduler + 网关 + dashboard 才生效（MCP 进程启动时读 env）。
+- **通知显示（2026-08-29）**：共享账本变动通知里，账户显示**账户名**（如「生活费-公共账户」）、账户行内的账本显示**账本名**（如「生活费」），均回落 UUID/ID；「记录人」显示 `PROFILE_DISPLAY_NAMES` 映射的友好名（可选 `.env` 配置，JSON 形如 `{"default":"臭臭小王","bestie":"拉拉大王"}`），未配置时回落 profile id。改 `.env` 后需重启 scheduler 与读取该配置的 MCP 进程才生效（进程启动时读 env；网关/dashboard 不读取该配置，重启无作用）。
 
 ## 定时任务边界
 

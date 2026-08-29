@@ -166,7 +166,7 @@ hermes -p "<profile>" webhook subscribe "life-assistant-<profile>" \
   --deliver-only
 ```
 
-Hermes route URL 必须使用上面显式保存的同一个 `<gateway-port>`，形如 `http://127.0.0.1:<gateway-port>/webhooks/<route-name>`。Life Assistant 只接受 loopback HTTP(S) URL。对应的配置形状如下，值均为占位符：
+Hermes route URL 必须使用上面显式保存的同一个 `<gateway-port>`，形如 `http://127.0.0.1:<gateway-port>/webhooks/<route-name>`。Life Assistant 只接受主机名为 `127.0.0.1` 或 `[::1]` 的 HTTP(S) URL（`localhost` 等其他 loopback 写法会被拒绝）。对应的配置形状如下，值均为占位符：
 
 ```json
 {
@@ -251,6 +251,7 @@ systemctl status --no-pager life-assistant-scheduler.service
 | `DATA_DIR` | SQLite/WAL 和旧 `store.json` 迁移源；生产必须使用绝对路径 |
 | `HERMES_PROFILE` | MCP 进程的 Profile 身份；必填且不得静默回退 |
 | `PROFILE_PUSH_ROUTES_JSON` | Profile 到 Hermes route、loopback URL、HMAC secret 的映射 |
+| `PROFILE_DISPLAY_NAMES` | 可选，Profile 显示名映射（JSON，如 `{"default":"我","bestie":"对象"}`）；共享账本通知的「记录人」用友好名替代 profile id，非法 JSON/非字符串值丢弃该字段并回落 profile id |
 | `LIFE_ASSISTANT_TIMEZONE` | scheduler 简报/预警渲染时区，以及 schedule 创建/更新时未显式指定 timezone 的默认时区。**生产部署必须显式设置（IANA 名称，如 `Asia/Shanghai`）**：否则日报/去重按机器本地时区计算，跨时区部署会出现「今日」语义错位 |
 | `DAILY_WEATHER_BRIEF_CRON` | 每日生活简报 cron，默认 `0 7 * * *` |
 | `HOLIDAY_REFRESH_CRON` | 节假日安排每日刷新 cron（Asia/Shanghai），默认 `0 2 * * *` |
@@ -261,6 +262,8 @@ systemctl status --no-pager life-assistant-scheduler.service
 | `QWEATHER_API_HOST` | 可选，和风天气 API host；**新式 API Key 绑定专属 host（如 `xxx.re.qweatherapi.com`），必须配置，否则全部 403 Invalid Host 静默降级 Open-Meteo（官方预警也不可用）**；旧订阅 key 保持默认 `devapi.qweather.com` |
 | `TIANAPI_KEY` | 可选，油价首选数据源 |
 | `JUHE_KEY` | 可选，油价兜底数据源 |
+
+天气预警扫描（每 15 分钟）与油价调价 watch（每天 09:00）的 cron 为内置固定值，不支持环境变量调整。
 
 旧 `NOTIFY_WEBHOOK_URL`、`BARK_URL`、`SERVERCHAN_SENDKEY` 已是迁移期 no-op，不要在新部署中配置。
 
@@ -286,13 +289,15 @@ systemctl status --no-pager life-assistant-scheduler.service
 
 - **白名单 action**：`weather.current`、`weather.forecast`（days 1–7）、`airquality.current`、`oilprice.current`，全部复用模块 Provider，不调用 LLM；
 - **条件 DSL**：`{ field, op, value }`，field 是 action 结果的 dot-path（如 `today.precipAmountMm`、`aqi`、`p92`；注意 `today.precipProb` 仅 Open-Meteo 数据源有值，和风路径用 `precipAmountMm`），支持 `> >= < <= == !=`；字段缺失视为不满足；缺省条件表示到点必提醒；
-- **调度**：`daily`（每天 HH:mm，可带 IANA 时区）或 `interval`（每 N 分钟，最小 5）；scheduler 按 `AUTOMATION_SCAN_CRON`（默认每 10 分钟）扫描到期任务；
+- **调度**：`daily`（每天 HH:mm，可带 IANA 时区）或 `interval`（每 N 分钟，最小 5）；scheduler 按 `AUTOMATION_SCAN_CRON`（默认每 10 分钟）扫描到期任务，interval 任务实际执行最长延迟一个扫描周期（默认 10 分钟）；
 - **投递**：条件满足时走 Profile 私有通知通道（静默时段、outbox、`notify.pull` 兜底全部适用）；dedupe key 含任务本地日期，同一任务每个本地日期最多主动提醒一次；daily 任务当日执行失败不影响当日后续重试（失败不记为当日已完成，下次扫描仍会尝试），成功一次后当日不再重复执行；interval 任务失败则等待下一轮扫描；
 - **工具**：`automation.create / list / update / delete / run`；`run` 立即手动执行一次用于验证配置，不影响既定调度节奏；单任务失败只记录 `last_error`，不阻断其它任务。
 
 ## 备份与迁移
 
 `assistant.export` 导出当前 Profile 的 JSON 快照（日程全量含完成/归档状态与强提醒配置、自动任务、静默时段和共享位置），`assistant.import` 按 ID 幂等导入：已存在的条目跳过不覆盖，非法条目跳过并计数；共享位置仅在 `applyLocation: true` 时覆盖（位置是全 Profile 共享数据）。快照不含通知历史与 Webhook secret；当前导出格式 `EXPORT_VERSION=2`（v1 旧快照仍可导入，其中无强提醒字段，导入后强提醒视为未开启），超出支持范围的快照版本会显式拒绝；单类条目超过 1000 条时快照带 `truncated: true`（不完整，需分批处理）。
+
+注意：`assistant.export` 与 `schedule.list`/`schedule.get` 是只读查询，但若存在 `next_run_at` 已损坏的日程行，读取时的自愈会将其停用并落库（一次写操作）。备份前无需处理，但纯备份场景下 WAL 可能因此增长。
 
 ## 平台切换
 
@@ -363,7 +368,7 @@ hermes -p "<profile>" webhook subscribe "<route-name>" \
 - **共享账本**：`ledger_create` 创建（创建者即 owner），`member_add`/`member_remove` 管理成员（owner 专属，不能移除 owner 本人）；`account_create(ledgerId)` 在账本下创建**共享账户**（如家庭公共资金池），余额全员共享可见，任意成员可记账；
 - **流水**：`entry_add`/`entry_list`/`entry_get`/`entry_update`/`entry_delete`；金额单位是元（>0，最多两位小数，存储为分）；`transfer` 需要两个不同账户；修改/删除用 `version` 乐观锁，冲突后重新读取再重试。改/删权限：记录人本人，或共享账本 owner；
 - **余额**：永不落库，由全部流水实时派生（含转账双边）。跨账本转账为**单流水**设计：流水记入共享账本后，对端账本成员通过 `shared_entry` 通知可见该笔变动（通知带对端账户/账本信息），但对端账本的流水列表/汇总**不包含**该条目；
-- **通知**：共享账本内记账/修改/删除会通知除记录人外的每个成员；每月 1 号（`BOOKKEEPING_REPORT_CRON`，默认 09:00）scheduler 推送上月个人 + 各共享账本收支汇总，上月无流水的 Profile 静默跳过；
+- **通知**：共享账本内记账/修改/删除会通知除记录人外的每个成员；每月 1 号（`BOOKKEEPING_REPORT_CRON`，默认 09:00）scheduler 推送上月个人 + 各共享账本收支汇总，上月无流水的 Profile 静默跳过。月报是 1 号推送时刻的快照：之后补记的上月流水不会出现在任何月报；
 - **汇总**：`summary` 返回指定月（`yyyy-LL`，按配置时区切自然月）的收入/支出/结余、分类聚合与账户余额清单（单位为元）；其中**账户余额为当前实时值，非所选月份月末快照**。
 
 ## 工具一览

@@ -32,7 +32,7 @@ export const automationModule: AssistantModule = {
     withTool(
       {
         name: "create",
-        description: `创建当前 Profile 的私有自动任务（确定性执行，不使用 LLM）。scheduler 按 schedule 到点执行白名单 action，条件满足（或无条件）时通过主动通知提醒；同一任务每个本地日期最多主动提醒一次。可用 action：\n${actionHelp}`,
+        description: `创建当前 Profile 的私有自动任务（确定性执行，不使用 LLM）。scheduler 按 schedule 到点执行白名单 action（实际检查频率受扫描周期 AUTOMATION_SCAN_CRON 约束，默认每 10 分钟，interval 任务最长延迟一个扫描周期），条件满足（或无条件）时通过主动通知提醒；同一任务每个本地日期最多主动提醒一次。可用 action：\n${actionHelp}`,
       },
       {
         name: z.string().min(1).max(100).describe("任务名，如 早晨下雨提醒"),
