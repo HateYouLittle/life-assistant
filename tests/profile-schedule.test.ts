@@ -112,7 +112,7 @@ test("push routes accept only strong loopback webhook configurations", () => {
     badRoute: { route: "bad route", url: "http://localhost:8644/webhooks/reminder", secret: strongA },
   }));
   assert.equal(Object.getPrototypeOf(routes), null);
-  assert.deepEqual(Object.keys(routes).sort(), ["constructor", "default"]);
+  assert.deepEqual(Object.keys(routes).sort(), ["constructor", "default", "localhostRoute"]);
   assert.equal(routes["constructor"].secret, strongB);
 });
 
@@ -2649,7 +2649,7 @@ test("S2: exhausted ordinary RRule schedules are created and updated as complete
   db.prepare("DELETE FROM schedules WHERE profile_id = ? AND id IN (?, ?)").run(a.id, created.id, active.id);
 });
 
-test("S5: hydration repairs a row with an invalid next_run_at in the database", () => {
+test("S5: read hydration reports an invalid next_run_at without writing", () => {
   const a = requireProfileContext("profile-a");
   const stamp = "2099-01-01T00:00:00.000Z";
   db.prepare(`
@@ -2658,7 +2658,7 @@ test("S5: hydration repairs a row with an invalid next_run_at in the database", 
       '{"frequency":"daily","interval":1,"calendar":"solar"}',
       '[{"minutesBefore":0,"id":"reminder-1","target":"occurrence"}]', 1, 'not-a-date', 1, ?, ?)
   `).run(a.id, stamp, stamp);
-  // 自愈会静默停用用户日程，必须经 logHydrationError 留痕，否则坏行消失无线索。
+  // 只读 hydration 不写库，但必须经 logHydrationError 留痕。
   const originalConsoleError = console.error;
   const errors: string[] = [];
   console.error = (...args: unknown[]) => { errors.push(args.map(String).join(" ")); };
@@ -2668,7 +2668,7 @@ test("S5: hydration repairs a row with an invalid next_run_at in the database", 
     const row = db.prepare(
       "SELECT next_run_at, enabled FROM schedules WHERE profile_id = ? AND id = ?",
     ).get(a.id, "bad-next-run-repair") as Record<string, unknown>;
-    assert.deepEqual({ ...row }, { next_run_at: null, enabled: 0 });
+    assert.deepEqual({ ...row }, { next_run_at: "not-a-date", enabled: 1 });
     assert.ok(
       errors.some((line) => line.includes("hydration") && line.includes("bad-next-run-repair")),
       `S5 自愈必须记录日志，实际记录：${JSON.stringify(errors)}`,

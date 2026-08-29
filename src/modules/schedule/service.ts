@@ -791,6 +791,7 @@ export function resetHydrationErrorLog(): void {
 function rowToItem(
   row: Record<string, unknown>,
   findImpl: typeof findOccurrence = findOccurrence,
+  options: { repair?: boolean } = {},
 ): ScheduleItem {
   const recurrence = sanitizeRecurrence(parseJson(row.recurrence_json, null), String(row.calendar) as CalendarType);
   // leap_month_policy 列是闰月策略的权威存储：即使 recurrence_json 漂移/缺失也以列值为准，
@@ -863,10 +864,12 @@ function rowToItem(
       // 自愈会静默停用用户日程（enabled=0），必须经 logHydrationError 留痕（自带去重窗口）。
       logHydrationError(item.profileId, item.id, error);
       item.nextRunAt = undefined;
-      getDatabase().prepare(`
-        UPDATE schedules SET next_run_at = NULL, enabled = 0, updated_at = ?
-        WHERE profile_id = ? AND id = ?
-      `).run(nowIso(), item.profileId, item.id);
+      if (options.repair !== false) {
+        getDatabase().prepare(`
+          UPDATE schedules SET next_run_at = NULL, enabled = 0, updated_at = ?
+          WHERE profile_id = ? AND id = ?
+        `).run(nowIso(), item.profileId, item.id);
+      }
       return item;
     }
     try {
@@ -982,14 +985,14 @@ export function listSchedules(value: ProfileContext | string, options: ScheduleL
   const rawUpcoming = Number(options.upcoming ?? 100);
   const limit = Math.min(Math.max(Number.isInteger(rawUpcoming) && rawUpcoming >= 1 ? rawUpcoming : 100, 1), 500);
   const rows = getDatabase().prepare(`SELECT * FROM schedules WHERE ${clauses.join(" AND ")} ORDER BY COALESCE(next_run_at, '9999-12-31T23:59:59.999Z'), created_at LIMIT ${limit}`).all(...values) as Record<string, unknown>[];
-  return rows.map((row) => rowToItem(row));
+  return rows.map((row) => rowToItem(row, findOccurrence, { repair: false }));
 }
 
 export function getSchedule(value: ProfileContext | string, id: string): ScheduleItem {
   const profile = asProfileContext(value);
   const row = getDatabase().prepare("SELECT * FROM schedules WHERE profile_id = ? AND id = ?").get(profile.id, id) as Record<string, unknown> | undefined;
   if (!row) throw new Error("schedule not found");
-  return rowToItem(row);
+  return rowToItem(row, findOccurrence, { repair: false });
 }
 
 export function updateSchedule(value: ProfileContext | string, id: string, changes: Partial<ScheduleInput>, at: Date = new Date()): ScheduleItem {
@@ -1315,8 +1318,9 @@ export function completeSchedule(value: ProfileContext | string, id: string, occ
 export function hydrateRow(
   row: Record<string, unknown>,
   findImpl: typeof findOccurrence = findOccurrence,
+  options: { repair?: boolean } = { repair: true },
 ): ScheduleItem {
-  return rowToItem(row, findImpl);
+  return rowToItem(row, findImpl, options);
 }
 
 export function nextEventAfter(item: ScheduleItem, event: ValidDateTime): ValidDateTime | null {

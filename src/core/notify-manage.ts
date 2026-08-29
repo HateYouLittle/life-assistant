@@ -217,6 +217,14 @@ export function pullPending(value: ProfileContext | string, at: Date = new Date(
       FROM profile_notifications n
       LEFT JOIN profile_notification_reads r ON r.notification_id = n.id AND r.profile_id = ?
       WHERE n.profile_id = ? AND r.notification_id IS NULL
+        AND (
+          json_extract(n.envelope, '$.payload.ledgerId') IS NULL
+          OR EXISTS (
+            SELECT 1 FROM ledger_members lm
+            WHERE lm.ledger_id = json_extract(n.envelope, '$.payload.ledgerId')
+              AND lm.profile_id = n.profile_id
+          )
+        )
         AND NOT EXISTS (
           SELECT 1 FROM profile_notification_deliveries d
           WHERE d.notification_id = n.id AND d.profile_id = n.profile_id

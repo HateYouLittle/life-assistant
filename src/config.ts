@@ -55,7 +55,7 @@ export function parseProfilePushRoutes(raw: string | undefined): Record<string, 
       if (!/^[a-z0-9][a-z0-9._-]{0,63}$/.test(route.route) || !isStrongWebhookSecret(route.secret)) continue;
       try {
         const url = new URL(route.url);
-        const loopbackHosts = new Set(["127.0.0.1", "[::1]"]);
+        const loopbackHosts = new Set(["127.0.0.1", "[::1]", "localhost"]);
         if ((url.protocol !== "http:" && url.protocol !== "https:")
           || !loopbackHosts.has(url.hostname)
           || url.username
@@ -161,9 +161,9 @@ export const config = {
 
   /** 调度周期（cron 表达式），可在模块注册时覆盖 */
   cron: {
-    weatherAlerts: "*/15 * * * *",
+    weatherAlerts: nonBlankOrDefault(process.env.WEATHER_ALERTS_CRON, "*/15 * * * *"),
     dailyWeatherBrief: nonBlankOrDefault(process.env.DAILY_WEATHER_BRIEF_CRON, "0 7 * * *"),
-    oilWatch: "0 9 * * *",
+    oilWatch: nonBlankOrDefault(process.env.OIL_WATCH_CRON, "0 9 * * *"),
     holidayRefresh: nonBlankOrDefault(process.env.HOLIDAY_REFRESH_CRON, "0 2 * * *"),
     automationScan: nonBlankOrDefault(process.env.AUTOMATION_SCAN_CRON, "*/10 * * * *"),
     // 每月 1 号推送上月记账月度账单（bookkeeping.monthly_report）。

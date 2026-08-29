@@ -24,6 +24,9 @@ test.after(() => {
 
 test("personal ledger is lazily created exactly once", () => {
   const a = requireProfileContext("profile-a");
+  const fresh = requireProfileContext("profile-lazy");
+  assert.equal(svc.listLedgers(fresh).length, 1);
+  assert.equal(svc.listAccounts(fresh).length, 0);
   const first = svc.ensurePersonalLedger(a);
   assert.equal(first.type, "personal");
   assert.equal(first.ownerProfileId, "profile-a");
@@ -95,6 +98,20 @@ test("entries adjust derived balances including double-sided transfers", async (
   // 无账户的收支仍可记账，落个人账本
   const orphan = await svc.addEntry(a, { type: "expense", amount: 9.9, category: "杂项" });
   assert.equal(orphan.accountId, undefined);
+});
+
+test("balance aggregation reports safe-integer overflow clearly", async () => {
+  const a = requireProfileContext("profile-a");
+  const account = await svc.createAccount(a, { name: "超大余额" });
+  for (let i = 0; i < 11; i += 1) {
+    await svc.addEntry(a, { type: "income", amount: MAX_AMOUNT_YUAN, category: "大额", accountId: account.id });
+  }
+  try {
+    assert.throws(() => svc.accountBalanceCents(account.id), /safe integer range/i);
+  } finally {
+    db.prepare("DELETE FROM ledger_entries WHERE account_id = ?").run(account.id);
+    db.prepare("DELETE FROM ledger_accounts WHERE id = ?").run(account.id);
+  }
 });
 
 test("entry update and delete enforce optimistic locking", async () => {

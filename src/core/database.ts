@@ -81,6 +81,7 @@ export function migrateDatabaseSchema(db: DatabaseSync): void {
       last_error TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
+      ledger_id TEXT,
       PRIMARY KEY (profile_id, notification_id, route),
       FOREIGN KEY (profile_id, notification_id) REFERENCES profile_notifications(profile_id, id) ON DELETE CASCADE
     );
@@ -245,6 +246,7 @@ export function migrateDatabaseSchema(db: DatabaseSync): void {
     ensureColumn(db, "profile_notification_deliveries", "claimed_at", "TEXT");
     // v5：snooze/延迟投递生效点；NULL 表示不延迟。
     ensureColumn(db, "profile_notification_deliveries", "not_before", "TEXT");
+    ensureColumn(db, "profile_notification_deliveries", "ledger_id", "TEXT");
     // v6：结构化快照；投递时据此重渲染 schedule.reminder 的相对时间并附加顺延原因。
     ensureColumn(db, "profile_notifications", "envelope", "TEXT");
     // v7：待办强提醒（schedules 可选列；NULL = 未开启强提醒）。

@@ -136,7 +136,7 @@ test("schema v3 additively upgrades legacy schedules without touching protected 
   assert.ok(columnNames(legacy, "schedules").includes("reminder_max_attempts"));
   // v5/v6/v7 的 additive 新列：只允许在表尾追加，不得改动既有列。
   const additiveColumns: Record<string, string[]> = {
-    profile_notification_deliveries: ["not_before"],
+    profile_notification_deliveries: ["not_before", "ledger_id"],
     profile_notifications: ["envelope"],
   };
   for (const table of protectedTables) {

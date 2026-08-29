@@ -12,6 +12,7 @@ process.env.LIFE_ASSISTANT_TIMEZONE = "Asia/Shanghai";
 const { requireProfileContext } = await import("../src/core/profile.js");
 const { getDatabase } = await import("../src/core/database.js");
 const svc = await import("../src/modules/bookkeeping/service.js");
+const { pullPending } = await import("../src/core/notify-manage.js");
 
 const db = getDatabase();
 
@@ -53,6 +54,16 @@ test("shared ledger lifecycle: owner auto-membership and member management", () 
   assert.throws(() => svc.listEntries(b(), ledger.id), /ledger not found/i);
   // 恢复成员关系供后续用例使用
   svc.addLedgerMember(a(), ledger.id, "profile-b");
+});
+
+test("removed member cannot pull queued shared-entry notifications", async () => {
+  const ledger = svc.createSharedLedger(a(), "通知撤销测试");
+  svc.addLedgerMember(a(), ledger.id, "profile-c");
+  const account = await svc.createAccount(a(), { name: "通知账户", ledgerId: ledger.id });
+  await svc.addEntry(a(), { type: "income", amount: 10, category: "测试", accountId: account.id });
+  svc.removeLedgerMember(a(), ledger.id, "profile-c");
+  const notices = pullPending(c());
+  assert.equal(notices.some((notice) => notice.source === "bookkeeping"), false);
 });
 
 test("shared accounts are owner-managed but member-writable", async () => {

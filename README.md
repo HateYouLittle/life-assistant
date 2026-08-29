@@ -257,13 +257,15 @@ systemctl status --no-pager life-assistant-scheduler.service
 | `HOLIDAY_REFRESH_CRON` | 节假日安排每日刷新 cron（Asia/Shanghai），默认 `0 2 * * *` |
 | `AUTOMATION_SCAN_CRON` | 自动任务扫描 cron，默认 `*/10 * * * *`；单任务调度在其 schedule 中定义 |
 | `BOOKKEEPING_REPORT_CRON` | 记账月度账单 cron，默认 `0 9 1 * *`（每月 1 号 09:00 推送上月收支汇总） |
+| `WEATHER_ALERTS_CRON` | 天气预警扫描 cron，默认 `*/15 * * * *` |
+| `OIL_WATCH_CRON` | 油价调价 watch cron，默认 `0 9 * * *` |
 | `LOCATION_CITY/LAT/LON` | 可选预置共享位置；未设置时由 Agent 首次确认 |
 | `QWEATHER_KEY` | 可选，和风天气实时/预报/官方预警和 GeoAPI |
 | `QWEATHER_API_HOST` | 可选，和风天气 API host；**新式 API Key 绑定专属 host（如 `xxx.re.qweatherapi.com`），必须配置，否则全部 403 Invalid Host 静默降级 Open-Meteo（官方预警也不可用）**；旧订阅 key 保持默认 `devapi.qweather.com` |
 | `TIANAPI_KEY` | 可选，油价首选数据源 |
 | `JUHE_KEY` | 可选，油价兜底数据源 |
 
-天气预警扫描（每 15 分钟）与油价调价 watch（每天 09:00）的 cron 为内置固定值，不支持环境变量调整。
+天气预警扫描与油价调价 watch 的默认 cron 可分别通过 `WEATHER_ALERTS_CRON`、`OIL_WATCH_CRON` 覆盖。
 
 旧 `NOTIFY_WEBHOOK_URL`、`BARK_URL`、`SERVERCHAN_SENDKEY` 已是迁移期 no-op，不要在新部署中配置。
 

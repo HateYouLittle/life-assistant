@@ -115,6 +115,18 @@ function rowToItem(row: Record<string, unknown>): AutomationItem {
   };
 }
 
+function rowToItemReadable(row: Record<string, unknown>): AutomationItem {
+  try { return rowToItem(row); } catch (error) {
+    return {
+      id: String(row.id), profileId: String(row.profile_id), name: String(row.name ?? "(损坏)"),
+      action: String(row.action ?? ""), params: {}, enabled: false,
+      lastError: `automation data corrupted: ${error instanceof Error ? error.message : String(error)}`,
+      createdAt: String(row.created_at ?? ""), updatedAt: String(row.updated_at ?? ""),
+      schedule: { type: "interval", minutes: 60 },
+    };
+  }
+}
+
 export function createAutomation(value: ProfileContext | string, input: AutomationCreateInput): AutomationItem {
   const profile = asProfileContext(value);
   const name = z.string().min(1).max(100).parse(input.name);
@@ -165,7 +177,7 @@ export function listAutomations(value: ProfileContext | string, options: Automat
   const rows = getDatabase().prepare(
     `SELECT * FROM automations WHERE ${clauses.join(" AND ")} ORDER BY created_at, rowid`,
   ).all(...params as any[]) as Array<Record<string, unknown>>;
-  return rows.map(rowToItem);
+  return rows.map(rowToItemReadable);
 }
 
 export function getAutomation(value: ProfileContext | string, id: string): AutomationItem {
@@ -174,7 +186,7 @@ export function getAutomation(value: ProfileContext | string, id: string): Autom
     "SELECT * FROM automations WHERE profile_id = ? AND id = ?",
   ).get(profile.id, id) as Record<string, unknown> | undefined;
   if (!row) throw new Error(`automation ${id} 不存在或不属于当前 Profile`);
-  return rowToItem(row);
+  return rowToItemReadable(row);
 }
 
 export interface AutomationUpdateInput {
@@ -205,11 +217,15 @@ export function updateAutomation(value: ProfileContext | string, id: string, cha
     ? current.schedule
     : normalizeSchedule(automationScheduleSchema.parse(changes.schedule));
   const enabled = changes.enabled === undefined ? current.enabled : changes.enabled;
+  const configChanged = changes.name !== undefined || changes.action !== undefined || changes.params !== undefined
+    || changes.condition !== undefined || changes.schedule !== undefined || changes.enabled !== undefined;
 
   getDatabase().prepare(`
     UPDATE automations
     SET name = ?, action = ?, params_json = ?, condition_json = ?, schedule_json = ?,
-        enabled = ?, last_error = NULL, updated_at = ?
+        enabled = ?, last_run_at = CASE WHEN ? THEN NULL ELSE last_run_at END,
+        last_result = CASE WHEN ? THEN NULL ELSE last_result END,
+        last_error = NULL, updated_at = ?
     WHERE profile_id = ? AND id = ?
   `).run(
     name,
@@ -218,6 +234,8 @@ export function updateAutomation(value: ProfileContext | string, id: string, cha
     condition === undefined ? null : JSON.stringify(condition),
     JSON.stringify(schedule),
     enabled ? 1 : 0,
+    configChanged ? 1 : 0,
+    configChanged ? 1 : 0,
     new Date().toISOString(),
     profile.id,
     id,

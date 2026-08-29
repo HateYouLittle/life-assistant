@@ -17,8 +17,8 @@ export interface Location {
 const KEY = "location:current";
 
 export const locationSetSchema = z.object({
-  city: z.string().min(1).max(64),
-  province: z.string().optional(),
+  city: z.string().transform((v) => v.trim()).pipe(z.string().min(1).max(64)),
+  province: z.string().optional().transform((v) => v?.trim() || undefined),
   lat: z.number().min(-90).max(90),
   lon: z.number().min(-180).max(180),
 });
@@ -43,7 +43,7 @@ export function currentLocation(): Location | null {
     // env 预置坐标同样校验有限性与范围，非法视为未配置
     if (Number.isFinite(lat) && Number.isFinite(lon) && lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180) {
       return {
-        city: config.location.city,
+        city: config.location.city.trim(),
         lat,
         lon,
         source: "env",
@@ -76,27 +76,28 @@ export function requireConfirmedLocation(): Location {
  *   只做临时查询，绝不写入 location:current（多 profile 共享 store 时避免互相污染）
  */
 export async function resolveLocation(city?: string): Promise<{ city: string; lat: number; lon: number }> {
-  if (!city) {
+  const normalizedCity = city?.trim();
+  if (!normalizedCity) {
     const loc = requireConfirmedLocation();
     return { city: loc.city, lat: loc.lat, lon: loc.lon };
   }
   if (config.qweatherKey) {
     try {
-      const geo = await qweatherGeo(city);
-      return { city, lat: geo.lat, lon: geo.lon };
+      const geo = await qweatherGeo(normalizedCity);
+      return { city: normalizedCity, lat: geo.lat, lon: geo.lon };
     } catch (e) {
-      console.error(`[location] qweather geo failed for "${city}": ${(e as Error).message}`);
+      console.error(`[location] qweather geo failed for "${normalizedCity}": ${(e as Error).message}`);
     }
   }
   const r = await httpJson<{ results?: Array<{ name: string; latitude: number; longitude: number }> }>(
-    `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(city)}&count=1&language=zh`,
+    `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(normalizedCity)}&count=1&language=zh`,
   );
   const hit = r.results?.[0];
-  if (!hit) throw new Error(`未找到城市：${city}`);
+  if (!hit) throw new Error(`未找到城市：${normalizedCity}`);
   // 与 location.detect 同一校验口径：坐标非有限数或越界时拒绝
   if (!Number.isFinite(hit.latitude) || !Number.isFinite(hit.longitude)
     || hit.latitude < -90 || hit.latitude > 90 || hit.longitude < -180 || hit.longitude > 180) {
-    throw new Error(`城市坐标无效：${city}`);
+    throw new Error(`城市坐标无效：${normalizedCity}`);
   }
   return { city: hit.name, lat: hit.latitude, lon: hit.longitude };
 }
@@ -144,7 +145,7 @@ const locationModule: AssistantModule = {
         name: "detect",
         description: "按城市名解析经纬度和省级行政区（先和风 GeoAPI，再 Open-Meteo Geocoding 兜底），用于用户口述城市后补全位置；确认后请把 province 一并传给 location.set。",
       },
-      { city: z.string().describe("城市名，如 北京 / 上海 / 朔城区") },
+      { city: z.string().transform((v) => v.trim()).pipe(z.string().min(1)).describe("城市名，如 北京 / 上海 / 朔城区") },
       async ({ city }) => {
         // 优先和风 GeoAPI：对中文区县（如"朔城区"）支持好
         if (config.qweatherKey) {

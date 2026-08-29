@@ -286,12 +286,17 @@ export async function fetchForecast(lat: number, lon: number, days = 3, city?: s
       );
       // 和风业务错误：HTTP 200 + code 字段（如 401/402/403）→ 抛出后走 Open-Meteo 降级
       assertQweatherOk(r.code, "weatherforecast");
-      if (r.daily !== undefined && r.daily.length === 0) {
+      if (r.daily !== undefined && r.daily.length < days) {
         // 空 daily 视为失败，继续 Open-Meteo 兜底，而不是把空数组返回给上层（N12）
         throw new Error("QWeather forecast returned empty daily");
       }
       if (r.daily) {
         return r.daily.slice(0, days).map((d) => {
+          const dateValid = /^\d{4}-\d{2}-\d{2}$/.test(d.fxDate)
+            && !Number.isNaN(Date.parse(`${d.fxDate}T00:00:00Z`));
+          if (!dateValid || !d.textDay?.trim() || !/^\d+$/.test(String(d.iconDay))) {
+            throw new Error("QWeather forecast returned invalid date/text/icon fields");
+          }
           const tMax = Number(d.tempMax);
           const tMin = Number(d.tempMin);
           // 温度等关键数值非法（NaN/Infinity）视为失败并走 Open-Meteo 兜底（N12）
@@ -302,7 +307,7 @@ export async function fetchForecast(lat: number, lon: number, days = 3, city?: s
             date: d.fxDate,
             tMax,
             tMin,
-            weatherText: d.textDay || (QW_TEXT[d.iconDay] ?? `code ${d.iconDay}`),
+            weatherText: d.textDay.trim(),
             // 和风 v7 daily 的 precip 是当日累计降水量（mm），实测（2026-08，专属 API host）
             // 响应中没有 precipProb 字段：阵雨日 precip=9.5 是毫米量，按概率解释会
             // 显示"概率 9%"并漏掉带伞建议。降水量缺失时置 undefined，不带噪音。

@@ -71,6 +71,7 @@ const CITY_TO_PROVINCE: Record<string, string> = {
   海口: "海南", 三亚: "海南",
   香港: "香港", 澳门: "澳门", 台湾: "台湾",
 };
+const PROVINCE_NAMES = ["河北","山西","辽宁","吉林","黑龙江","江苏","浙江","安徽","福建","江西","山东","河南","湖北","湖南","广东","海南","四川","贵州","云南","陕西","甘肃","青海","台湾","内蒙古","广西","西藏","宁夏","新疆","北京","天津","上海","重庆","香港","澳门"];
 
 /** Normalize a saved city/district name to the province names used by both providers. */
 export function provinceOf(city: string): string | undefined {
@@ -78,6 +79,8 @@ export function provinceOf(city: string): string | undefined {
   const provinces = new Set(Object.values(CITY_TO_PROVINCE));
   if (provinces.has(trimmed)) return trimmed;
   if (CITY_TO_PROVINCE[trimmed]) return CITY_TO_PROVINCE[trimmed];
+  const embeddedProvince = PROVINCE_NAMES.find((name) => trimmed.includes(name));
+  if (embeddedProvince) return embeddedProvince;
   for (const suffix of ["特别行政区", "维吾尔自治区", "壮族自治区", "回族自治区", "自治区", "省", "市"]) {
     if (!trimmed.endsWith(suffix)) continue;
     const withoutSuffix = trimmed.slice(0, -suffix.length);

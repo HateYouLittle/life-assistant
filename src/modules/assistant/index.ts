@@ -17,7 +17,7 @@ export const EXPORT_FORMAT = "life-assistant.export";
 /**
  * 导出快照格式版本：v1（无强提醒字段，intervalMinutes/maxAttempts 缺失 = 未开启）→
  * v2（含可选 intervalMinutes/maxAttempts，导入恢复强提醒）。仅影响导出文件格式，
- * 不动 DB schema（保持 v7）。
+ * 不动 DB schema（当前 schema v8，与导出格式版本独立）。
  */
 export const EXPORT_VERSION = 2;
 /** 单类条目导出上限；超过时快照带 truncated 标记，导入方应提示用户分批处理。 */
@@ -163,7 +163,7 @@ export function buildAssistantExport(profile: ProfileContext): AssistantExport {
     exportedAt: new Date().toISOString(),
     profile: profile.id,
     data: {
-      schedules: rows.slice(0, EXPORT_ROW_LIMIT).map((row) => toPortableSchedule(hydrateRow(row))),
+      schedules: rows.slice(0, EXPORT_ROW_LIMIT).map((row) => toPortableSchedule(hydrateRow(row, undefined, { repair: false }))),
       automations: exportedAutomations,
       quietHours: quiet ? { start: quiet.start, end: quiet.end, timezone: quiet.timezone } : null,
       location: loc ? { city: loc.city, province: loc.province, lat: loc.lat, lon: loc.lon } : null,

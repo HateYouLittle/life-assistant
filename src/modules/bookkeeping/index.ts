@@ -102,6 +102,7 @@ const bookkeepingModule: AssistantModule = {
       },
       {
         accountId: z.string().describe("账户 ID"),
+        version: z.number().int().min(1).optional().describe("可选乐观锁版本；提供时必须为当前 version"),
         name: z.string().min(1).max(100).optional().describe("新名称"),
         type: accountTypeSchema.optional(),
         archived: z.boolean().optional().describe("true 归档，false 恢复"),

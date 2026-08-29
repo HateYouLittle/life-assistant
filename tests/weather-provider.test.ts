@@ -41,6 +41,22 @@ test("QWeather forecast maps daily precip as precipitation amount in mm", async 
   }]);
 });
 
+test("QWeather short daily arrays fall back to Open-Meteo", async (t) => {
+  const originalKey = config.qweatherKey;
+  const originalFetch = globalThis.fetch;
+  config.qweatherKey = "test-key";
+  let calls = 0;
+  globalThis.fetch = (async (input) => {
+    calls += 1;
+    if (String(input).includes("/v7/weather/3d")) return Response.json({ daily: [{ fxDate: "2026-08-03", tempMax: "31", tempMin: "24", textDay: "晴", iconDay: "100", precip: "0" }] });
+    return Response.json({ daily: { time: ["2026-08-03", "2026-08-04", "2026-08-05"], temperature_2m_max: [30, 30, 30], temperature_2m_min: [20, 20, 20], weather_code: [0, 0, 0], precipitation_probability_max: [0, 0, 0] } });
+  }) as typeof fetch;
+  t.after(() => { config.qweatherKey = originalKey; globalThis.fetch = originalFetch; });
+  const forecast = await fetchForecast(39.9, 116.4, 3);
+  assert.equal(forecast.length, 3);
+  assert.equal(calls, 2);
+});
+
 test("QWeather current passes lon,lat order and maps now fields", async (t) => {
   const originalKey = config.qweatherKey;
   const originalFetch = globalThis.fetch;

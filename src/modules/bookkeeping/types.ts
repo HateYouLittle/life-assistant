@@ -154,6 +154,8 @@ export interface AccountCreateInput {
 }
 
 export interface AccountUpdateInput {
+  /** 可选乐观锁版本；提供时必须匹配当前 version。 */
+  version?: number;
   name?: string;
   type?: AccountType;
   archived?: boolean;

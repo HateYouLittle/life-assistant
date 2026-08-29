@@ -137,6 +137,9 @@ async function publishResolvedProfile(args: {
   const profile = requireProfileContext(args.profileId);
   const legacyDedupeKeys = args.legacyDedupeKeys ?? [];
   const { dedupeKey, envelope } = args;
+  const ledgerId = envelope && envelope.kind === "bookkeeping.shared_entry"
+    ? String((envelope as { payload?: { ledgerId?: unknown } }).payload?.ledgerId ?? "") || null
+    : null;
   const db = getDatabase();
   const time = nowIso();
   db.exec("BEGIN IMMEDIATE");
@@ -173,6 +176,10 @@ async function publishResolvedProfile(args: {
     const route = Object.prototype.hasOwnProperty.call(config.profilePushRoutes, profile.id)
       ? config.profilePushRoutes[profile.id]
       : undefined;
+    if (notificationId && ledgerId) {
+      db.prepare("UPDATE profile_notification_deliveries SET ledger_id = COALESCE(ledger_id, ?) WHERE profile_id = ? AND notification_id = ?")
+        .run(ledgerId, profile.id, notificationId);
+    }
     const ROUTE_CHANGED_ERROR = "configured webhook route changed";
     const alreadyHandled = notificationId
       ? db.prepare(`
@@ -195,9 +202,9 @@ async function publishResolvedProfile(args: {
       db.prepare(`
         INSERT OR IGNORE INTO profile_notification_deliveries(
           profile_id, notification_id, route, status, attempts,
-          next_attempt_at, created_at, updated_at
-        ) VALUES(?, ?, ?, 'pending', 0, ?, ?, ?)
-      `).run(profile.id, notificationId, route.route, time, time, time);
+          next_attempt_at, created_at, updated_at, ledger_id
+        ) VALUES(?, ?, ?, 'pending', 0, ?, ?, ?, ?)
+      `).run(profile.id, notificationId, route.route, time, time, time, ledgerId);
     }
     db.exec("COMMIT");
   } catch (error) {

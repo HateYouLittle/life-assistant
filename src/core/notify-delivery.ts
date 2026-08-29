@@ -140,7 +140,7 @@ export async function deliverPendingProfileNotifications(options: {
   const rows = db.prepare(`
     SELECT d.profile_id, d.notification_id, d.route, d.attempts,
            d.request_generation, d.request_started_at, d.transport_failures,
-           d.not_before, n.source, n.title, n.body, n.created_at, n.dedupe_key, n.envelope
+           d.not_before, d.ledger_id, n.source, n.title, n.body, n.created_at, n.dedupe_key, n.envelope
     FROM profile_notification_deliveries d
     JOIN profile_notifications n ON n.id = d.notification_id AND n.profile_id = d.profile_id
     WHERE (
@@ -150,6 +150,14 @@ export async function deliverPendingProfileNotifications(options: {
       AND NOT EXISTS (
         SELECT 1 FROM profile_notification_reads r
         WHERE r.profile_id = d.profile_id AND r.notification_id = d.notification_id
+      )
+      AND (
+        json_extract(n.envelope, '$.payload.ledgerId') IS NULL
+        OR EXISTS (
+          SELECT 1 FROM ledger_members lm
+          WHERE lm.ledger_id = json_extract(n.envelope, '$.payload.ledgerId')
+            AND lm.profile_id = d.profile_id
+        )
       )
     ORDER BY d.next_attempt_at, d.notification_id
     LIMIT 100
@@ -180,6 +188,13 @@ export async function deliverPendingProfileNotifications(options: {
       WHERE profile_id = ? AND notification_id = ? AND route = ? AND (
         (status IN ('pending', 'failed') AND next_attempt_at <= ? AND (not_before IS NULL OR not_before <= ?))
         OR (status = 'sending' AND claimed_at <= ?)
+      ) AND (
+        NOT EXISTS (SELECT 1 FROM profile_notifications n WHERE n.id = profile_notification_deliveries.notification_id AND json_extract(n.envelope, '$.payload.ledgerId') IS NOT NULL)
+        OR EXISTS (
+          SELECT 1 FROM profile_notifications n
+          JOIN ledger_members lm ON lm.ledger_id = json_extract(n.envelope, '$.payload.ledgerId') AND lm.profile_id = profile_notification_deliveries.profile_id
+          WHERE n.id = profile_notification_deliveries.notification_id
+        )
       )
     `).run(
       claimToken,

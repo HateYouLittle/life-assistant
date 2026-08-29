@@ -40,6 +40,12 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
+function safeAdd(a: number, b: number, label = "amount"): number {
+  const sum = a + b;
+  if (!Number.isSafeInteger(sum)) throw new Error(`${label} exceeds JavaScript safe integer range`);
+  return sum;
+}
+
 /** 元 → 分：拒绝非有限数、非正数、超过 9e12 元（分值超出安全整数范围）与两位以上小数（浮点噪声容忍 1e-6）。 */
 function toCents(amount: number): number {
   if (typeof amount !== "number" || !Number.isFinite(amount)) {
@@ -207,6 +213,7 @@ export function ensurePersonalLedger(value: ProfileContext | string, at: Date = 
 
 export function listLedgers(value: ProfileContext | string): LedgerView[] {
   const profile = asProfileContext(value);
+  ensurePersonalLedger(profile);
   const db = getDatabase();
   const rows = db.prepare(`
     SELECT l.*, m.role AS caller_role,
@@ -226,7 +233,7 @@ export function listLedgers(value: ProfileContext | string): LedgerView[] {
       role: row.caller_role as LedgerRole,
       memberCount: Number(row.member_count),
       accountCount: accounts.length,
-      totalBalanceCents: accounts.reduce((sum, account) => sum + account.balanceCents, 0),
+      totalBalanceCents: accounts.reduce((sum, account) => safeAdd(sum, account.balanceCents, "ledger balance"), 0),
       createdAt: ledger.createdAt,
     };
   });
@@ -290,29 +297,51 @@ export function removeLedgerMember(value: ProfileContext | string, ledgerId: str
   const profile = asProfileContext(value);
   const ledger = requireSharedOwner(profile, ledgerId);
   if (memberProfileId === ledger.ownerProfileId) throw new Error("cannot remove the ledger owner");
-  const result = getDatabase()
-    .prepare("DELETE FROM ledger_members WHERE ledger_id = ? AND profile_id = ?")
-    .run(ledgerId, memberProfileId);
-  if (result.changes === 0) throw new Error("member not found in this ledger");
+  const db = getDatabase();
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const result = db.prepare("DELETE FROM ledger_members WHERE ledger_id = ? AND profile_id = ?")
+      .run(ledgerId, memberProfileId) as { changes: number };
+    if (result.changes === 0) throw new Error("member not found in this ledger");
+    // 撤销移除前已排队的共享记账通知；JSON 条件兼容迁移前未填 ledger_id 的历史行。
+    db.prepare(`
+      UPDATE profile_notification_deliveries
+      SET status = 'cancelled', claim_token = NULL, claimed_at = NULL, updated_at = ?
+      WHERE profile_id = ? AND status IN ('pending', 'failed', 'fallback')
+        AND (ledger_id = ? OR (ledger_id IS NULL AND EXISTS (
+          SELECT 1 FROM profile_notifications n
+          WHERE n.id = profile_notification_deliveries.notification_id
+            AND n.profile_id = profile_notification_deliveries.profile_id
+            AND json_extract(n.envelope, '$.payload.ledgerId') = ?
+        )))
+    `).run(new Date().toISOString(), memberProfileId, ledgerId, ledgerId);
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
 }
 
 // ---------------------------------------------------------------------------
 // 账户与余额（余额 = 流水派生，跨账本聚合，见方案 §3）
 // ---------------------------------------------------------------------------
 
-const BALANCE_SQL = `SELECT COALESCE(SUM(CASE
-  WHEN type = 'income'   AND account_id = ?  THEN amount_cents
-  WHEN type = 'expense'  AND account_id = ?  THEN -amount_cents
-  WHEN type = 'transfer' AND account_id = ?  THEN -amount_cents
-  WHEN type = 'transfer' AND to_account_id = ? THEN amount_cents
-  ELSE 0 END), 0) AS balance_cents
-FROM ledger_entries WHERE account_id = ? OR to_account_id = ?`;
-
 export function accountBalanceCents(accountId: string): number {
-  const row = getDatabase().prepare(BALANCE_SQL).get(accountId, accountId, accountId, accountId, accountId, accountId) as {
-    balance_cents: number | bigint;
-  };
-  return Number(row.balance_cents);
+  const rows = getDatabase().prepare(
+    "SELECT type, account_id, to_account_id, amount_cents FROM ledger_entries WHERE account_id = ? OR to_account_id = ?",
+  ).all(accountId, accountId) as Array<{ type: string; account_id?: string; to_account_id?: string; amount_cents: number | bigint }>;
+  let value = 0n;
+  for (const row of rows) {
+    const amount = typeof row.amount_cents === "bigint" ? row.amount_cents : BigInt(row.amount_cents);
+    if (row.type === "income" && row.account_id === accountId) value += amount;
+    else if (row.type === "expense" && row.account_id === accountId) value -= amount;
+    else if (row.type === "transfer" && row.account_id === accountId) value -= amount;
+    else if (row.type === "transfer" && row.to_account_id === accountId) value += amount;
+  }
+  if (value > BigInt(Number.MAX_SAFE_INTEGER) || value < BigInt(Number.MIN_SAFE_INTEGER)) {
+    throw new Error("account balance exceeds JavaScript safe integer range");
+  }
+  return Number(value);
 }
 
 function withBalance(account: LedgerAccount): AccountView {
@@ -355,13 +384,14 @@ export async function createAccount(value: ProfileContext | string, input: Accou
     ownerProfileId = profile.id;
     ledgerId = null;
   }
+  if (kind === "personal") ensurePersonalLedger(profile, at);
   const db = getDatabase();
   const ts = at.toISOString();
   const id = crypto.randomUUID();
   // 期初流水与账户行同一事务落库；个人账本懒创建自带事务，须放在 BEGIN 之前解析。
   const opening = input.initialBalance !== undefined
     ? {
-        ledgerId: kind === "shared" ? ledgerId! : ensurePersonalLedger(profile).id,
+        ledgerId: kind === "shared" ? ledgerId! : ensurePersonalLedger(profile, at).id,
         amountCents: toCents(input.initialBalance),
         entryId: crypto.randomUUID(),
       }
@@ -406,6 +436,7 @@ export async function createAccount(value: ProfileContext | string, input: Accou
 
 export function listAccounts(value: ProfileContext | string, ledgerId?: string): AccountView[] {
   const profile = asProfileContext(value);
+  ensurePersonalLedger(profile);
   if (ledgerId !== undefined) {
     // 个人账本的账户按 owner 关联（ledger_id 为 NULL），共享账本按 ledger_id 关联。
     const ledger = requireLedgerForRead(profile, ledgerId);
@@ -439,9 +470,12 @@ export function updateAccount(
     type: changes.type ?? account.type,
     archived: changes.archived ?? account.archived,
   };
-  getDatabase().prepare(
-    "UPDATE ledger_accounts SET name = ?, type = ?, archived = ?, version = version + 1, updated_at = ? WHERE id = ?",
-  ).run(merged.name, merged.type, merged.archived ? 1 : 0, at.toISOString(), account.id);
+  const result = getDatabase().prepare(
+    `UPDATE ledger_accounts SET name = ?, type = ?, archived = ?, version = version + 1, updated_at = ?
+     WHERE id = ? ${changes.version !== undefined ? "AND version = ?" : ""}`,
+  ).run(...([merged.name, merged.type, merged.archived ? 1 : 0, at.toISOString(), account.id,
+    ...(changes.version !== undefined ? [changes.version] : [])] as any[])) as { changes: number };
+  if (result.changes === 0) throw new Error(`account version conflict: current version changed; expected ${changes.version ?? account.version}`);
   return withBalance(getAccountRow(account.id)!);
 }
 
@@ -819,7 +853,7 @@ function sumCategoryTotals(entries: LedgerEntry[], type: EntryType): CategoryTot
   for (const entry of entries) {
     if (entry.type !== type) continue;
     const key = entry.category ?? "未分类";
-    totals.set(key, (totals.get(key) ?? 0) + entry.amountCents);
+    totals.set(key, safeAdd(totals.get(key) ?? 0, entry.amountCents, "category total"));
   }
   return [...totals.entries()]
     .map(([category, amountCents]) => ({ category, amountCents }))
@@ -839,15 +873,15 @@ export function summarizeLedger(
   const entries = (getDatabase().prepare(
     "SELECT * FROM ledger_entries WHERE ledger_id = ? AND occurred_at >= ? AND occurred_at < ?",
   ).all(target, start, end) as Row[]).map(rowToEntry);
-  const incomeCents = entries.filter((e) => e.type === "income").reduce((sum, e) => sum + e.amountCents, 0);
-  const expenseCents = entries.filter((e) => e.type === "expense").reduce((sum, e) => sum + e.amountCents, 0);
+  const incomeCents = entries.filter((e) => e.type === "income").reduce((sum, e) => safeAdd(sum, e.amountCents, "income total"), 0);
+  const expenseCents = entries.filter((e) => e.type === "expense").reduce((sum, e) => safeAdd(sum, e.amountCents, "expense total"), 0);
   return {
     ledgerId: target,
     ledgerName: ledger.name,
     month: resolvedMonth,
     incomeCents,
     expenseCents,
-    netCents: incomeCents - expenseCents,
+    netCents: safeAdd(incomeCents, -expenseCents, "net total"),
     entryCount: entries.length,
     expenseByCategory: sumCategoryTotals(entries, "expense"),
     incomeByCategory: sumCategoryTotals(entries, "income"),
@@ -884,8 +918,8 @@ export function buildMonthlyReport(profileId: string, month: string): MonthlyRep
     .prepare("SELECT * FROM ledgers WHERE type = 'personal' AND owner_profile_id = ?")
     .get(profileId) as Row | undefined;
   const personalEntries = personalRow ? entriesIn(personalRow.id as string) : [];
-  const personalIncome = personalEntries.filter((e) => e.type === "income").reduce((s, e) => s + e.amountCents, 0);
-  const personalExpense = personalEntries.filter((e) => e.type === "expense").reduce((s, e) => s + e.amountCents, 0);
+  const personalIncome = personalEntries.filter((e) => e.type === "income").reduce((s, e) => safeAdd(s, e.amountCents, "income total"), 0);
+  const personalExpense = personalEntries.filter((e) => e.type === "expense").reduce((s, e) => safeAdd(s, e.amountCents, "expense total"), 0);
 
   const sharedLedgers = (db.prepare(`
     SELECT l.*, m.joined_at AS caller_joined_at FROM ledgers l
@@ -904,9 +938,9 @@ export function buildMonthlyReport(profileId: string, month: string): MonthlyRep
     return {
       ledgerId: ledger.id,
       ledgerName: ledger.name,
-      incomeCents: entries.filter((e) => e.type === "income").reduce((s, e) => s + e.amountCents, 0),
-      expenseCents: entries.filter((e) => e.type === "expense").reduce((s, e) => s + e.amountCents, 0),
-      balanceCents: accountsOfLedger(ledger).reduce((s, account) => s + account.balanceCents, 0),
+      incomeCents: entries.filter((e) => e.type === "income").reduce((s, e) => safeAdd(s, e.amountCents, "income total"), 0),
+      expenseCents: entries.filter((e) => e.type === "expense").reduce((s, e) => safeAdd(s, e.amountCents, "expense total"), 0),
+      balanceCents: accountsOfLedger(ledger).reduce((s, account) => safeAdd(s, account.balanceCents, "ledger balance"), 0),
     };
   });
 
@@ -918,7 +952,7 @@ export function buildMonthlyReport(profileId: string, month: string): MonthlyRep
     personal: {
       incomeCents: personalIncome,
       expenseCents: personalExpense,
-      netCents: personalIncome - personalExpense,
+      netCents: safeAdd(personalIncome, -personalExpense, "net total"),
       topCategories: sumCategoryTotals(personalEntries, "expense").slice(0, 5),
     },
     shared,
