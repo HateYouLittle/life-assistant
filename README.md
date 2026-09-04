@@ -244,7 +244,75 @@ systemctl status --no-pager life-assistant-scheduler.service
 
 确保 `.env` 中的 `DATA_DIR` 为绝对路径，且与所有 MCP 注册一致。同一 `DATA_DIR` 不要启动第二个 scheduler；SQLite 租约是故障防护，不是多实例部署模式。
 
-## 配置项
+## Web 仪表盘与只读 REST API
+
+Life Assistant 内置一个只读 Web 仪表盘：浏览器直接展示天气、空气质量、生活指数、油价、节假日/调休、日程、记账、自动化规则与系统健康，后端通过轻量只读 REST API 复用项目全部领域模块，不写库、不影响 scheduler 与 MCP。
+
+- **后端**：`src/server/`，基于 [Hono](https://hono.dev) 与 `@hono/node-server`，单端口同时托管 API 与前端静态产物（`@hono/node-server/serve-static` 提供 `dist/web`）。
+- **前端**：`web/`，Vite + React 19 + TypeScript + Tailwind CSS + Lucide Icons + `lunar-javascript`，暗黑 Bento Grid 布局，自适应明暗主题、骨架屏与响应式网格。
+- **端口**：默认 `3080`，由环境变量 `PORT` 覆盖。
+- **Profile 切换**：通过 `?profile=<id>` 查询参数或页头切换器；未指定时回落到 `HERMES_PROFILE`，再回落 `default`。
+
+### API 端点（全部只读 Get）
+
+| 端点 | 说明 |
+|---|---|
+| `/api/health` | 服务健康与当前 profile |
+| `/api/overview` | 聚合概览（位置、日历、天气、油价、日程计数、记账汇总、静默时段） |
+| `/api/weather` | 天气、7 日预报、AQI、官方预警、生活指数 |
+| `/api/oilprice` | 当前油价与下一次调价窗口 |
+| `/api/holiday` | 今日工作日/节假日、下一个法定节假日、全年安排与调休 |
+| `/api/schedules` | 日程与提醒（可按 `status`、`type` 过滤） |
+| `/api/bookkeeping` | 账户余额、月度收支汇总、最近流水、账本列表 |
+| `/api/automations` | 自动化规则与最近运行结果 |
+
+所有端点支持可选 `?profile=<id>`。天气/油价端点会实际请求上游（和风/Open-Meteo/TianAPI），其余端点读取本地 SQLite。
+
+### 运行（前台调试）
+
+```bash
+set -a
+source .env
+set +a
+npm run dev:web        # tsx 热重载
+npm run start:web      # 生产模式，读取 dist/web 静态资源
+```
+
+### systemd 常驻服务
+
+生产环境建议由 systemd 托管，与 scheduler 同等运维标准。先取得 Node 绝对路径并替换下方占位符，保存为 `/etc/systemd/system/life-assistant-web.service`：
+
+```ini
+[Unit]
+Description=Life Assistant Web - responsive dashboard and read-only REST API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=<service-user>
+WorkingDirectory=/absolute/path/to/life-assistant
+EnvironmentFile=/absolute/path/to/life-assistant/.env
+Environment=DATA_DIR=/absolute/path/to/life-assistant/data
+Environment=PORT=3080
+ExecStart=/absolute/path/to/node /absolute/path/to/life-assistant/dist/server/index.js
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+加载、启动并验证：
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now life-assistant-web.service
+systemctl is-active life-assistant-web.service
+curl -s http://127.0.0.1:3080/api/health
+```
+
+前端/后端构建已并入根 `npm run build`（先 `tsc` 编译 Node，再 `vite build` 产出 `dist/web`），`dist/web` 与 `dist/server` 同属一端口拓扑，无需额外 Nginx 或反向代理。
 
 | 变量 | 用途 |
 |---|---|

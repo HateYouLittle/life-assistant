@@ -6,3 +6,4 @@ data/
 *.log
 .npm-cache/
 .zcode/
+*.tsbuildinfo

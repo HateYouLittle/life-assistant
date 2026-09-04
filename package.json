@@ -8,15 +8,20 @@
     "node": ">=22.13"
   },
   "scripts": {
-    "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.json",
+    "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.json && npm run build:web",
     "test": "node --import tsx/esm --test tests/*.test.ts",
     "start": "node dist/index.js",
     "start:scheduler": "node dist/scheduler.js",
     "dev": "tsx src/index.ts",
-    "dev:scheduler": "tsx src/scheduler.ts"
+    "dev:scheduler": "tsx src/scheduler.ts",
+    "start:web": "node dist/server/index.js",
+    "dev:web": "tsx src/server/index.ts",
+    "build:web": "npm --prefix web run build"
   },
   "dependencies": {
+    "@hono/node-server": "^2.0.12",
     "@modelcontextprotocol/sdk": "^1.12.0",
+    "hono": "^4.13.2",
     "lunar-javascript": "^1.7.7",
     "luxon": "^3.7.2",
     "node-cron": "^3.0.3",
