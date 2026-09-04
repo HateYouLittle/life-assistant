@@ -11,9 +11,13 @@ process.env.HERMES_PROFILE = "test-profile";
 process.env.LIFE_ASSISTANT_TIMEZONE = "Asia/Shanghai";
 
 const { createApp } = await import("../src/server/app.js");
+// 路由 handler 会惰性打开数据库单例（core/database.ts 的 module-level connection）。
+// Windows 下 rmSync 删除目录前必须先关闭连接，否则 SQLite/WAL 文件句柄未释放 → EPERM。
+const { resetDatabaseForTests } = await import("../src/core/database.js");
 const app = createApp();
 
 after(() => {
+  resetDatabaseForTests();
   fs.rmSync(testDataDir, { recursive: true, force: true });
 });
 
@@ -136,5 +140,55 @@ describe("Backend Read-only REST API Server", () => {
     assert.equal(res.status, 200);
     const body = (await res.json()) as any;
     assert.equal(body.profile, "configured-profile");
+  });
+});
+
+describe("API token auth & CORS", () => {
+  const secured = createApp({ apiToken: "topsecret" });
+
+  it("rejects missing token when configured", async () => {
+    const res = await secured.request("/api/health");
+    assert.equal(res.status, 401);
+  });
+
+  it("rejects a wrong token when configured", async () => {
+    const res = await secured.request("/api/health", {
+      headers: { Authorization: "Bearer wrong" },
+    });
+    assert.equal(res.status, 401);
+  });
+
+  it("accepts a bearer token via Authorization header", async () => {
+    const res = await secured.request("/api/health", {
+      headers: { Authorization: "Bearer topsecret" },
+    });
+    assert.equal(res.status, 200);
+  });
+
+  it("accepts the token via ?token= query param", async () => {
+    const res = await secured.request("/api/health?token=topsecret");
+    assert.equal(res.status, 200);
+  });
+
+  it("leaves the API open when no token is configured", async () => {
+    const open = createApp();
+    const res = await open.request("/api/health");
+    assert.equal(res.status, 200);
+  });
+
+  it("does not reflect a non-loopback CORS origin", async () => {
+    const app = createApp();
+    const res = await app.request("/api/health", {
+      headers: { Origin: "https://evil.example.com" },
+    });
+    assert.equal(res.headers.get("access-control-allow-origin"), null);
+  });
+
+  it("reflects a loopback CORS origin", async () => {
+    const app = createApp();
+    const res = await app.request("/api/health", {
+      headers: { Origin: "http://localhost:5173" },
+    });
+    assert.equal(res.headers.get("access-control-allow-origin"), "http://localhost:5173");
   });
 });

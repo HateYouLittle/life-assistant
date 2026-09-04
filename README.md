@@ -14,7 +14,7 @@ Life Assistant 是面向 Hermes Agent 的 Skill + MCP 服务，提供天气、�
 | 通知 | Profile SQLite outbox、Hermes HMAC V2 `deliver-only` Webhook、`notify.pull` 失败兜底；静默时段、snooze、取消与通知列表 |
 | 备份 | `assistant.export` / `assistant.import`：日程、自动任务、静默时段与位置的 JSON 快照，按 ID 幂等导入 |
 
-当前共注册 46 个 MCP 工具。快递追踪已经封存，未注册到运行时。
+当前共注册 41 个 MCP 工具、6 个定时 job。快递追踪已经封存，未注册到运行时。
 
 ## 架构概览
 
@@ -246,14 +246,36 @@ systemctl status --no-pager life-assistant-scheduler.service
 
 ## Web 仪表盘与只读 REST API
 
-Life Assistant 内置一个只读 Web 仪表盘：浏览器直接展示天气、空气质量、生活指数、油价、节假日/调休、日程、记账、自动化规则与系统健康，后端通过轻量只读 REST API 复用项目全部领域模块，不写库、不影响 scheduler 与 MCP。
+Life Assistant 内置一个 Web 仪表盘：浏览器直接展示天气、空气质量、生活指数、油价、节假日/调休、日程、记账、自动化规则与系统健康，后端通过 REST API 复用项目全部领域模块。
 
 - **后端**：`src/server/`，基于 [Hono](https://hono.dev) 与 `@hono/node-server`，单端口同时托管 API 与前端静态产物（`@hono/node-server/serve-static` 提供 `dist/web`）。
 - **前端**：`web/`，Vite + React 19 + TypeScript + Tailwind CSS + Lucide Icons + `lunar-javascript`，暗黑 Bento Grid 布局，自适应明暗主题、骨架屏与响应式网格。
 - **端口**：默认 `3080`，由环境变量 `PORT` 覆盖。
+- **绑定地址**：默认 `127.0.0.1`（仅本机回环），由 `HOST` 覆盖。**默认只监听回环是刻意的安全默认**——API 无内置认证，任何能访问该地址的调用方都能用 `?profile=` 读取任意身份的数据。
 - **Profile 切换**：通过 `?profile=<id>` 查询参数或页头切换器；未指定时回落到 `HERMES_PROFILE`，再回落 `default`。
 
-### API 端点（全部只读 Get）
+> ⚠️ **"只读"的准确含义**：后端绝大多数是读写查询（不写库），但有两处例外会让"只读看板"产生副作用——① 天气/油价/概览端点会**真实请求上游**（和风/Open-Meteo/TianAPI），消耗第三方配额；② `schedule` 读取时若发现 `next_run_at` 损坏会**自愈停用该行并落库**（一次写操作）。此外这些查询会读取本地 SQLite。
+
+#### Web API 鉴权
+
+默认（未配置任何 token）时 API **无鉴权**，仅靠绑定 `127.0.0.1` 隔离——这对本机单用户是合理默认。若你打算让服务监听 `0.0.0.0`（局域网/公网访问），**必须**先配置 `WEB_API_TOKEN`，否则任何访问者都能越权读取全部 Profile 的数据：
+
+- `WEB_API_TOKEN=<secret>`：设置后，所有 `/api/*` 请求必须携带 `Authorization: Bearer <token>` 或 `?token=<token>`，否则返回 `401`。未设置时行为保持不变。
+- 配置了 `WEB_API_TOKEN` 后，**前端静态页面默认不带 token**，会收到 401。此时请用 `curl`/带 token 的客户端访问 API，或部署时给前端请求加上 token（见下方"前端示意"）。更常见的做法是本机看板不配 token，仅通过 `127.0.0.1` 访问。
+
+```bash
+# 仅本机访问（推荐默认）
+HOST=127.0.0.1
+# 需要局域网/公网访问时，务必配置 token
+HOST=0.0.0.0
+WEB_API_TOKEN=your-long-random-secret
+```
+
+- `WEBCORS_ORIGIN`：可选，逗号分隔的额外 CORS 白名单来源（默认只放行 `127.0.0.1`/`localhost`/`[::1]` 任意端口）。只在你从特定域名或端口跨域访问时才需要设置。
+
+前端跨域示意（配 token 时的 `fetch`）：把 `?token=<WEB_API_TOKEN>` 附加到每个 `/api/*` URL（也可用 `Authorization` 头）。前端实现默认不带 token——它设计为本机零配置看板。
+
+#### API 端点（全部 Get）
 
 | 端点 | 说明 |
 |---|---|
@@ -332,6 +354,9 @@ curl -s http://127.0.0.1:3080/api/health
 | `QWEATHER_API_HOST` | 可选，和风天气 API host；**新式 API Key 绑定专属 host（如 `xxx.re.qweatherapi.com`），必须配置，否则全部 403 Invalid Host 静默降级 Open-Meteo（官方预警也不可用）**；旧订阅 key 保持默认 `devapi.qweather.com` |
 | `TIANAPI_KEY` | 可选，油价首选数据源 |
 | `JUHE_KEY` | 可选，油价兜底数据源 |
+| `HOST` | 可选，web 服务绑定地址，默认 `127.0.0.1`（仅本机回环）。暴露到局域网/公网前必须先配 `WEB_API_TOKEN` |
+| `WEB_API_TOKEN` | 可选，web API 鉴权令牌。设置后所有 `/api/*` 请求须带 `Authorization: Bearer <token>` 或 `?token=<token>`，否则 401；未设置时本机零配置可用（靠回环绑定隔离） |
+| `WEBCORS_ORIGIN` | 可选，额外 CORS 白名单来源（逗号分隔）。默认只放行 `127.0.0.1`/`localhost`/`[::1]` |
 
 天气预警扫描与油价调价 watch 的默认 cron 可分别通过 `WEATHER_ALERTS_CRON`、`OIL_WATCH_CRON` 覆盖。
 
