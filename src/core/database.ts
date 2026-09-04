@@ -81,6 +81,7 @@ export function migrateDatabaseSchema(db: DatabaseSync): void {
       last_error TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
+      not_before TEXT,
       ledger_id TEXT,
       PRIMARY KEY (profile_id, notification_id, route),
       FOREIGN KEY (profile_id, notification_id) REFERENCES profile_notifications(profile_id, id) ON DELETE CASCADE

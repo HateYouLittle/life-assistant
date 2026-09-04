@@ -27,7 +27,8 @@ function originAllowed(requestOrigin: string | undefined): boolean {
   if (!requestOrigin) return false;
   try {
     const url = new URL(requestOrigin);
-    return allowedCorsOrigins().has(url.hostname);
+    const allowed = allowedCorsOrigins();
+    return allowed.has(url.hostname) || allowed.has(requestOrigin) || allowed.has(url.origin);
   } catch {
     return false;
   }
@@ -45,12 +46,18 @@ export function createApp(options?: { profile?: string; apiToken?: string }) {
     c.header("Referrer-Policy", "no-referrer");
   });
 
-  // CORS：默认仅反射本机回环来源；Origin 不匹配时不返回 CORS 头。
+  // CORS & 预检 OPTIONS：默认仅放行本机回环或配置来源；
+  // 必须先于 Token 鉴权中间件执行，避免浏览器发送的无 Token 预检被 401 拦截。
   app.use("*", async (c, next) => {
     const origin = c.req.header("origin");
     if (originAllowed(origin)) {
       c.header("Access-Control-Allow-Origin", origin!);
       c.header("Vary", "Origin");
+      c.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+      c.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+    }
+    if (c.req.method === "OPTIONS") {
+      return originAllowed(origin) ? c.body(null, 204) : c.body(null, 403);
     }
     await next();
   });

@@ -8,6 +8,8 @@ import { currentOilPriceResult, nextAdjustmentSummary } from "../../modules/oilp
 import { fetchOilPrice } from "../../modules/oilprice/provider.js";
 import { listSchedules } from "../../modules/schedule/service.js";
 import { fetchCurrent, fetchForecast } from "../../modules/weather/provider.js";
+import { weatherCacheGet, weatherCacheKey, weatherCacheSet } from "./weather.js";
+import { oilPriceCacheGet, oilPriceCacheSet } from "./oilprice.js";
 import type { AppEnv } from "../types.js";
 
 export const overviewRoute = new Hono<AppEnv>();
@@ -29,27 +31,38 @@ overviewRoute.get("/", async (c) => {
 
   let weather = null;
   if (loc) {
-    try {
-      const [current, forecast] = await Promise.all([
-        fetchCurrent(loc.lat, loc.lon, loc.city),
-        fetchForecast(loc.lat, loc.lon, 1, loc.city),
-      ]);
-      weather = { current, forecast };
-    } catch {
-      weather = null;
+    const key = weatherCacheKey(loc);
+    const cached = weatherCacheGet(key) as { current?: unknown; forecast?: unknown[] } | undefined;
+    if (cached?.current) {
+      weather = { current: cached.current, forecast: cached.forecast };
+    } else {
+      try {
+        const [current, forecast] = await Promise.all([
+          fetchCurrent(loc.lat, loc.lon, loc.city),
+          fetchForecast(loc.lat, loc.lon, 1, loc.city),
+        ]);
+        weather = { current, forecast };
+      } catch {
+        weather = null;
+      }
     }
   }
 
   let oilprice = null;
   if (loc) {
-    try {
-      const obs = await fetchOilPrice(loc.city);
-      const current = currentOilPriceResult(obs);
-      const nextAdjustment = nextAdjustmentSummary();
-      oilprice = { current, nextAdjustment };
-    } catch {
-      oilprice = null;
+    const cachedCurrent = oilPriceCacheGet(loc.city) as any;
+    let current = cachedCurrent;
+    if (!current) {
+      try {
+        const obs = await fetchOilPrice(loc.city);
+        current = currentOilPriceResult(obs);
+        if (current) oilPriceCacheSet(loc.city, current);
+      } catch {
+        current = null;
+      }
     }
+    const nextAdjustment = nextAdjustmentSummary();
+    oilprice = { current, nextAdjustment };
   }
 
   const activeCount = listSchedules(profile, { status: "active" }).length;

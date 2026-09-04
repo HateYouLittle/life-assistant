@@ -105,10 +105,17 @@ export default function App() {
         bookkeepingRes,
         automationsRes,
         healthRes,
-      ].filter((r) => r.status === "rejected");
+      ].filter((r) => r.status === "rejected") as PromiseRejectedResult[];
 
-      if (failures.length > 0 && !overviewRes) {
-        setError("部分数据接口加载失败，已展示已获取内容");
+      if (failures.length > 0) {
+        const isUnauthorized = failures.some((f) => String(f.reason).includes("401") || String(f.reason).includes("Unauthorized"));
+        if (isUnauthorized) {
+          setError("API 鉴权失败（401 Unauthorized）：请在 URL 添加 ?token=<your_token> 或检查后台 WEB_API_TOKEN");
+        } else if (failures.length === 8) {
+          setError("获取看板数据失败：全部后端接口无法连接");
+        } else {
+          setError("部分数据接口加载失败，已展示已获取内容");
+        }
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : "获取看板数据失败");

@@ -16,7 +16,8 @@
     "dev:scheduler": "tsx src/scheduler.ts",
     "start:web": "node dist/server/index.js",
     "dev:web": "tsx src/server/index.ts",
-    "build:web": "npm --prefix web run build"
+    "build:web": "npm --prefix web run build",
+    "postinstall": "npm --prefix web install"
   },
   "dependencies": {
     "@hono/node-server": "^2.0.12",

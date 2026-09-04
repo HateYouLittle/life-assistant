@@ -16,6 +16,20 @@ interface RequestOptions {
   delayMs?: number;
 }
 
+export function getStoredApiToken(): string | null {
+  try {
+    const params = new URLSearchParams(window.location.search);
+    const urlToken = params.get("token");
+    if (urlToken) {
+      localStorage.setItem("web_api_token", urlToken);
+      return urlToken;
+    }
+    return localStorage.getItem("web_api_token");
+  } catch {
+    return null;
+  }
+}
+
 export async function fetchApi<T>(
   path: string,
   options: RequestOptions = {}
@@ -32,18 +46,28 @@ export async function fetchApi<T>(
     }
   }
 
+  const token = getStoredApiToken();
+  const headers: Record<string, string> = {
+    Accept: "application/json",
+  };
+  if (token) {
+    headers["Authorization"] = `Bearer ${token}`;
+  }
+
   let attempt = 0;
   let lastError: unknown;
 
   while (attempt <= retries) {
     try {
       const res = await fetch(url.toString(), {
-        headers: {
-          Accept: "application/json",
-        },
+        headers,
       });
 
       if (!res.ok) {
+        // 401 认证失败不重试，直接抛出
+        if (res.status === 401) {
+          throw new Error("HTTP 401: Unauthorized (请检查 WEB_API_TOKEN)");
+        }
         throw new Error(`HTTP ${res.status}: ${res.statusText}`);
       }
 
@@ -51,6 +75,9 @@ export async function fetchApi<T>(
       return data;
     } catch (err) {
       lastError = err;
+      if (err instanceof Error && err.message.includes("401")) {
+        break;
+      }
       attempt++;
       if (attempt <= retries) {
         await new Promise((resolve) => setTimeout(resolve, delayMs * Math.pow(1.5, attempt - 1)));

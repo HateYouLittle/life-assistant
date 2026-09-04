@@ -14,7 +14,7 @@ Life Assistant 是面向 Hermes Agent 的 Skill + MCP 服务，提供天气、�
 | 通知 | Profile SQLite outbox、Hermes HMAC V2 `deliver-only` Webhook、`notify.pull` 失败兜底；静默时段、snooze、取消与通知列表 |
 | 备份 | `assistant.export` / `assistant.import`：日程、自动任务、静默时段与位置的 JSON 快照，按 ID 幂等导入 |
 
-当前共注册 41 个 MCP 工具、6 个定时 job。快递追踪已经封存，未注册到运行时。
+当前共注册 46 个 MCP 工具、6 个定时 job。快递追踪已经封存，未注册到运行时。
 
 ## 架构概览
 

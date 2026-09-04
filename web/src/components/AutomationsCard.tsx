@@ -88,7 +88,7 @@ export const AutomationsCard: React.FC<AutomationsCardProps> = ({
         </div>
         <div className="flex items-center gap-1.5 px-2 py-1 rounded-lg bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 text-[11px] font-medium">
           <Cpu className="w-3 h-3" />
-          <span>PORT 3080</span>
+          <span>PORT {typeof window !== "undefined" && window.location.port ? window.location.port : "3080"}</span>
         </div>
       </div>
 

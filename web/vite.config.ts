@@ -7,6 +7,15 @@ export default defineConfig({
   build: {
     outDir: path.resolve(__dirname, "../dist/web"),
     emptyOutDir: true,
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          vendor: ["react", "react-dom"],
+          lucide: ["lucide-react"],
+          lunar: ["lunar-javascript"],
+        },
+      },
+    },
   },
   server: {
     port: 5173,

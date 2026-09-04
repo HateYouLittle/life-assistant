@@ -92,6 +92,14 @@ describe("Backend Read-only REST API Server", () => {
     assert.ok(Array.isArray(body.ledgers));
   });
 
+  it("GET /api/bookkeeping?month=2026-08 -> filters by month", async () => {
+    const res = await app.request("/api/bookkeeping?month=2026-08");
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as any;
+    assert.equal(body.summary.month, "2026-08");
+    assert.ok(Array.isArray(body.entries));
+  });
+
   it("GET /api/automations -> 200 and contains items array", async () => {
     const res = await app.request("/api/automations");
     assert.equal(res.status, 200);
@@ -190,5 +198,51 @@ describe("API token auth & CORS", () => {
       headers: { Origin: "http://localhost:5173" },
     });
     assert.equal(res.headers.get("access-control-allow-origin"), "http://localhost:5173");
+  });
+
+  it("handles CORS preflight OPTIONS without token on secured app", async () => {
+    const res = await secured.request("/api/health", {
+      method: "OPTIONS",
+      headers: {
+        Origin: "http://localhost:5173",
+        "Access-Control-Request-Method": "GET",
+        "Access-Control-Request-Headers": "Authorization",
+      },
+    });
+    assert.equal(res.status, 204);
+    assert.equal(res.headers.get("access-control-allow-origin"), "http://localhost:5173");
+    assert.equal(res.headers.get("access-control-allow-methods"), "GET, POST, OPTIONS");
+    assert.ok(res.headers.get("access-control-allow-headers")?.includes("Authorization"));
+  });
+
+  it("reflects WEBCORS_ORIGIN configured with full protocol", async () => {
+    process.env.WEBCORS_ORIGIN = "https://dashboard.example.com,http://192.168.1.100:3000";
+    try {
+      const app = createApp();
+      const res1 = await app.request("/api/health", {
+        headers: { Origin: "https://dashboard.example.com" },
+      });
+      assert.equal(res1.headers.get("access-control-allow-origin"), "https://dashboard.example.com");
+
+      const res2 = await app.request("/api/health", {
+        headers: { Origin: "http://192.168.1.100:3000" },
+      });
+      assert.equal(res2.headers.get("access-control-allow-origin"), "http://192.168.1.100:3000");
+    } finally {
+      delete process.env.WEBCORS_ORIGIN;
+    }
+  });
+});
+
+describe("Oilprice cache", async () => {
+  const { oilPriceCacheGet, oilPriceCacheSet, oilPriceCacheClear } = await import("../src/server/routes/oilprice.js");
+
+  it("stores and retrieves oil price by city within TTL", () => {
+    oilPriceCacheClear();
+    assert.equal(oilPriceCacheGet("南昌"), undefined);
+    oilPriceCacheSet("南昌", { p92: "7.80" }, 1000);
+    assert.deepEqual(oilPriceCacheGet("南昌", 3600_000, 2000), { p92: "7.80" });
+    assert.equal(oilPriceCacheGet("南昌", 3600_000, 1000 + 3600_001), undefined);
+    oilPriceCacheClear();
   });
 });
