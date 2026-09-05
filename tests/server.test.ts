@@ -100,6 +100,40 @@ describe("Backend Read-only REST API Server", () => {
     assert.ok(Array.isArray(body.entries));
   });
 
+  it("GET /api/bookkeeping aggregates personal and shared ledgers", async () => {
+    const bkSvc = await import("../src/modules/bookkeeping/service.js");
+    const sharedLedger = bkSvc.createSharedLedger("test-profile", "测试共享账本", new Date("2026-08-01T00:00:00.000Z"));
+    const sharedAcc = await bkSvc.createAccount("test-profile", {
+      ledgerId: sharedLedger.id,
+      name: "公共账户",
+      type: "bank",
+    });
+    await bkSvc.addEntry("test-profile", {
+      type: "expense",
+      amount: 52,
+      category: "餐饮",
+      accountId: sharedAcc.id,
+      occurredAt: "2026-08-15T12:00:00.000Z",
+    });
+
+    // 1. 默认无 ledgerId：聚合个人与共享账本
+    const resAll = await app.request("/api/bookkeeping?month=2026-08");
+    assert.equal(resAll.status, 200);
+    const bodyAll = (await resAll.json()) as any;
+    assert.equal(bodyAll.summary.expenseCents, 5200);
+    assert.equal(bodyAll.summary.entryCount, 1);
+    assert.ok(bodyAll.entries.some((e: any) => e.amountCents === 5200));
+
+    // 2. 指定 personal ledgerId：只有个人账本数据（0）
+    const personalLedger = bodyAll.ledgers.find((l: any) => l.type === "personal");
+    assert.ok(personalLedger);
+    const resPersonal = await app.request(`/api/bookkeeping?ledgerId=${personalLedger.id}&month=2026-08`);
+    assert.equal(resPersonal.status, 200);
+    const bodyPersonal = (await resPersonal.json()) as any;
+    assert.equal(bodyPersonal.summary.expenseCents, 0);
+    assert.equal(bodyPersonal.summary.entryCount, 0);
+  });
+
   it("GET /api/automations -> 200 and contains items array", async () => {
     const res = await app.request("/api/automations");
     assert.equal(res.status, 200);

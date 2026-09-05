@@ -645,6 +645,77 @@ export function listEntries(
   return rows.map(rowToEntry);
 }
 
+/**
+ * 汇总当前 Profile 可见的所有账本流水（个人账本 + 其加入的所有共享账本）。
+ * 共享账本流水按加入时间（joined_at）截断（L15）。
+ */
+export function listProfileEntries(
+  value: ProfileContext | string,
+  options: EntryListOptions = {},
+): LedgerEntry[] {
+  const profile = asProfileContext(value);
+  ensurePersonalLedger(profile);
+  const db = getDatabase();
+
+  const personalRow = db
+    .prepare("SELECT id FROM ledgers WHERE type = 'personal' AND owner_profile_id = ?")
+    .get(profile.id) as Row | undefined;
+  const personalId = personalRow ? (personalRow.id as string) : undefined;
+
+  const sharedRows = db.prepare(`
+    SELECT l.id, m.joined_at
+    FROM ledgers l
+    JOIN ledger_members m ON m.ledger_id = l.id AND m.profile_id = ?
+    WHERE l.type = 'shared'
+  `).all(profile.id) as Array<{ id: string; joined_at: string }>;
+
+  const ledgerClauses: string[] = [];
+  const ledgerValues: string[] = [];
+
+  if (personalId) {
+    ledgerClauses.push("ledger_id = ?");
+    ledgerValues.push(personalId);
+  }
+  for (const s of sharedRows) {
+    ledgerClauses.push("(ledger_id = ? AND occurred_at >= ?)");
+    ledgerValues.push(s.id, s.joined_at);
+  }
+
+  if (ledgerClauses.length === 0) {
+    return [];
+  }
+
+  const clauses: string[] = [`(${ledgerClauses.join(" OR ")})`];
+  const values: string[] = [...ledgerValues];
+
+  if (options.type) {
+    clauses.push("type = ?");
+    values.push(options.type);
+  }
+  if (options.category) {
+    clauses.push("category = ?");
+    values.push(options.category);
+  }
+  if (options.from !== undefined) {
+    clauses.push("occurred_at >= ?");
+    values.push(normalizeTimestamp(options.from, options.from));
+  }
+  if (options.to !== undefined) {
+    clauses.push("occurred_at <= ?");
+    values.push(normalizeTimestamp(options.to, options.to));
+  }
+
+  const rawLimit = options.limit ?? 50;
+  const limit = Math.min(Math.max(Number.isFinite(rawLimit) ? Math.trunc(rawLimit) : 50, 1), 500);
+  const rawOffset = options.offset ?? 0;
+  const offset = Math.max(Number.isFinite(rawOffset) ? Math.trunc(rawOffset) : 0, 0);
+
+  const rows = db.prepare(
+    `SELECT * FROM ledger_entries WHERE ${clauses.join(" AND ")} ORDER BY occurred_at DESC, created_at DESC LIMIT ${limit} OFFSET ${offset}`,
+  ).all(...values) as Row[];
+  return rows.map(rowToEntry);
+}
+
 export function getEntry(value: ProfileContext | string, ledgerId: string, entryId: string): LedgerEntry {
   const profile = asProfileContext(value);
   requireLedgerForRead(profile, ledgerId);
@@ -886,6 +957,70 @@ export function summarizeLedger(
     expenseByCategory: sumCategoryTotals(entries, "expense"),
     incomeByCategory: sumCategoryTotals(entries, "income"),
     accounts: listAccounts(profile, target).map((account): AccountBalanceView => ({
+      id: account.id,
+      name: account.name,
+      type: account.type,
+      kind: account.kind,
+      archived: account.archived,
+      balanceCents: account.balanceCents,
+    })),
+  };
+}
+
+/**
+ * 汇总单个 Profile 的全量账本月度数据（个人账本 + 各共享账本）。
+ * 共享账本按成员加入时间截断（L15）。
+ */
+export function summarizeProfileLedgers(
+  value: ProfileContext | string,
+  month?: string,
+): SummaryView {
+  const profile = asProfileContext(value);
+  ensurePersonalLedger(profile);
+  const resolvedMonth = month ?? currentMonthKey();
+  const { start, end } = monthRange(resolvedMonth);
+  const db = getDatabase();
+
+  const personalRow = db
+    .prepare("SELECT * FROM ledgers WHERE type = 'personal' AND owner_profile_id = ?")
+    .get(profile.id) as Row | undefined;
+  const personalId = personalRow ? String(personalRow.id) : undefined;
+  const personalEntries: LedgerEntry[] = personalId
+    ? (db.prepare(
+        "SELECT * FROM ledger_entries WHERE ledger_id = ? AND occurred_at >= ? AND occurred_at < ?",
+      ).all(personalId, start, end) as Row[]).map(rowToEntry)
+    : [];
+
+  const sharedLedgers = db.prepare(`
+    SELECT l.id, m.joined_at
+    FROM ledgers l
+    JOIN ledger_members m ON m.ledger_id = l.id AND m.profile_id = ?
+    WHERE l.type = 'shared'
+  `).all(profile.id) as Array<{ id: string; joined_at: string }>;
+
+  const sharedEntries: LedgerEntry[] = [];
+  for (const { id, joined_at } of sharedLedgers) {
+    const rows = db.prepare(
+      "SELECT * FROM ledger_entries WHERE ledger_id = ? AND occurred_at >= ? AND occurred_at < ? AND occurred_at >= ?",
+    ).all(id, start, end, joined_at) as Row[];
+    sharedEntries.push(...rows.map(rowToEntry));
+  }
+
+  const allEntries = [...personalEntries, ...sharedEntries];
+  const incomeCents = allEntries.filter((e) => e.type === "income").reduce((sum, e) => safeAdd(sum, e.amountCents, "income total"), 0);
+  const expenseCents = allEntries.filter((e) => e.type === "expense").reduce((sum, e) => safeAdd(sum, e.amountCents, "expense total"), 0);
+
+  return {
+    ledgerId: personalRow ? (personalRow.id as string) : "all",
+    ledgerName: "个人与共享账本汇总",
+    month: resolvedMonth,
+    incomeCents,
+    expenseCents,
+    netCents: safeAdd(incomeCents, -expenseCents, "net total"),
+    entryCount: allEntries.length,
+    expenseByCategory: sumCategoryTotals(allEntries, "expense"),
+    incomeByCategory: sumCategoryTotals(allEntries, "income"),
+    accounts: listAccounts(profile).map((account): AccountBalanceView => ({
       id: account.id,
       name: account.name,
       type: account.type,

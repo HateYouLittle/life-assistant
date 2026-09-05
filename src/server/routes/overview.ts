@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import { DateTime } from "luxon";
 import { getQuietHours } from "../../core/notification-settings.js";
-import { summarizeLedger } from "../../modules/bookkeeping/service.js";
+import { summarizeProfileLedgers } from "../../modules/bookkeeping/service.js";
 import { dayInfo, nextHoliday } from "../../modules/holiday/calendar.js";
 import { currentLocation } from "../../modules/location/index.js";
 import { currentOilPriceResult, nextAdjustmentSummary } from "../../modules/oilprice/index.js";
@@ -66,7 +66,7 @@ overviewRoute.get("/", async (c) => {
   }
 
   const activeCount = listSchedules(profile, { status: "active" }).length;
-  const summary = summarizeLedger(profile);
+  const summary = summarizeProfileLedgers(profile);
   const quietHours = getQuietHours(profile);
 
   return c.json({

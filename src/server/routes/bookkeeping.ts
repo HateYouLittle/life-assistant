@@ -4,7 +4,9 @@ import {
   listAccounts,
   listEntries,
   listLedgers,
+  listProfileEntries,
   summarizeLedger,
+  summarizeProfileLedgers,
 } from "../../modules/bookkeeping/service.js";
 import type { AppEnv } from "../types.js";
 
@@ -17,6 +19,7 @@ bookkeepingRoute.get("/", (c) => {
     process.env.HERMES_PROFILE ||
     "default";
   const month = c.req.query("month");
+  const ledgerId = c.req.query("ledgerId");
 
   let from: string | undefined;
   let to: string | undefined;
@@ -28,9 +31,13 @@ bookkeepingRoute.get("/", (c) => {
     }
   }
 
-  const accounts = listAccounts(profile);
-  const summary = summarizeLedger(profile, undefined, month);
-  const entries = listEntries(profile, undefined, { from, to, limit: 50 });
+  const accounts = listAccounts(profile, ledgerId);
+  const summary = ledgerId
+    ? summarizeLedger(profile, ledgerId, month)
+    : summarizeProfileLedgers(profile, month);
+  const entries = ledgerId
+    ? listEntries(profile, ledgerId, { from, to, limit: 50 })
+    : listProfileEntries(profile, { from, to, limit: 50 });
   const ledgers = listLedgers(profile);
 
   return c.json({
